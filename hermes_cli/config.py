@@ -357,6 +357,11 @@ DEFAULT_CONFIG = {
         # 0 = no drain, interrupt immediately.
         "restart_drain_timeout": 60,
         "service_tier": "",
+        # Optional per-platform overrides for gateway/cron runs, e.g.
+        # agent.platforms.slack.service_tier=fast,
+        # agent.platforms.discord.reasoning_effort=xhigh,
+        # agent.platforms.cron.reasoning_effort=high.
+        "platforms": {},
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -471,6 +476,16 @@ DEFAULT_CONFIG = {
         "max_simple_chars": 160,
         "max_simple_words": 28,
         "cheap_model": {},
+    },
+
+    "smart_reasoning_routing": {
+        "enabled": False,
+        "default_effort": "high",
+        "complex_effort": "xhigh",
+        "min_complex_chars": 220,
+        "min_complex_words": 35,
+        "escalate_on_tool_results": True,
+        "complex_keywords": [],
     },
     
     # Auxiliary model config — provider:model for each side task.

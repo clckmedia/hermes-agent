@@ -589,6 +589,7 @@ class GatewayRunner:
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
         self._smart_model_routing = self._load_smart_model_routing()
+        self._smart_reasoning_routing = self._load_smart_reasoning_routing()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -967,7 +968,14 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        has_prior_context: bool = False,
+    ) -> dict:
         from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -981,7 +989,12 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-        route = resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+        route = resolve_turn_route(
+            user_message,
+            getattr(self, "_smart_model_routing", {}),
+            primary,
+            has_prior_context=has_prior_context,
+        )
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -1171,66 +1184,56 @@ class GatewayRunner:
         return ""
 
     @staticmethod
-    def _load_reasoning_config() -> dict | None:
-        """Load reasoning effort from config.yaml.
+    def _load_reasoning_config(platform_key: str | None = None) -> dict | None:
+        """Load reasoning_effort from config.yaml, honoring per-platform overrides.
 
-        Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh". Returns None to use
-        default (medium).
+        Resolution order:
+        1. agent.platforms.<platform>.reasoning_effort
+        2. agent.reasoning_effort
+
+        Uses the same parser as the CLI so gateway and CLI stay aligned.
+        Returns ``None`` when unset or invalid (default reasoning applies).
         """
-        from hermes_constants import parse_reasoning_effort
-        effort = ""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                effort = str(cfg.get("agent", {}).get("reasoning_effort", "") or "").strip()
-        except Exception:
-            pass
+        from hermes_constants import get_agent_setting, parse_reasoning_effort
+
+        cfg = _load_gateway_config()
+        effort, used_platform_override = get_agent_setting(cfg, "reasoning_effort", platform_key)
         result = parse_reasoning_effort(effort)
-        if effort and effort.strip() and result is None:
-            logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+        if effort and result is None:
+            scope = f" for platform '{platform_key}'" if used_platform_override and platform_key else ""
+            logger.warning("Unknown reasoning_effort '%s'%s, using default (medium)", effort, scope)
         return result
 
     @staticmethod
-    def _load_service_tier() -> str | None:
-        """Load Priority Processing setting from config.yaml.
+    def _load_service_tier(platform_key: str | None = None) -> str | None:
+        """Load service tier from config.yaml, honoring per-platform overrides.
 
-        Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
-        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
-        Returns None when unset or unsupported.
+        Resolution order:
+        1. agent.platforms.<platform>.service_tier
+        2. agent.service_tier
         """
-        raw = ""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                raw = str(cfg.get("agent", {}).get("service_tier", "") or "").strip()
-        except Exception:
-            pass
+        from hermes_constants import get_agent_setting, parse_service_tier
 
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        cfg = _load_gateway_config()
+        raw, used_platform_override = get_agent_setting(cfg, "service_tier", platform_key)
+        value = parse_service_tier(raw)
+        if raw and value is None:
+            scope = f" for platform '{platform_key}'" if used_platform_override and platform_key else ""
+            logger.warning("Unknown service_tier '%s'%s, ignoring", raw, scope)
+        return value
 
     @staticmethod
-    def _load_show_reasoning() -> bool:
-        """Load show_reasoning toggle from config.yaml display section."""
+    def _load_show_reasoning(platform_key: str | None = None) -> bool:
+        """Load show_reasoning toggle from config.yaml display section.
+
+        When *platform_key* is provided, per-platform display overrides apply.
+        """
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return bool(cfg.get("display", {}).get("show_reasoning", False))
+            cfg = _load_gateway_config()
+            if platform_key:
+                from gateway.display_config import resolve_display_setting
+                return bool(resolve_display_setting(cfg, platform_key, "show_reasoning", False))
+            return bool(cfg.get("display", {}).get("show_reasoning", False))
         except Exception:
             pass
         return False
@@ -1357,6 +1360,20 @@ class GatewayRunner:
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
                 return cfg.get("smart_model_routing", {}) or {}
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _load_smart_reasoning_routing() -> dict:
+        """Load optional smart reasoning escalation config."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                return cfg.get("smart_reasoning_routing", {}) or {}
         except Exception:
             pass
         return {}
@@ -5722,9 +5739,10 @@ class GatewayRunner:
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            reasoning_config = self._load_reasoning_config()
+            reasoning_config = self._load_reasoning_config(platform_key)
             self._reasoning_config = reasoning_config
-            self._service_tier = self._load_service_tier()
+            self._service_tier = self._load_service_tier(platform_key)
+            self._smart_reasoning_routing = self._load_smart_reasoning_routing()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             def run_sync():
@@ -5736,6 +5754,7 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     reasoning_config=reasoning_config,
+                    smart_reasoning_routing=getattr(self, "_smart_reasoning_routing", {}),
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
@@ -5890,10 +5909,12 @@ class GatewayRunner:
                 return
 
             platform_key = _platform_config_key(source.platform)
-            reasoning_config = self._load_reasoning_config()
-            self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
             pr = self._provider_routing
+            reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = reasoning_config
+            self._service_tier = self._load_service_tier()
+            self._smart_reasoning_routing = self._load_smart_reasoning_routing()
+            turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
 
             # Snapshot history from running agent or stored transcript
             running_agent = self._running_agents.get(session_key)
@@ -5918,6 +5939,7 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=[],
                     reasoning_config=reasoning_config,
+                    smart_reasoning_routing=getattr(self, "_smart_reasoning_routing", {}),
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
@@ -6005,8 +6027,9 @@ class GatewayRunner:
 
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / "config.yaml"
-        self._reasoning_config = self._load_reasoning_config()
-        self._show_reasoning = self._load_show_reasoning()
+        platform_key = _platform_config_key(event.source.platform)
+        self._reasoning_config = self._load_reasoning_config(platform_key)
+        self._show_reasoning = self._load_show_reasoning(platform_key)
 
         def _save_config_key(key_path: str, value):
             """Save a dot-separated key to config.yaml."""
@@ -6029,7 +6052,7 @@ class GatewayRunner:
                 return False
 
         if not args:
-            # Show current state
+            # Show current state for this platform
             rc = self._reasoning_config
             if rc is None:
                 level = "medium (default)"
@@ -6040,13 +6063,13 @@ class GatewayRunner:
             display_state = "on ✓" if self._show_reasoning else "off"
             return (
                 "🧠 **Reasoning Settings**\n\n"
+                f"**Platform:** `{platform_key}`\n"
                 f"**Effort:** `{level}`\n"
                 f"**Display:** {display_state}\n\n"
                 "_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|show|hide>`"
             )
 
         # Display toggle (per-platform)
-        platform_key = _platform_config_key(event.source.platform)
         if args in ("show", "on"):
             self._show_reasoning = True
             _save_config_key(f"display.platforms.{platform_key}.show_reasoning", True)
@@ -6074,10 +6097,13 @@ class GatewayRunner:
             )
 
         self._reasoning_config = parsed
-        if _save_config_key("agent.reasoning_effort", effort):
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
+        if _save_config_key(f"agent.platforms.{platform_key}.reasoning_effort", effort):
+            return (
+                f"🧠 ✓ Reasoning effort set to `{effort}` for **{platform_key}** (saved to config)"
+                "\n_(takes effect on next message)_"
+            )
         else:
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
+            return f"🧠 ✓ Reasoning effort set to `{effort}` for **{platform_key}** (this session only)"
 
     async def _handle_fast_command(self, event: MessageEvent) -> str:
         """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats."""
@@ -6086,7 +6112,8 @@ class GatewayRunner:
 
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / "config.yaml"
-        self._service_tier = self._load_service_tier()
+        platform_key = _platform_config_key(event.source.platform)
+        self._service_tier = self._load_service_tier(platform_key)
 
         user_config = _load_gateway_config()
         model = _resolve_gateway_model(user_config)
@@ -6117,6 +6144,7 @@ class GatewayRunner:
             status = "fast" if self._service_tier == "priority" else "normal"
             return (
                 "⚡ Priority Processing\n\n"
+                f"Platform: `{platform_key}`\n"
                 f"Current mode: `{status}`\n\n"
                 "_Usage:_ `/fast <normal|fast|status>`"
             )
@@ -6135,9 +6163,12 @@ class GatewayRunner:
                 "**Valid options:** normal, fast, status"
             )
 
-        if _save_config_key("agent.service_tier", saved_value):
-            return f"⚡ ✓ Priority Processing: **{label}** (saved to config)\n_(takes effect on next message)_"
-        return f"⚡ ✓ Priority Processing: **{label}** (this session only)"
+        if _save_config_key(f"agent.platforms.{platform_key}.service_tier", saved_value):
+            return (
+                f"⚡ ✓ Priority Processing: **{label}** for **{platform_key}** (saved to config)"
+                "\n_(takes effect on next message)_"
+            )
+        return f"⚡ ✓ Priority Processing: **{label}** for **{platform_key}** (this session only)"
 
     async def _handle_yolo_command(self, event: MessageEvent) -> str:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
@@ -8513,9 +8544,10 @@ class GatewayRunner:
                 }
 
             pr = self._provider_routing
-            reasoning_config = self._load_reasoning_config()
+            reasoning_config = self._load_reasoning_config(platform_key)
             self._reasoning_config = reasoning_config
-            self._service_tier = self._load_service_tier()
+            self._service_tier = self._load_service_tier(platform_key)
+            self._smart_reasoning_routing = self._load_smart_reasoning_routing()
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
@@ -8599,7 +8631,12 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+                has_prior_context=bool(history),
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -8638,6 +8675,7 @@ class GatewayRunner:
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
+                    smart_reasoning_routing=getattr(self, "_smart_reasoning_routing", {}),
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
@@ -8666,6 +8704,7 @@ class GatewayRunner:
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            agent.smart_reasoning_routing = getattr(self, "_smart_reasoning_routing", {})
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
 

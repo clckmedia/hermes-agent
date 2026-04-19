@@ -96,12 +96,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
-        # Track timestamps of messages sent by the bot so we can respond
-        # to thread replies even without an explicit @mention.
+        # Track timestamps of messages sent by the bot so fetched thread
+        # context can reliably identify Hermes-authored messages.
         self._bot_message_ts: set = set()
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
-        # Track threads where the bot has been @mentioned — once mentioned,
-        # respond to ALL subsequent messages in that thread automatically.
+        # Track thread roots where Hermes has been explicitly @mentioned.
+        # This is bookkeeping only — it must not auto-enable future replies
+        # without a fresh @mention on the current thread message.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
@@ -1021,46 +1022,27 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
-        # In channels, respond if:
-        #   0. Channel is in free_response_channels, OR require_mention is
-        #      disabled — always process regardless of mention.
-        #   1. The bot is @mentioned in this message, OR
-        #   2. The message is a reply in a thread the bot started/participated in, OR
-        #   3. The message is in a thread where the bot was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
+        # In channels, top-level messages may use free-response / global
+        # mention settings, but thread replies are always mention-only.
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         is_mentioned = bot_uid and f"<@{bot_uid}>" in text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid:
-            if channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process
-            elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
-            elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = (
-                    is_thread_reply
-                    and self._has_active_session_for_thread(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        user_id=user_id,
-                    )
-                )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+            if is_thread_reply:
+                if not is_mentioned:
                     return
+            elif channel_id in self._slack_free_response_channels():
+                pass  # Free-response channel — always process top-level messages
+            elif not self._slack_require_mention():
+                pass  # Mention requirement disabled globally for top-level Slack messages
+            elif not is_mentioned:
+                return
 
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
-            # Register this thread so all future messages auto-trigger the bot
             if event_thread_ts:
                 self._mentioned_threads.add(event_thread_ts)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:

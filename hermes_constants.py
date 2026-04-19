@@ -158,6 +158,56 @@ def parse_reasoning_effort(effort: str) -> dict | None:
     return None
 
 
+def parse_service_tier(value: str | None) -> str | None:
+    """Normalize a service tier setting.
+
+    Accepted aliases:
+    - "fast", "priority", "on" -> "priority"
+    - empty, "normal", "default", "standard", "off", "none" -> None
+    Returns None for unknown values so callers can ignore invalid overrides.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized or normalized in {"normal", "default", "standard", "off", "none"}:
+        return None
+    if normalized in {"fast", "priority", "on"}:
+        return "priority"
+    return None
+
+
+def get_agent_setting(config: dict | None, setting: str, platform_key: str | None = None) -> tuple[str, bool]:
+    """Return an agent config value, preferring platform-specific overrides.
+
+    Resolution order:
+    1. agent.platforms.<platform_key>.<setting>
+    2. agent.<setting>
+
+    Returns a tuple of (raw_value, used_platform_override).
+    Missing values return ("", False).
+    """
+    if not isinstance(config, dict):
+        return "", False
+
+    agent_cfg = config.get("agent", {})
+    if not isinstance(agent_cfg, dict):
+        return "", False
+
+    if platform_key:
+        platforms_cfg = agent_cfg.get("platforms", {})
+        if isinstance(platforms_cfg, dict):
+            platform_cfg = platforms_cfg.get(platform_key, {})
+            if isinstance(platform_cfg, dict):
+                raw = platform_cfg.get(setting)
+                if raw not in (None, ""):
+                    return str(raw).strip(), True
+
+    raw = agent_cfg.get(setting)
+    if raw in (None, ""):
+        return "", False
+    return str(raw).strip(), False
+
+
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 

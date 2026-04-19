@@ -590,6 +590,7 @@ class AIAgent:
         status_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
+        smart_reasoning_routing: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -799,6 +800,7 @@ class AIAgent:
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+        self.smart_reasoning_routing = dict(smart_reasoning_routing or {})
         self.service_tier = service_tier
         self.request_overrides = dict(request_overrides or {})
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
@@ -6494,8 +6496,22 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
+    def _effective_reasoning_config(self, api_messages: list | None = None) -> Dict[str, Any] | None:
+        """Return the reasoning config to use for this specific API call."""
+        try:
+            from agent.smart_model_routing import resolve_smart_reasoning_config
+
+            return resolve_smart_reasoning_config(
+                api_messages,
+                self.reasoning_config,
+                getattr(self, "smart_reasoning_routing", None),
+            )
+        except Exception:
+            return self.reasoning_config
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
+        effective_reasoning_config = self._effective_reasoning_config(api_messages)
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_kwargs
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
@@ -6515,7 +6531,7 @@ class AIAgent:
                 messages=anthropic_messages,
                 tools=self.tools,
                 max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
-                reasoning_config=self.reasoning_config,
+                reasoning_config=effective_reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
@@ -6563,11 +6579,11 @@ class AIAgent:
             # Resolve reasoning effort: config > default (medium)
             reasoning_effort = "medium"
             reasoning_enabled = True
-            if self.reasoning_config and isinstance(self.reasoning_config, dict):
-                if self.reasoning_config.get("enabled") is False:
+            if effective_reasoning_config and isinstance(effective_reasoning_config, dict):
+                if effective_reasoning_config.get("enabled") is False:
                     reasoning_enabled = False
-                elif self.reasoning_config.get("effort"):
-                    reasoning_effort = self.reasoning_config["effort"]
+                elif effective_reasoning_config.get("effort"):
+                    reasoning_effort = effective_reasoning_config["effort"]
 
             # Clamp effort levels not supported by the Responses API model.
             # GPT-5.4 supports none/low/medium/high/xhigh but not "minimal".
@@ -6749,12 +6765,12 @@ class AIAgent:
 
         if self._supports_reasoning_extra_body():
             if _is_github_models:
-                github_reasoning = self._github_models_reasoning_extra_body()
+                github_reasoning = self._github_models_reasoning_extra_body(effective_reasoning_config)
                 if github_reasoning is not None:
                     extra_body["reasoning"] = github_reasoning
             else:
-                if self.reasoning_config is not None:
-                    rc = dict(self.reasoning_config)
+                if effective_reasoning_config is not None:
+                    rc = dict(effective_reasoning_config)
                     # Nous Portal requires reasoning enabled — don't send
                     # enabled=false to it (would cause 400).
                     if _is_nous and rc.get("enabled") is False:
@@ -6786,9 +6802,9 @@ class AIAgent:
         # This prevents thinking-capable models (Qwen3, etc.) from generating
         # <think> blocks and producing empty-response errors when the user has
         # set reasoning_effort: none.
-        if self.provider == "custom" and self.reasoning_config and isinstance(self.reasoning_config, dict):
-            _effort = (self.reasoning_config.get("effort") or "").strip().lower()
-            _enabled = self.reasoning_config.get("enabled", True)
+        if self.provider == "custom" and effective_reasoning_config and isinstance(effective_reasoning_config, dict):
+            _effort = (effective_reasoning_config.get("effort") or "").strip().lower()
+            _enabled = effective_reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
 
@@ -6839,22 +6855,24 @@ class AIAgent:
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
 
-    def _github_models_reasoning_extra_body(self) -> dict | None:
+    def _github_models_reasoning_extra_body(self, effective_reasoning_config: Dict[str, Any] | None = None) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
         try:
             from hermes_cli.models import github_model_reasoning_efforts
         except Exception:
             return None
 
+        if effective_reasoning_config is None:
+            effective_reasoning_config = self._effective_reasoning_config(None)
         supported_efforts = github_model_reasoning_efforts(self.model)
         if not supported_efforts:
             return None
 
-        if self.reasoning_config and isinstance(self.reasoning_config, dict):
-            if self.reasoning_config.get("enabled") is False:
+        if effective_reasoning_config and isinstance(effective_reasoning_config, dict):
+            if effective_reasoning_config.get("enabled") is False:
                 return None
             requested_effort = str(
-                self.reasoning_config.get("effort", "medium")
+                effective_reasoning_config.get("effort", "medium")
             ).strip().lower()
         else:
             requested_effort = "medium"
@@ -8117,11 +8135,12 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
+            effective_summary_reasoning_config = self._effective_reasoning_config(api_messages)
             summary_extra_body = {}
             _is_nous = "nousresearch" in self._base_url_lower
             if self._supports_reasoning_extra_body():
-                if self.reasoning_config is not None:
-                    summary_extra_body["reasoning"] = self.reasoning_config
+                if effective_summary_reasoning_config is not None:
+                    summary_extra_body["reasoning"] = effective_summary_reasoning_config
                 else:
                     summary_extra_body["reasoning"] = {
                         "enabled": True,
@@ -8163,7 +8182,7 @@ class AIAgent:
                 if self.api_mode == "anthropic_messages":
                     from agent.anthropic_adapter import build_anthropic_kwargs as _bak, normalize_anthropic_response as _nar
                     _ant_kw = _bak(model=self.model, messages=api_messages, tools=None,
-                                   max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
+                                   max_tokens=self.max_tokens, reasoning_config=effective_summary_reasoning_config,
                                    is_oauth=self._is_anthropic_oauth,
                                    preserve_dots=self._anthropic_preserve_dots())
                     summary_response = self._anthropic_messages_create(_ant_kw)
@@ -8196,7 +8215,7 @@ class AIAgent:
                     from agent.anthropic_adapter import build_anthropic_kwargs as _bak2, normalize_anthropic_response as _nar2
                     _ant_kw2 = _bak2(model=self.model, messages=api_messages, tools=None,
                                     is_oauth=self._is_anthropic_oauth,
-                                    max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
+                                    max_tokens=self.max_tokens, reasoning_config=effective_summary_reasoning_config,
                                     preserve_dots=self._anthropic_preserve_dots())
                     retry_response = self._anthropic_messages_create(_ant_kw2)
                     _retry_msg, _ = _nar2(retry_response, strip_tool_prefix=self._is_anthropic_oauth)

@@ -378,11 +378,11 @@ class TestSessionKeyFix:
 # ===========================================================================
 
 class TestThreadEngagement:
-    """Test _bot_message_ts and _mentioned_threads tracking."""
+    """Test thread bookkeeping used by Slack context handling."""
 
     @pytest.mark.asyncio
     async def test_send_tracks_bot_message_ts(self):
-        """Bot's sent messages are tracked so thread replies work without @mention."""
+        """Bot's sent messages are tracked so thread context can identify Hermes replies."""
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "9000.1"})

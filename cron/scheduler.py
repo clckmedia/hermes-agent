@@ -655,10 +655,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning config from config.yaml
-        from hermes_constants import parse_reasoning_effort
-        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+        # Reasoning + service tier config from config.yaml (cron can have its own override)
+        from hermes_constants import get_agent_setting, parse_reasoning_effort, parse_service_tier
+        effort, _ = get_agent_setting(_cfg, "reasoning_effort", "cron")
         reasoning_config = parse_reasoning_effort(effort)
+
+        service_tier_raw, _ = get_agent_setting(_cfg, "service_tier", "cron")
+        service_tier = parse_service_tier(service_tier_raw)
 
         # Prefill messages from env or config.yaml
         prefill_messages = None
@@ -684,6 +687,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Provider routing
         pr = _cfg.get("provider_routing", {})
         smart_routing = _cfg.get("smart_model_routing", {}) or {}
+        smart_reasoning_routing = _cfg.get("smart_reasoning_routing", {}) or {}
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
@@ -715,6 +719,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             },
         )
 
+        request_overrides = None
+        if service_tier:
+            try:
+                from hermes_cli.models import resolve_fast_mode_overrides
+                request_overrides = resolve_fast_mode_overrides(turn_route["model"])
+            except Exception:
+                request_overrides = None
+
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(turn_route["runtime"].get("provider") or "").strip().lower()
@@ -743,6 +755,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             acp_args=turn_route["runtime"].get("args"),
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
+            smart_reasoning_routing=smart_reasoning_routing,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
             credential_pool=credential_pool,

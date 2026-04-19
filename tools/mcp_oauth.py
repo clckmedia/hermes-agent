@@ -40,6 +40,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -193,9 +194,17 @@ class HermesTokenStorage:
     # -- tokens ------------------------------------------------------------
 
     async def get_tokens(self) -> "OAuthToken | None":
-        data = _read_json(self._tokens_path())
+        path = self._tokens_path()
+        data = _read_json(path)
         if data is None:
             return None
+        expires_in = data.get("expires_in")
+        if isinstance(expires_in, int) and expires_in > 0:
+            try:
+                age_seconds = max(0, int(time.time() - path.stat().st_mtime))
+            except OSError:
+                age_seconds = 0
+            data["expires_in"] = max(0, expires_in - age_seconds)
         try:
             return OAuthToken.model_validate(data)
         except (ValueError, TypeError, KeyError) as exc:

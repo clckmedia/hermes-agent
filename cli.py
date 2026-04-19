@@ -1781,6 +1781,7 @@ class HermesCLI:
 
         # Optional cheap-vs-strong routing for simple turns
         self._smart_model_routing = CLI_CONFIG.get("smart_model_routing", {}) or {}
+        self._smart_reasoning_routing = CLI_CONFIG.get("smart_reasoning_routing", {}) or {}
         self._active_agent_route_signature = None
 
         # Agent will be initialized on first use
@@ -2807,6 +2808,7 @@ class HermesCLI:
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
             },
+            has_prior_context=bool(getattr(self, "conversation_history", None)),
         )
 
         service_tier = getattr(self, "service_tier", None)
@@ -2908,6 +2910,7 @@ class HermesCLI:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
+                smart_reasoning_routing=self._smart_reasoning_routing,
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
                 providers_allowed=self._providers_only,
@@ -5767,6 +5770,7 @@ class HermesCLI:
                     platform="cli",
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
+                    smart_reasoning_routing=self._smart_reasoning_routing,
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=self._providers_only,
@@ -5904,6 +5908,7 @@ class HermesCLI:
                     session_id=task_id,
                     platform="cli",
                     reasoning_config=self.reasoning_config,
+                    smart_reasoning_routing=self._smart_reasoning_routing,
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=self._providers_only,
@@ -7701,6 +7706,8 @@ class HermesCLI:
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+        self.agent.reasoning_config = self.reasoning_config
+        self.agent.smart_reasoning_routing = self._smart_reasoning_routing
         
         # Pre-process images through the vision tool (Gemini Flash) so the
         # main model receives text descriptions instead of raw base64 image

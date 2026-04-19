@@ -1084,10 +1084,10 @@ class TestThreadReplyHandling:
         adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_thread_reply_without_mention_with_session_processed(
+    async def test_thread_reply_without_mention_with_session_still_ignored(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Thread replies without mention should be processed if there's an active session."""
+        """Thread replies without mention should still be ignored even with an active session."""
         # Simulate an active session for this thread
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
@@ -1102,17 +1102,13 @@ class TestThreadReplyHandling:
             "team": "T_TEAM",
         }
         await adapter_with_session_store._handle_slack_message(event)
-        adapter_with_session_store.handle_message.assert_called_once()
-
-        # Verify the text is passed through unchanged (no mention stripping needed)
-        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        assert msg_event.text == "Follow-up question"
+        adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_thread_reply_with_mention_strips_bot_id(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Thread replies with @mention should still strip the bot ID."""
+        """Thread replies with @mention should still be processed and strip the bot ID."""
         # Even with a session, mentions should be stripped
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
