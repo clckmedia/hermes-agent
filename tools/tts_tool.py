@@ -819,6 +819,9 @@ def text_to_speech_tool(
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_str = str(file_path)
 
+    fallback_from = None
+    fallback_reason = None
+
     try:
         # Generate audio with the configured provider
         if provider == "elevenlabs":
@@ -841,7 +844,34 @@ def text_to_speech_tool(
                     "error": "OpenAI provider selected but 'openai' package not installed."
                 }, ensure_ascii=False)
             logger.info("Generating speech with OpenAI TTS...")
-            _generate_openai_tts(text, file_str, tts_config)
+            try:
+                _generate_openai_tts(text, file_str, tts_config)
+            except Exception as openai_error:
+                fallback_from = "openai"
+                fallback_reason = str(openai_error)
+                edge_available = True
+                try:
+                    _import_edge_tts()
+                except ImportError:
+                    edge_available = False
+
+                if edge_available:
+                    logger.warning("OpenAI TTS failed (%s), falling back to Edge TTS...", openai_error)
+                    provider = "edge"
+                    try:
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            pool.submit(
+                                lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                            ).result(timeout=60)
+                    except RuntimeError:
+                        asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                elif _check_neutts_available():
+                    logger.warning("OpenAI TTS failed (%s), falling back to NeuTTS...", openai_error)
+                    provider = "neutts"
+                    _generate_neutts(text, file_str, tts_config)
+                else:
+                    raise
 
         elif provider == "minimax":
             logger.info("Generating speech with MiniMax TTS...")
@@ -932,13 +962,17 @@ def text_to_speech_tool(
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
 
-        return json.dumps({
+        payload = {
             "success": True,
             "file_path": file_str,
             "media_tag": media_tag,
             "provider": provider,
             "voice_compatible": voice_compatible,
-        }, ensure_ascii=False)
+        }
+        if fallback_from:
+            payload["fallback_from"] = fallback_from
+            payload["fallback_reason"] = fallback_reason
+        return json.dumps(payload, ensure_ascii=False)
 
     except ValueError as e:
         # Configuration errors (missing API keys, etc.)

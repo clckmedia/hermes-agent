@@ -132,6 +132,61 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_runtime_status_does_not_overwrite_live_other_gateway(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        other_pid = 424242
+        current_pid = os.getpid()
+        state_path = tmp_path / "gateway_state.json"
+        pid_path = tmp_path / "gateway.pid"
+
+        state_path.write_text(json.dumps({
+            "pid": other_pid,
+            "start_time": 222,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+            "gateway_state": "running",
+            "exit_reason": None,
+            "restart_requested": False,
+            "active_agents": 1,
+            "platforms": {"discord": {"state": "connected"}},
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }))
+        pid_path.write_text(json.dumps({
+            "pid": other_pid,
+            "start_time": 222,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+        }))
+
+        def fake_kill(pid, sig):
+            if pid in {other_pid, current_pid}:
+                return None
+            raise ProcessLookupError
+
+        def fake_start_time(pid):
+            if pid == other_pid:
+                return 222
+            if pid == current_pid:
+                return 999
+            return None
+
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+        monkeypatch.setattr(status, "_get_process_start_time", fake_start_time)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: "/venv/bin/python /repo/hermes_cli/main.py gateway run --replace",
+        )
+
+        status.write_runtime_status(gateway_state="startup_failed", exit_reason="secondary start failed")
+
+        payload = status.read_runtime_status()
+        assert payload["pid"] == other_pid
+        assert payload["start_time"] == 222
+        assert payload["gateway_state"] == "running"
+        assert payload["exit_reason"] is None
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):

@@ -767,6 +767,15 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in ("false", "0", "no")
 
+    def _skill_slash_commands_enabled(self) -> bool:
+        """Check whether Discord /skill slash commands should be registered."""
+        raw = self.config.extra.get("skill_slash_commands")
+        if raw is None:
+            raw = os.getenv("DISCORD_SKILL_SLASH_COMMANDS", "true")
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction for normal Discord message events."""
         if not self._reactions_enabled():
@@ -1901,7 +1910,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        if self._skill_slash_commands_enabled():
+            self._register_skill_group(tree)
 
     def _register_skill_group(self, tree) -> None:
         """Register a ``/skill`` command group with category subcommand groups.

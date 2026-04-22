@@ -212,6 +212,54 @@ def _read_pid_record() -> Optional[dict]:
     return None
 
 
+def _record_matches_process(record: Optional[dict[str, Any]], pid: int, start_time: Optional[int]) -> bool:
+    """Return True when a stored record refers to the given live process."""
+    if not isinstance(record, dict):
+        return False
+    try:
+        record_pid = int(record.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if record_pid != pid:
+        return False
+
+    record_start = record.get("start_time")
+    if record_start is None or start_time is None:
+        return True
+    try:
+        return int(record_start) == int(start_time)
+    except (TypeError, ValueError):
+        return False
+
+
+
+def _record_is_live_gateway(record: Optional[dict[str, Any]]) -> bool:
+    """Return True when a stored record still points at a live gateway process."""
+    if not isinstance(record, dict):
+        return False
+    try:
+        pid = int(record.get("pid"))
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+    current_start = _get_process_start_time(pid)
+    recorded_start = record.get("start_time")
+    if recorded_start is not None and current_start is not None:
+        try:
+            if int(recorded_start) != int(current_start):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    return _looks_like_gateway_process(pid) or _record_looks_like_gateway(record)
+
+
+
 def write_pid_file() -> None:
     """Write the current process PID and metadata to the gateway PID file."""
     _write_json_file(_get_pid_path(), _build_pid_record())
@@ -230,11 +278,24 @@ def write_runtime_status(
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
+    existing = _read_json_file(path)
+    current_pid = os.getpid()
+    current_start = _get_process_start_time(current_pid)
+
+    if (
+        existing
+        and _record_is_live_gateway(existing)
+        and not _record_matches_process(existing, current_pid, current_start)
+    ):
+        # Another live gateway still owns the status file. Do not let a failed
+        # secondary startup overwrite the running gateway's health record.
+        return
+
+    payload = existing or _build_runtime_status_record()
     payload.setdefault("platforms", {})
     payload.setdefault("kind", _GATEWAY_KIND)
-    payload["pid"] = os.getpid()
-    payload["start_time"] = _get_process_start_time(os.getpid())
+    payload["pid"] = current_pid
+    payload["start_time"] = current_start
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:

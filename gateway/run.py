@@ -1280,6 +1280,19 @@ class GatewayRunner:
                 )
         return value
 
+    async def _warm_agent_runtime(self) -> None:
+        """Warm heavy agent imports after startup without blocking the event loop."""
+        await asyncio.sleep(2)
+
+        def _warm() -> None:
+            from run_agent import AIAgent  # noqa: F401
+
+        try:
+            await asyncio.to_thread(_warm)
+            logger.info("Agent runtime warmed in background")
+        except Exception as e:
+            logger.debug("Agent runtime warmup skipped: %s", e)
+
     @staticmethod
     def _load_background_notifications_mode() -> str:
         """Load background process notification mode from config or env var.
@@ -2055,6 +2068,10 @@ class GatewayRunner:
                 ", ".join(p.value for p in self._failed_platforms),
             )
         asyncio.create_task(self._platform_reconnect_watcher())
+
+        # Warm the agent runtime off the event loop so the first inbound message
+        # does not block Discord heartbeats during heavy imports/MCP discovery.
+        asyncio.create_task(self._warm_agent_runtime())
 
         logger.info("Press Ctrl+C to stop")
         
