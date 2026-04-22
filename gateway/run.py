@@ -1184,12 +1184,18 @@ class GatewayRunner:
         return ""
 
     @staticmethod
-    def _load_reasoning_config(platform_key: str | None = None) -> dict | None:
-        """Load reasoning_effort from config.yaml, honoring per-platform overrides.
+    def _load_reasoning_config(
+        platform_key: str | None = None,
+        channel_id: str | None = None,
+        parent_channel_id: str | None = None,
+    ) -> dict | None:
+        """Load reasoning_effort from config.yaml, honoring platform and channel overrides.
 
         Resolution order:
-        1. agent.platforms.<platform>.reasoning_effort
-        2. agent.reasoning_effort
+        1. agent.platforms.<platform>.channel_reasoning_overrides.<channel_id>
+        2. agent.platforms.<platform>.channel_reasoning_overrides.<parent_channel_id>
+        3. agent.platforms.<platform>.reasoning_effort
+        4. agent.reasoning_effort
 
         Uses the same parser as the CLI so gateway and CLI stay aligned.
         Returns ``None`` when unset or invalid (default reasoning applies).
@@ -1198,10 +1204,40 @@ class GatewayRunner:
 
         cfg = _load_gateway_config()
         effort, used_platform_override = get_agent_setting(cfg, "reasoning_effort", platform_key)
+        channel_scope = None
+
+        if platform_key:
+            agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+            platforms_cfg = agent_cfg.get("platforms", {}) if isinstance(agent_cfg, dict) else {}
+            platform_cfg = platforms_cfg.get(platform_key, {}) if isinstance(platforms_cfg, dict) else {}
+            if isinstance(platform_cfg, dict):
+                overrides = platform_cfg.get("channel_reasoning_overrides", {})
+                if isinstance(overrides, dict):
+                    for candidate, label in (
+                        (channel_id, "channel"),
+                        (parent_channel_id, "parent channel"),
+                    ):
+                        if not candidate:
+                            continue
+                        raw = overrides.get(str(candidate))
+                        if raw not in (None, ""):
+                            effort = str(raw).strip()
+                            channel_scope = f"{label} '{candidate}'"
+                            used_platform_override = False
+                            break
+
         result = parse_reasoning_effort(effort)
         if effort and result is None:
-            scope = f" for platform '{platform_key}'" if used_platform_override and platform_key else ""
-            logger.warning("Unknown reasoning_effort '%s'%s, using default (medium)", effort, scope)
+            if channel_scope and platform_key:
+                logger.warning(
+                    "Unknown reasoning_effort '%s' for %s on platform '%s', using default (medium)",
+                    effort,
+                    channel_scope,
+                    platform_key,
+                )
+            else:
+                scope = f" for platform '{platform_key}'" if used_platform_override and platform_key else ""
+                logger.warning("Unknown reasoning_effort '%s'%s, using default (medium)", effort, scope)
         return result
 
     @staticmethod
@@ -3955,6 +3991,7 @@ class GatewayRunner:
                 session_key=session_key,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                channel_parent_id=event.channel_parent_id,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8170,6 +8207,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        channel_parent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -8561,7 +8599,11 @@ class GatewayRunner:
                 }
 
             pr = self._provider_routing
-            reasoning_config = self._load_reasoning_config(platform_key)
+            reasoning_config = self._load_reasoning_config(
+                platform_key,
+                channel_id=source.chat_id,
+                parent_channel_id=channel_parent_id,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier(platform_key)
             self._smart_reasoning_routing = self._load_smart_reasoning_routing()
@@ -9535,6 +9577,7 @@ class GatewayRunner:
                         return result
                     next_message_id = getattr(pending_event, "message_id", None)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                next_channel_parent_id = getattr(pending_event, "channel_parent_id", None)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -9559,6 +9602,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    channel_parent_id=next_channel_parent_id,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
