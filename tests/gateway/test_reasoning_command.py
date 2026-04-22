@@ -146,7 +146,7 @@ class TestReasoningCommand:
                 "provider": "openrouter",
                 "api_mode": "chat_completions",
                 "base_url": "https://openrouter.ai/api/v1",
-                "api_key": "test-key",
+                "api_key": "***",
             },
         )
         fake_run_agent = types.ModuleType("run_agent")
@@ -173,6 +173,120 @@ class TestReasoningCommand:
                 source=source,
                 session_id="session-1",
                 session_key="agent:main:local:dm",
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_run_agent_applies_discord_channel_reasoning_override(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n"
+            "  reasoning_effort: high\n"
+            "  platforms:\n"
+            "    discord:\n"
+            "      channel_reasoning_overrides:\n"
+            "        '1494192153545408562': xhigh\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+        runner._reasoning_config = {"enabled": True, "effort": "high"}
+        runner._resolve_session_agent_runtime = lambda **kwargs: (
+            "gpt-5.4",
+            {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "***",
+            },
+        )
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1494192153545408562",
+            chat_name="strategy",
+            chat_type="channel",
+            user_id="user-1",
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message="ping",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:discord:channel",
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_run_agent_applies_discord_parent_channel_reasoning_override(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n"
+            "  reasoning_effort: high\n"
+            "  platforms:\n"
+            "    discord:\n"
+            "      channel_reasoning_overrides:\n"
+            "        '1494188024874008596': xhigh\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+        runner._reasoning_config = {"enabled": True, "effort": "high"}
+        runner._resolve_session_agent_runtime = lambda **kwargs: (
+            "gpt-5.4",
+            {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "***",
+            },
+        )
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1494526366954295347",
+            chat_name="project-ops thread",
+            chat_type="thread",
+            user_id="user-1",
+            thread_id="1494526366954295347",
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message="ping",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:discord:thread",
+                channel_parent_id="1494188024874008596",
             )
         )
 

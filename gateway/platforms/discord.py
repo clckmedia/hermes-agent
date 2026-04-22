@@ -2036,6 +2036,7 @@ class DiscordAdapter(BasePlatformAdapter):
             source=source,
             raw_message=interaction,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            channel_parent_id=parent_id or None,
         )
 
     # ------------------------------------------------------------------
@@ -2117,6 +2118,7 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_message=interaction,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
+            channel_parent_id=_parent_id or None,
         )
         await self.handle_message(event)
 
@@ -2723,6 +2725,7 @@ class DiscordAdapter(BasePlatformAdapter):
             timestamp=message.created_at,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
+            channel_parent_id=_parent_id or None,
         )
 
         # Track thread participation so the bot won't require @mention for

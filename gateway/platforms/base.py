@@ -686,6 +686,10 @@ class MessageEvent:
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
+
+    # Optional parent channel/container ID for thread-style contexts.
+    # Used for inheritable per-channel config such as forum-level overrides.
+    channel_parent_id: Optional[str] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
