@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -114,6 +115,29 @@ class TestHermesTokenStorage:
 
         import asyncio
         assert asyncio.run(storage.get_client_info()) is None
+
+    def test_get_tokens_reduces_expires_in_by_file_age(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("aged-server")
+
+        d = tmp_path / "mcp-tokens"
+        d.mkdir(parents=True)
+        token_path = d / "aged-server.json"
+        token_path.write_text(json.dumps({
+            "access_token": "abc123",
+            "token_type": "Bearer",
+            "expires_in": 900,
+            "refresh_token": "refresh123",
+        }))
+        aged_seconds = 1000
+        now = time.time()
+        os.utime(token_path, (now - aged_seconds, now - aged_seconds))
+
+        import asyncio
+        token = asyncio.run(storage.get_tokens())
+        assert token is not None
+        assert token.expires_in == 0
+        assert token.refresh_token == "refresh123"
 
 
 # ---------------------------------------------------------------------------

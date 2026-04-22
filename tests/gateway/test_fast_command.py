@@ -135,7 +135,7 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
     assert runner._service_tier == "priority"
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert saved["agent"]["service_tier"] == "fast"
+    assert saved["agent"]["platforms"]["telegram"]["service_tier"] == "fast"
 
 
 @pytest.mark.asyncio
@@ -143,11 +143,22 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
 
-    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n"
+        "  service_tier: normal\n"
+        "  platforms:\n"
+        "    telegram:\n"
+        "      service_tier: fast\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8")) or {},
+    )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
     monkeypatch.setattr(
         gateway_run,
@@ -176,3 +187,82 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_passes_smart_reasoning_routing_and_prior_context(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  default: gpt-5.4\n"
+        "agent:\n"
+        "  reasoning_effort: high\n"
+        "smart_reasoning_routing:\n"
+        "  enabled: true\n"
+        "  default_effort: high\n"
+        "  complex_effort: xhigh\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8")) or {},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    seen = {}
+
+    def _resolve_turn_route(user_message, routing_config, primary, has_prior_context=False):
+        seen["has_prior_context"] = has_prior_context
+        return {
+            "model": "gpt-5.4",
+            "runtime": {
+                "provider": primary["provider"],
+                "api_mode": primary["api_mode"],
+                "base_url": primary["base_url"],
+                "api_key": primary["api_key"],
+                "command": primary.get("command"),
+                "args": list(primary.get("args") or []),
+                "credential_pool": primary.get("credential_pool"),
+            },
+            "label": None,
+            "signature": ("gpt-5.4", "openrouter", "https://openrouter.ai/api/v1", "chat_completions", None, ()),
+        }
+
+    monkeypatch.setattr("agent.smart_model_routing.resolve_turn_route", _resolve_turn_route)
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="yes",
+        context_prompt="",
+        history=[{"role": "assistant", "content": "Want me to inspect the workflow in detail?"}],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "ok"
+    assert seen["has_prior_context"] is True
+    assert _CapturingAgent.last_init["smart_reasoning_routing"] == {
+        "enabled": True,
+        "default_effort": "high",
+        "complex_effort": "xhigh",
+    }

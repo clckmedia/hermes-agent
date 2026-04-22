@@ -82,7 +82,13 @@ class TestReasoningCommand:
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
         config_path.write_text(
-            "agent:\n  reasoning_effort: none\ndisplay:\n  show_reasoning: true\n",
+            "agent:\n"
+            "  reasoning_effort: none\n"
+            "display:\n"
+            "  show_reasoning: false\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      show_reasoning: true\n",
             encoding="utf-8",
         )
 
@@ -114,14 +120,21 @@ class TestReasoningCommand:
         result = await runner._handle_reasoning_command(_make_event("/reasoning low"))
 
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        assert saved["agent"]["reasoning_effort"] == "low"
+        assert saved["agent"]["platforms"]["telegram"]["reasoning_effort"] == "low"
         assert runner._reasoning_config == {"enabled": True, "effort": "low"}
         assert "takes effect on next message" in result
 
     def test_run_agent_reloads_reasoning_config_per_message(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n"
+            "  reasoning_effort: low\n"
+            "  platforms:\n"
+            "    cli:\n"
+            "      reasoning_effort: xhigh\n",
+            encoding="utf-8",
+        )
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
         monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
@@ -165,7 +178,7 @@ class TestReasoningCommand:
 
         assert result["final_response"] == "ok"
         assert _CapturingAgent.last_init is not None
-        assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
+        assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
     def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"

@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple
 
+import httpx
+
 try:
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -54,6 +56,13 @@ class _ThreadContextCache:
     content: str
     fetched_at: float = field(default_factory=time.monotonic)
     message_count: int = 0
+
+
+@dataclass
+class _ChannelClientContextCache:
+    """Cache entry for channel→client registry context."""
+    content: str
+    fetched_at: float = field(default_factory=time.monotonic)
 
 
 def check_slack_requirements() -> bool:
@@ -96,12 +105,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
-        # Track timestamps of messages sent by the bot so we can respond
-        # to thread replies even without an explicit @mention.
+        # Track timestamps of messages sent by the bot so fetched thread
+        # context can reliably identify Hermes-authored messages.
         self._bot_message_ts: set = set()
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
-        # Track threads where the bot has been @mentioned — once mentioned,
-        # respond to ALL subsequent messages in that thread automatically.
+        # Track thread roots where Hermes has been explicitly @mentioned.
+        # This is bookkeeping only — it must not auto-enable future replies
+        # without a fresh @mention on the current thread message.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
@@ -113,6 +123,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Cache for _fetch_thread_context results: cache_key → _ThreadContextCache
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         self._THREAD_CACHE_TTL = 60.0
+        # Cache for Slack channel → client registry context lookups.
+        self._channel_client_context_cache: Dict[str, _ChannelClientContextCache] = {}
+        self._CHANNEL_CLIENT_CONTEXT_TTL = 300.0
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -823,6 +836,90 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return {"name": chat_id, "type": "unknown"}
 
+    def _teable_client_registry_api_url(self) -> str:
+        """Return the Teable API base URL for client-registry lookups."""
+        raw = os.getenv("TEABLE_BASE_URL", "https://app.teable.ai").strip().rstrip("/")
+        if raw.endswith("/api"):
+            return raw
+        return f"{raw}/api"
+
+    def _teable_client_registry_table_id(self) -> str:
+        """Return the Teable table ID used for Slack channel → client lookups."""
+        return os.getenv("TEABLE_CLIENT_REGISTRY_TABLE_ID", "").strip()
+
+    def _clean_channel_client_value(self, value: Any) -> str:
+        """Collapse channel-registry values into a single bounded line for prompt safety."""
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text[:200]
+
+    def _format_channel_client_context(self, fields: Dict[str, Any], channel_id: str) -> str:
+        """Format a compact client context block for a Slack channel."""
+        preferred_fields = [
+            ("Client Name", fields.get("Client Name")),
+            ("Client Status", fields.get("Client Status")),
+            ("Client Domain", fields.get("Client Domain")),
+            ("Slack Channel ID", fields.get("Slack Channel ID") or channel_id),
+            ("Slack Channel Name", fields.get("Slack Channel Name")),
+            ("HubSpot Company ID", fields.get("HubSpot Company ID")),
+        ]
+        lines = [
+            f"{label}: {self._clean_channel_client_value(value)}"
+            for label, value in preferred_fields
+            if value
+        ]
+        if not lines:
+            return ""
+        return (
+            "[Slack client context — resolved from channel registry:]\n"
+            + "\n".join(lines)
+            + "\n[End of Slack client context]\n\n"
+        )
+
+    async def _fetch_channel_client_context(self, channel_id: str) -> str:
+        """Resolve the client for a Slack channel via the Teable client registry."""
+        if not channel_id or channel_id.startswith("D"):
+            return ""
+
+        now = time.monotonic()
+        cached = self._channel_client_context_cache.get(channel_id)
+        if cached and (now - cached.fetched_at) < self._CHANNEL_CLIENT_CONTEXT_TTL:
+            return cached.content
+
+        token = os.getenv("TEABLE_API_KEY", "").strip()
+        table_id = self._teable_client_registry_table_id()
+        if not token or not table_id:
+            self._channel_client_context_cache[channel_id] = _ChannelClientContextCache(content="")
+            return ""
+
+        content = ""
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                result = await client.get(
+                    f"{self._teable_client_registry_api_url()}/table/{table_id}/record",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={
+                        "take": 1000,
+                        "cellFormat": "text",
+                        "fieldKeyType": "name",
+                    },
+                )
+                result.raise_for_status()
+                payload = result.json()
+
+            for record in payload.get("records", []):
+                fields = record.get("fields") or {}
+                if str(fields.get("Slack Channel ID") or "").strip() != channel_id:
+                    continue
+                content = self._format_channel_client_context(fields, channel_id)
+                break
+        except Exception as e:
+            logger.debug("[Slack] Failed to resolve client context for channel %s: %s", channel_id, e)
+            content = ""
+
+        self._channel_client_context_cache[channel_id] = _ChannelClientContextCache(content=content)
+        return content
+
     # ----- Internal handlers -----
 
     def _assistant_thread_key(self, channel_id: str, thread_ts: str) -> Optional[Tuple[str, str]]:
@@ -1028,46 +1125,27 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
-        # In channels, respond if:
-        #   0. Channel is in free_response_channels, OR require_mention is
-        #      disabled — always process regardless of mention.
-        #   1. The bot is @mentioned in this message, OR
-        #   2. The message is a reply in a thread the bot started/participated in, OR
-        #   3. The message is in a thread where the bot was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
+        # In channels, top-level messages may use free-response / global
+        # mention settings, but thread replies are always mention-only.
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         is_mentioned = bot_uid and f"<@{bot_uid}>" in text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid:
-            if channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process
-            elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
-            elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = (
-                    is_thread_reply
-                    and self._has_active_session_for_thread(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        user_id=user_id,
-                    )
-                )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+            if is_thread_reply:
+                if not is_mentioned:
                     return
+            elif channel_id in self._slack_free_response_channels():
+                pass  # Free-response channel — always process top-level messages
+            elif not self._slack_require_mention():
+                pass  # Mention requirement disabled globally for top-level Slack messages
+            elif not is_mentioned:
+                return
 
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
-            # Register this thread so all future messages auto-trigger the bot
             if event_thread_ts:
                 self._mentioned_threads.add(event_thread_ts)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
@@ -1075,21 +1153,40 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        active_thread_session = False
+        if is_thread_reply:
+            active_thread_session = self._has_active_session_for_thread(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                user_id=user_id,
+            )
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
-            channel_id=channel_id,
-            thread_ts=event_thread_ts,
-            user_id=user_id,
-        ):
+        if is_thread_reply and not active_thread_session:
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
                 current_ts=ts,
                 team_id=team_id,
+                include_bot_messages=True,
             )
             if thread_context:
                 text = thread_context + text
+        elif is_thread_reply and is_mentioned and active_thread_session:
+            parent_context = await self._fetch_thread_parent_context(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                current_ts=ts,
+                team_id=team_id,
+            )
+            if parent_context:
+                text = parent_context + text
+
+        if not is_dm:
+            channel_client_context = await self._fetch_channel_client_context(channel_id)
+            if channel_client_context:
+                text = channel_client_context + text
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -1401,9 +1498,73 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Thread context fetching -----
 
+    def _thread_context_cache_key(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        current_ts: str,
+        include_bot_messages: bool,
+        parent_only: bool,
+        limit: int,
+    ) -> str:
+        """Build a cache key that preserves context-fetch variants."""
+        return (
+            f"{channel_id}:{thread_ts}:{current_ts}:"
+            f"bots={int(include_bot_messages)}:parent={int(parent_only)}:limit={limit}"
+        )
+
+    def _message_is_our_bot_message(self, message: Dict[str, Any], team_id: str = "") -> bool:
+        """Return True when a fetched thread message was authored by Hermes."""
+        msg_ts = str(message.get("ts") or "")
+        if msg_ts and msg_ts in self._bot_message_ts:
+            return True
+
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        msg_user = str(message.get("user") or "")
+        return bool(bot_uid and msg_user and msg_user == bot_uid)
+
+    async def _format_thread_context_speaker(self, message: Dict[str, Any], channel_id: str) -> str:
+        """Format the speaker label for a fetched thread-context message."""
+        if message.get("bot_id") or message.get("subtype") == "bot_message":
+            bot_profile = message.get("bot_profile") or {}
+            name = (
+                message.get("username")
+                or bot_profile.get("name")
+                or message.get("app_name")
+                or "Slack"
+            )
+            return f"{name} [bot]"
+
+        msg_user = str(message.get("user") or "unknown")
+        return await self._resolve_user_name(msg_user, chat_id=channel_id)
+
+    async def _fetch_thread_parent_context(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        current_ts: str,
+        team_id: str = "",
+    ) -> str:
+        """Fetch only the thread parent/root message for context."""
+        return await self._fetch_thread_context(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            current_ts=current_ts,
+            team_id=team_id,
+            include_bot_messages=True,
+            parent_only=True,
+            limit=1,
+        )
+
     async def _fetch_thread_context(
-        self, channel_id: str, thread_ts: str, current_ts: str,
-        team_id: str = "", limit: int = 30,
+        self,
+        channel_id: str,
+        thread_ts: str,
+        current_ts: str,
+        team_id: str = "",
+        limit: int = 30,
+        include_bot_messages: bool = False,
+        parent_only: bool = False,
     ) -> str:
         """Fetch recent thread messages to provide context when the bot is
         mentioned mid-thread for the first time.
@@ -1420,7 +1581,14 @@ class SlackAdapter(BasePlatformAdapter):
         Returns a formatted string with prior thread history, or empty string
         on failure or if the thread has no prior messages.
         """
-        cache_key = f"{channel_id}:{thread_ts}"
+        cache_key = self._thread_context_cache_key(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            current_ts=current_ts,
+            include_bot_messages=include_bot_messages,
+            parent_only=parent_only,
+            limit=limit,
+        )
         now = time.monotonic()
         cached = self._thread_context_cache.get(cache_key)
         if cached and (now - cached.fetched_at) < self._THREAD_CACHE_TTL:
@@ -1436,7 +1604,7 @@ class SlackAdapter(BasePlatformAdapter):
                     result = await client.conversations_replies(
                         channel=channel_id,
                         ts=thread_ts,
-                        limit=limit + 1,  # +1 because it includes the current message
+                        limit=max(limit, 1) + (0 if parent_only else 1),
                         inclusive=True,
                     )
                     break
@@ -1464,17 +1632,22 @@ class SlackAdapter(BasePlatformAdapter):
             messages = result.get("messages", [])
             if not messages:
                 return ""
+            if parent_only:
+                messages = [msg for msg in messages if str(msg.get("ts") or "") == str(thread_ts)]
 
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
             context_parts = []
             for msg in messages:
-                msg_ts = msg.get("ts", "")
+                msg_ts = str(msg.get("ts") or "")
                 # Exclude the current triggering message — it will be delivered
                 # as the user message itself, so including it here would duplicate it.
                 if msg_ts == current_ts:
                     continue
-                # Exclude our own bot messages to avoid circular context.
-                if msg.get("bot_id") or msg.get("subtype") == "bot_message":
+
+                is_bot_message = bool(msg.get("bot_id") or msg.get("subtype") == "bot_message")
+                if self._message_is_our_bot_message(msg, team_id=team_id):
+                    continue
+                if is_bot_message and not include_bot_messages:
                     continue
 
                 msg_text = msg.get("text", "").strip()
@@ -1485,19 +1658,20 @@ class SlackAdapter(BasePlatformAdapter):
                 if bot_uid:
                     msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
 
-                msg_user = msg.get("user", "unknown")
                 is_parent = msg_ts == thread_ts
                 prefix = "[thread parent] " if is_parent else ""
-                name = await self._resolve_user_name(msg_user, chat_id=channel_id)
-                context_parts.append(f"{prefix}{name}: {msg_text}")
+                speaker = await self._format_thread_context_speaker(msg, channel_id)
+                context_parts.append(f"{prefix}{speaker}: {msg_text}")
 
             content = ""
             if context_parts:
-                content = (
-                    "[Thread context — prior messages in this thread (not yet in conversation history):]\n"
-                    + "\n".join(context_parts)
-                    + "\n[End of thread context]\n\n"
-                )
+                if parent_only:
+                    header = "[Thread parent context — prior root message only:]\n"
+                    footer = "\n[End of thread parent context]\n\n"
+                else:
+                    header = "[Thread context — prior messages in this thread (not yet in conversation history):]\n"
+                    footer = "\n[End of thread context]\n\n"
+                content = header + "\n".join(context_parts) + footer
 
             self._thread_context_cache[cache_key] = _ThreadContextCache(
                 content=content,

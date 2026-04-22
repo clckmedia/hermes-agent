@@ -226,3 +226,14 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
     created["bot"].tree.allow_finish.set()
     await asyncio.sleep(0)
     await adapter.disconnect()
+
+
+def test_register_slash_commands_skips_skill_group_when_disabled(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token", extra={"skill_slash_commands": False}))
+    adapter._client = SimpleNamespace(tree=FakeTree())
+    register_skill_group = MagicMock()
+    monkeypatch.setattr(adapter, "_register_skill_group", register_skill_group)
+
+    adapter._register_slash_commands()
+
+    register_skill_group.assert_not_called()
