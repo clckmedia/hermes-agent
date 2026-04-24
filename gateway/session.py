@@ -364,8 +364,12 @@ class SessionEntry:
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
     was_auto_reset: bool = False
-    auto_reset_reason: Optional[str] = None  # "idle" or "daily"
+    auto_reset_reason: Optional[str] = None  # "idle", "daily", or "oversized"
     reset_had_activity: bool = False  # whether the expired session had any messages
+
+    # One-shot approaching-limit warning state. Cleared automatically if the
+    # session later drops back below the warning threshold.
+    size_warning_sent: bool = False
     
     # Set by the background expiry watcher after it successfully flushes
     # memories for this session.  Persisted to sessions.json so the flag
@@ -407,6 +411,8 @@ class SessionEntry:
             "last_prompt_tokens": self.last_prompt_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
+            "reset_had_activity": self.reset_had_activity,
+            "size_warning_sent": self.size_warning_sent,
             "memory_flushed": self.memory_flushed,
             "suspended": self.suspended,
             "resume_pending": self.resume_pending,
@@ -459,12 +465,86 @@ class SessionEntry:
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
+            reset_had_activity=data.get("reset_had_activity", False),
+            size_warning_sent=data.get("size_warning_sent", False),
             memory_flushed=data.get("memory_flushed", False),
             suspended=data.get("suspended", False),
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
         )
+
+
+def build_forced_compaction_fallback_history(
+    history: List[Dict[str, Any]],
+    *,
+    keep_last_messages: int = 24,
+) -> List[Dict[str, Any]]:
+    """Deterministically shrink a transcript when LLM summarisation fails.
+
+    Preserves the session_meta header (if present) plus the recent tail of the
+    actual conversation, inserting one assistant note that explains older turns
+    were omitted. This is the last-resort safety valve before a huge transcript
+    would otherwise keep causing API failures.
+    """
+    if not history:
+        return []
+
+    keep_last_messages = max(int(keep_last_messages or 0), 1)
+    session_meta = [msg for msg in history if isinstance(msg, dict) and msg.get("role") == "session_meta"]
+    convo = [
+        msg for msg in history
+        if isinstance(msg, dict) and msg.get("role") != "session_meta"
+    ]
+    if len(convo) <= keep_last_messages:
+        return history
+
+    note = {
+        "role": "assistant",
+        "content": (
+            "[Automatic compression fallback: older conversation context was omitted "
+            "because summarisation failed. The recent tail was preserved so the "
+            "session can keep going. Use /resume if you need the full earlier transcript.]"
+        ),
+    }
+    tail = convo[-keep_last_messages:]
+    result: List[Dict[str, Any]] = []
+    if session_meta:
+        result.append(session_meta[0])
+    result.append(note)
+    result.extend(tail)
+    return result
+
+
+def describe_auto_reset_reason(
+    reset_reason: str,
+    policy: SessionResetPolicy,
+) -> tuple[str, str]:
+    """Return (context_note, user-facing reason text) for an automatic reset."""
+    reason = str(reset_reason or "idle").strip().lower()
+    if reason == "suspended":
+        return (
+            "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]",
+            "previous session was stopped or interrupted",
+        )
+    if reason == "daily":
+        return (
+            "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]",
+            f"daily schedule at {policy.at_hour}:00",
+        )
+    if reason == "oversized":
+        return (
+            "[System note: The user's previous session grew too large and was automatically rotated. This is a fresh conversation with no prior context.]",
+            "session grew too large",
+        )
+
+    hours = policy.idle_minutes // 60
+    mins = policy.idle_minutes % 60
+    duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
+    return (
+        "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]",
+        f"inactive for {duration}",
+    )
 
 
 def is_shared_multi_user_session(
@@ -647,6 +727,9 @@ class SessionStore:
             session_type=entry.chat_type,
         )
 
+        if self._session_exceeds_size_limits(entry, policy):
+            return True
+
         if policy.mode == "none":
             return False
 
@@ -669,6 +752,105 @@ class SessionStore:
 
         return False
 
+    def _session_exceeds_size_limits(
+        self,
+        entry: SessionEntry,
+        policy: SessionResetPolicy,
+    ) -> bool:
+        """Return True when persisted session stats breach configured size guards.
+
+        Uses SQLite session stats as the source of truth because the in-memory
+        SessionEntry counters are intentionally lightweight and may lag reality.
+        Falls back to the entry's cached token total when SQLite is unavailable.
+        """
+        max_input_tokens = int(getattr(policy, "max_input_tokens", 0) or 0)
+        max_message_count = int(getattr(policy, "max_message_count", 0) or 0)
+        if max_input_tokens <= 0 and max_message_count <= 0:
+            return False
+
+        stats = self._get_session_usage_stats(entry)
+        if stats:
+            if max_input_tokens > 0 and int(stats.get("input_tokens") or 0) >= max_input_tokens:
+                return True
+            if max_message_count > 0 and int(stats.get("message_count") or 0) >= max_message_count:
+                return True
+            return False
+
+        if max_input_tokens > 0 and int(getattr(entry, "total_tokens", 0) or 0) >= max_input_tokens:
+            return True
+        return False
+
+    def _get_session_usage_stats(self, entry: SessionEntry) -> Optional[Dict[str, Any]]:
+        """Return persisted usage stats for a session when available."""
+        if self._db is None:
+            return None
+        try:
+            return self._db.get_session(entry.session_id)
+        except Exception as exc:
+            logger.debug("Session DB get_session failed for %s: %s", entry.session_id, exc)
+            return None
+
+    def consume_session_size_warning(self, entry: SessionEntry) -> Optional[str]:
+        """Return a one-shot approaching-limit warning, or None.
+
+        The warning flag is persisted on the SessionEntry so a user only sees the
+        notice once while the session remains above the threshold. If the session
+        later drops back below the threshold (for example after /compact), the
+        flag is cleared so a future rise can warn again.
+        """
+        policy = self.config.get_reset_policy(
+            platform=entry.platform,
+            session_type=entry.chat_type,
+        )
+        max_input_tokens = int(getattr(policy, "max_input_tokens", 0) or 0)
+        max_message_count = int(getattr(policy, "max_message_count", 0) or 0)
+        warning_fraction = float(getattr(policy, "warning_threshold_fraction", 0.8) or 0.0)
+        if warning_fraction <= 0 or (max_input_tokens <= 0 and max_message_count <= 0):
+            if entry.size_warning_sent:
+                entry.size_warning_sent = False
+                self._save()
+            return None
+
+        stats = self._get_session_usage_stats(entry) or {}
+        input_tokens = int(stats.get("input_tokens") or getattr(entry, "total_tokens", 0) or 0)
+        message_count = int(stats.get("message_count") or 0)
+
+        hard_exceeded = (
+            (max_input_tokens > 0 and input_tokens >= max_input_tokens)
+            or (max_message_count > 0 and message_count >= max_message_count)
+        )
+        if hard_exceeded:
+            if entry.size_warning_sent:
+                entry.size_warning_sent = False
+                self._save()
+            return None
+
+        warning_text = None
+        if max_input_tokens > 0 and input_tokens >= int(max_input_tokens * warning_fraction):
+            warning_text = (
+                f"⚠️ Heads up — this session is approaching the auto-rotation limit "
+                f"({input_tokens:,} / {max_input_tokens:,} input tokens). "
+                f"If older context matters, consider /compact soon. If it rotates later, "
+                f"the earlier transcript will still be available via /resume."
+            )
+        elif max_message_count > 0 and message_count >= int(max_message_count * warning_fraction):
+            warning_text = (
+                f"⚠️ Heads up — this session is approaching the auto-rotation limit "
+                f"({message_count:,} / {max_message_count:,} messages). "
+                f"If older context matters, consider /compact soon. If it rotates later, "
+                f"the earlier transcript will still be available via /resume."
+            )
+
+        if warning_text and not entry.size_warning_sent:
+            entry.size_warning_sent = True
+            self._save()
+            return warning_text
+
+        if not warning_text and entry.size_warning_sent:
+            entry.size_warning_sent = False
+            self._save()
+        return None
+
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
         """
         Check if a session should be reset based on policy.
@@ -687,6 +869,9 @@ class SessionStore:
             platform=source.platform,
             session_type=source.chat_type
         )
+
+        if self._session_exceeds_size_limits(entry, policy):
+            return "oversized"
         
         if policy.mode == "none":
             return None
@@ -788,8 +973,14 @@ class SessionStore:
                     # Session is being auto-reset.
                     was_auto_reset = True
                     auto_reset_reason = reset_reason
-                    # Track whether the expired session had any real conversation
-                    reset_had_activity = entry.total_tokens > 0
+                    # Track whether the expired session had any real conversation.
+                    # Size-based resets should always be treated as having
+                    # activity because they only trigger from persisted session
+                    # stats after at least one real turn was stored.
+                    reset_had_activity = (
+                        reset_reason == "oversized"
+                        or entry.total_tokens > 0
+                    )
                     db_end_session_id = entry.session_id
             else:
                 was_auto_reset = False

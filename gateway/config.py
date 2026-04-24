@@ -107,10 +107,22 @@ class SessionResetPolicy:
     - "idle": Reset after N minutes of inactivity
     - "both": Whichever triggers first (daily boundary OR idle timeout)
     - "none": Never auto-reset (context managed only by compression)
+
+    Size guards:
+    - ``max_input_tokens`` rotates a session once cumulative prompt/input tokens
+      recorded in SQLite exceed the threshold.
+    - ``max_message_count`` rotates a session once persisted message count
+      exceeds the threshold.
+    - ``warning_threshold_fraction`` emits one warning when the session reaches
+      that fraction of either configured size guard.
+    - Zero/None disables the corresponding guard.
     """
     mode: str = "both"  # "daily", "idle", "both", or "none"
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
+    max_input_tokens: int = 0  # Cumulative per-session input tokens before auto-rotation
+    max_message_count: int = 0  # Persisted message count before auto-rotation
+    warning_threshold_fraction: float = 0.8  # Warn once when size reaches this fraction of the hard limit
     notify: bool = True  # Send a notification to the user when auto-reset occurs
     notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
     
@@ -119,6 +131,9 @@ class SessionResetPolicy:
             "mode": self.mode,
             "at_hour": self.at_hour,
             "idle_minutes": self.idle_minutes,
+            "max_input_tokens": self.max_input_tokens,
+            "max_message_count": self.max_message_count,
+            "warning_threshold_fraction": self.warning_threshold_fraction,
             "notify": self.notify,
             "notify_exclude_platforms": list(self.notify_exclude_platforms),
         }
@@ -129,12 +144,18 @@ class SessionResetPolicy:
         mode = data.get("mode")
         at_hour = data.get("at_hour")
         idle_minutes = data.get("idle_minutes")
+        max_input_tokens = data.get("max_input_tokens")
+        max_message_count = data.get("max_message_count")
+        warning_threshold_fraction = data.get("warning_threshold_fraction")
         notify = data.get("notify")
         exclude = data.get("notify_exclude_platforms")
         return cls(
             mode=mode if mode is not None else "both",
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
+            max_input_tokens=max_input_tokens if max_input_tokens is not None else 0,
+            max_message_count=max_message_count if max_message_count is not None else 0,
+            warning_threshold_fraction=(warning_threshold_fraction if warning_threshold_fraction is not None else 0.8),
             notify=notify if notify is not None else True,
             notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
         )

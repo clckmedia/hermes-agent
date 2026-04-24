@@ -495,6 +495,58 @@ class TestThreadEngagement:
         assert delivered.text.rstrip().endswith("give us an update on this client")
 
     @pytest.mark.asyncio
+    async def test_handle_slack_message_plaintext_reset_maps_to_command(self):
+        adapter = _make_adapter()
+        adapter._resolve_user_name = AsyncMock(return_value="Damien")
+        adapter._has_active_session_for_thread = MagicMock(return_value=True)
+        adapter._fetch_thread_parent_context = AsyncMock(return_value="")
+        adapter._fetch_channel_client_context = AsyncMock(return_value="")
+        adapter._add_reaction = AsyncMock()
+        adapter._remove_reaction = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "channel": "C1",
+            "ts": "1002.2",
+            "thread_ts": "1002.0",
+            "user": "U1",
+            "text": "<@U_BOT> reset this session",
+            "team": "T1",
+            "channel_type": "channel",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter._fetch_thread_parent_context.assert_not_awaited()
+        adapter._fetch_channel_client_context.assert_not_awaited()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "/reset"
+        assert delivered.message_type.name == "COMMAND"
+
+    @pytest.mark.asyncio
+    async def test_handle_slack_message_plaintext_reset_maps_to_command_in_dm(self):
+        adapter = _make_adapter()
+        adapter._resolve_user_name = AsyncMock(return_value="Damien")
+        adapter._add_reaction = AsyncMock()
+        adapter._remove_reaction = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "channel": "D1",
+            "ts": "1003.0",
+            "user": "U1",
+            "text": "reset session",
+            "team": "T1",
+            "channel_type": "im",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "/reset"
+        assert delivered.message_type.name == "COMMAND"
+
+    @pytest.mark.asyncio
     async def test_bot_message_ts_cap(self):
         """Verify memory is bounded when many messages are sent."""
         adapter = _make_adapter()

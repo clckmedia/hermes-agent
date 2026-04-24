@@ -119,26 +119,43 @@ class TestGetConnectedPlatforms:
 
 class TestSessionResetPolicy:
     def test_roundtrip(self):
-        policy = SessionResetPolicy(mode="idle", at_hour=6, idle_minutes=120)
+        policy = SessionResetPolicy(
+            mode="idle",
+            at_hour=6,
+            idle_minutes=120,
+            max_input_tokens=250000,
+            max_message_count=300,
+            warning_threshold_fraction=0.85,
+        )
         d = policy.to_dict()
         restored = SessionResetPolicy.from_dict(d)
         assert restored.mode == "idle"
         assert restored.at_hour == 6
         assert restored.idle_minutes == 120
+        assert restored.max_input_tokens == 250000
+        assert restored.max_message_count == 300
+        assert restored.warning_threshold_fraction == 0.85
 
     def test_defaults(self):
         policy = SessionResetPolicy()
         assert policy.mode == "both"
         assert policy.at_hour == 4
         assert policy.idle_minutes == 1440
+        assert policy.warning_threshold_fraction == 0.8
 
     def test_from_dict_treats_null_values_as_defaults(self):
         restored = SessionResetPolicy.from_dict(
-            {"mode": None, "at_hour": None, "idle_minutes": None}
+            {
+                "mode": None,
+                "at_hour": None,
+                "idle_minutes": None,
+                "warning_threshold_fraction": None,
+            }
         )
         assert restored.mode == "both"
         assert restored.at_hour == 4
         assert restored.idle_minutes == 1440
+        assert restored.warning_threshold_fraction == 0.8
 
 
 class TestGatewayConfigRoundtrip:

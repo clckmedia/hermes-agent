@@ -2928,6 +2928,90 @@ class AIAgent:
 
         return context
 
+    def _should_attempt_large_session_error_compaction(
+        self,
+        *,
+        classified_reason: FailoverReason,
+        approx_tokens: int,
+        api_message_count: int,
+    ) -> bool:
+        """Return True when a retryable giant-session error should compact first.
+
+        Some providers surface oversized/degraded requests as generic 5xx,
+        timeout, or opaque transport failures instead of explicit context
+        overflow errors. When the session is already very large, compact once
+        before spending retries/fallback budget on the same giant payload.
+        """
+        if not self.compression_enabled:
+            return False
+
+        compressor = getattr(self, "context_compressor", None)
+        if compressor is None:
+            return False
+
+        if classified_reason not in (
+            FailoverReason.server_error,
+            FailoverReason.overloaded,
+            FailoverReason.timeout,
+            FailoverReason.unknown,
+        ):
+            return False
+
+        min_messages = (
+            int(getattr(compressor, "protect_first_n", 3) or 3)
+            + int(getattr(compressor, "protect_last_n", 6) or 6)
+            + 4
+        )
+        if api_message_count <= min_messages:
+            return False
+
+        context_length = max(1, int(getattr(compressor, "context_length", 0) or 0))
+        threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
+        token_trigger = max(
+            int(context_length * 0.65),
+            int(threshold_tokens * 0.9) if threshold_tokens else 0,
+            90000,
+        )
+        large_by_tokens = approx_tokens >= token_trigger
+        large_by_messages = api_message_count >= 120
+        return large_by_tokens or large_by_messages
+
+    def _build_large_session_error_hint(
+        self,
+        *,
+        classified_reason: FailoverReason,
+        approx_tokens: int,
+        api_message_count: int,
+        compaction_attempted: bool,
+    ) -> Optional[str]:
+        """Return a user-facing hint when failures likely come from giant-session drift."""
+        if not (
+            compaction_attempted
+            or self._should_attempt_large_session_error_compaction(
+                classified_reason=classified_reason,
+                approx_tokens=approx_tokens,
+                api_message_count=api_message_count,
+            )
+        ):
+            return None
+
+        if compaction_attempted:
+            first_line = (
+                "This probably isn’t just a normal API wobble — the session is big enough "
+                "that context degradation is likely, and Hermes already tried one automatic compaction pass."
+            )
+        else:
+            first_line = (
+                "This probably isn’t just a normal API wobble — the session is big enough "
+                "that context degradation is likely."
+            )
+
+        return (
+            f"{first_line}\n\n"
+            "Try /compact now, or /new if a fresh thread is acceptable. "
+            "Older transcript history is still preserved, and you can get back to it with /resume."
+        )
+
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
         if response is None:
@@ -8574,6 +8658,7 @@ class AIAgent:
         truncated_tool_call_retries = 0
         truncated_response_prefix = ""
         compression_attempts = 0
+        large_session_compaction_attempted_this_turn = False
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
         
         # Record the execution thread so interrupt()/clear_interrupt() can
@@ -8841,6 +8926,7 @@ class AIAgent:
             nous_auth_retry_attempted=False
             thinking_sig_retry_attempted = False
             has_retried_429 = False
+            graceful_large_session_compaction_attempted = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
 
@@ -9892,6 +9978,50 @@ class AIAgent:
                         # Fall through to normal error handling if compression
                         # is exhausted or didn't help.
 
+                    if (
+                        not graceful_large_session_compaction_attempted
+                        and self._should_attempt_large_session_error_compaction(
+                            classified_reason=classified.reason,
+                            approx_tokens=approx_tokens,
+                            api_message_count=len(api_messages) if api_messages else 0,
+                        )
+                    ):
+                        graceful_large_session_compaction_attempted = True
+                        large_session_compaction_attempted_this_turn = True
+                        pre_compact_tokens = estimate_request_tokens_rough(
+                            messages,
+                            system_prompt=active_system_prompt or system_message or "",
+                            tools=self.tools or None,
+                        )
+                        self._emit_status(
+                            f"🗜️ Large session + {classified.reason.value.replace('_', ' ')} — compacting before retry..."
+                        )
+                        original_len = len(messages)
+                        messages, active_system_prompt = self._compress_context(
+                            messages,
+                            system_message,
+                            approx_tokens=max(approx_tokens, pre_compact_tokens),
+                            task_id=effective_task_id,
+                        )
+                        conversation_history = None
+                        post_compact_tokens = estimate_request_tokens_rough(
+                            messages,
+                            system_prompt=active_system_prompt or system_message or "",
+                            tools=self.tools or None,
+                        )
+                        if len(messages) < original_len or post_compact_tokens < pre_compact_tokens:
+                            self._emit_status(
+                                f"🗜️ Compacted large session (~{pre_compact_tokens:,} → ~{post_compact_tokens:,} tokens), retrying..."
+                            )
+                            time.sleep(2)
+                            restart_with_compressed_messages = True
+                            break
+                        logger.info(
+                            "%sLarge-session graceful compaction attempted after %s, but payload did not shrink enough",
+                            self.log_prefix,
+                            classified.reason.value,
+                        )
+
                     # Eager fallback for rate-limit errors (429 or quota exhaustion).
                     # When a fallback model is configured, switch immediately instead
                     # of burning through retries with exponential backoff -- the
@@ -10285,6 +10415,17 @@ class AIAgent:
                             )
                         self._persist_session(messages, conversation_history)
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                        _large_session_hint = self._build_large_session_error_hint(
+                            classified_reason=classified.reason,
+                            approx_tokens=approx_tokens,
+                            api_message_count=len(api_messages),
+                            compaction_attempted=large_session_compaction_attempted_this_turn,
+                        )
+                        if _large_session_hint:
+                            self._emit_status(
+                                "💡 This looks more like giant-session degradation than a simple transient API fault."
+                            )
+                            _final_response += f"\n\n{_large_session_hint}"
                         if _is_stream_drop:
                             _final_response += (
                                 "\n\nThe provider's stream connection keeps "

@@ -266,6 +266,8 @@ from gateway.session import (
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    build_forced_compaction_fallback_history,
+    describe_auto_reset_reason,
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
@@ -3514,6 +3516,23 @@ class GatewayRunner:
 
         return message_text
 
+    async def _maybe_send_session_size_warning(self, source, session_entry, metadata=None):
+        """Send a one-shot warning when the session is approaching auto-rotation."""
+        try:
+            warning = self.session_store.consume_session_size_warning(session_entry)
+        except Exception as exc:
+            logger.debug("Session size warning check failed: %s", exc)
+            return
+        if not warning:
+            return
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        try:
+            await adapter.send(source.chat_id, warning, metadata=metadata)
+        except Exception as exc:
+            logger.debug("Session size warning send failed: %s", exc)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -3528,6 +3547,11 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        await self._maybe_send_session_size_warning(
+            source,
+            session_entry,
+            metadata=getattr(event, "metadata", None),
+        )
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -3565,12 +3589,18 @@ class GatewayRunner:
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
-            if reset_reason == "suspended":
-                context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
-            elif reset_reason == "daily":
-                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
-            else:
-                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
+            try:
+                policy = self.session_store.config.get_reset_policy(
+                    platform=source.platform,
+                    session_type=getattr(source, 'chat_type', 'dm'),
+                )
+            except Exception:
+                policy = None
+            if policy is None:
+                from gateway.config import SessionResetPolicy as _SessionResetPolicy
+                policy = _SessionResetPolicy()
+
+            context_note, reason_text = describe_auto_reset_reason(reset_reason, policy)
             context_prompt = context_note + "\n\n" + context_prompt
 
             # Send a user-facing notification explaining the reset, unless:
@@ -3578,10 +3608,6 @@ class GatewayRunner:
             # - the platform is excluded (e.g. api_server, webhook)
             # - the expired session had no activity (nothing was cleared)
             try:
-                policy = self.session_store.config.get_reset_policy(
-                    platform=source.platform,
-                    session_type=getattr(source, 'chat_type', 'dm'),
-                )
                 platform_name = source.platform.value if source.platform else ""
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
                 # Suspended sessions always notify (they were explicitly stopped
@@ -3594,15 +3620,6 @@ class GatewayRunner:
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
-                        elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
-                        else:
-                            hours = policy.idle_minutes // 60
-                            mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
                         notice = (
                             f"◐ Session automatically reset ({reason_text}). "
                             f"Conversation history cleared.\n"
@@ -3912,6 +3929,40 @@ class GatewayRunner:
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
                         )
+                        try:
+                            _fallback_history = build_forced_compaction_fallback_history(
+                                history,
+                                keep_last_messages=24,
+                            )
+                            if len(_fallback_history) < len(history):
+                                logger.warning(
+                                    "Session hygiene fallback: rotating session %s and keeping %s recent messages after compression failure.",
+                                    session_entry.session_id,
+                                    len(_fallback_history),
+                                )
+                                _new_entry = self.session_store.reset_session(session_key)
+                                if _new_entry is not None:
+                                    session_entry = _new_entry
+                                self._evict_cached_agent(session_key)
+                                self._session_model_overrides.pop(session_key, None)
+                                self.session_store.rewrite_transcript(
+                                    session_entry.session_id,
+                                    _fallback_history,
+                                )
+                                self.session_store.update_session(
+                                    session_entry.session_key,
+                                    last_prompt_tokens=0,
+                                )
+                                history = _fallback_history
+                                context_prompt = (
+                                    "[System note: Automatic fallback compaction preserved only the recent tail of the prior conversation because normal summarisation failed. If older context matters, ask the user to use /resume.]\n\n"
+                                    + context_prompt
+                                )
+                        except Exception as fallback_exc:
+                            logger.warning(
+                                "Session hygiene forced fallback also failed: %s",
+                                fallback_exc,
+                            )
 
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():

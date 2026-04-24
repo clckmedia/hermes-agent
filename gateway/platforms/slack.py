@@ -127,6 +127,22 @@ class SlackAdapter(BasePlatformAdapter):
         self._channel_client_context_cache: Dict[str, _ChannelClientContextCache] = {}
         self._CHANNEL_CLIENT_CONTEXT_TTL = 300.0
 
+    @staticmethod
+    def _coerce_plaintext_session_command(text: str) -> Optional[str]:
+        """Map exact plain-text reset/new requests to gateway session commands."""
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        normalized = normalized.strip(" .,!?:;\"'`()[]{}")
+        if normalized in {
+            "reset",
+            "reset session",
+            "reset this session",
+            "reset the session",
+            "new session",
+            "start new session",
+        }:
+            return "/reset"
+        return None
+
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -1153,6 +1169,10 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        plaintext_session_command = self._coerce_plaintext_session_command(text)
+        if plaintext_session_command:
+            text = plaintext_session_command
+
         active_thread_session = False
         if is_thread_reply:
             active_thread_session = self._has_active_session_for_thread(
@@ -1163,7 +1183,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not active_thread_session:
+        if is_thread_reply and not plaintext_session_command and not active_thread_session:
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
@@ -1173,7 +1193,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             if thread_context:
                 text = thread_context + text
-        elif is_thread_reply and is_mentioned and active_thread_session:
+        elif is_thread_reply and not plaintext_session_command and is_mentioned and active_thread_session:
             parent_context = await self._fetch_thread_parent_context(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
@@ -1183,7 +1203,7 @@ class SlackAdapter(BasePlatformAdapter):
             if parent_context:
                 text = parent_context + text
 
-        if not is_dm:
+        if not is_dm and not plaintext_session_command:
             channel_client_context = await self._fetch_channel_client_context(channel_id)
             if channel_client_context:
                 text = channel_client_context + text
