@@ -11,6 +11,8 @@ def test_describe_auto_reset_reason_for_oversized_session():
     )
 
     assert "grew too large" in context_note
+    assert "do not guess" in context_note
+    assert "session_search" in context_note
     assert reason_text == "session grew too large"
 
 
@@ -21,4 +23,5 @@ def test_describe_auto_reset_reason_for_idle_session():
     )
 
     assert "inactivity" in context_note
+    assert "do not guess" in context_note
     assert reason_text == "inactive for 2h 30m"

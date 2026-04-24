@@ -68,6 +68,25 @@ class TestSessionStoreSizeWarnings:
         assert second is None
         assert entry.size_warning_sent is True
 
+    def test_warning_emitted_once_when_session_exceeds_input_limit(self, tmp_path):
+        source = _make_source()
+        entry = _make_entry(source)
+        db = FakeDB({"sess-live": {"input_tokens": 2_100_000, "message_count": 120}})
+        store = _make_store(
+            tmp_path,
+            SessionResetPolicy(mode="idle", max_input_tokens=2_000_000, warning_threshold_fraction=0.8),
+            db,
+        )
+
+        first = store.consume_session_size_warning(entry)
+        second = store.consume_session_size_warning(entry)
+
+        assert "has exceeded the auto-rotation limit" in first
+        assert "2,100,000 / 2,000,000" in first
+        assert "next message" in first
+        assert second is None
+        assert entry.size_warning_sent is True
+
     def test_warning_flag_clears_when_session_drops_below_threshold(self, tmp_path):
         source = _make_source()
         entry = _make_entry(source)

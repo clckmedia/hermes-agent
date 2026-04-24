@@ -49,6 +49,40 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "qqbot",
 })
 
+# Platform home delivery variables are not perfectly uniform across adapters.
+# Keep the allow-list explicit so cron fallback cannot enumerate arbitrary env vars.
+_DELIVERY_HOME_ENV_VARS = {
+    "matrix": ("MATRIX_HOME_ROOM", "MATRIX_HOME_CHANNEL"),
+    "telegram": ("TELEGRAM_HOME_CHANNEL",),
+    "discord": ("DISCORD_HOME_CHANNEL",),
+    "slack": ("SLACK_HOME_CHANNEL",),
+    "signal": ("SIGNAL_HOME_CHANNEL",),
+    "mattermost": ("MATTERMOST_HOME_CHANNEL",),
+    "sms": ("SMS_HOME_CHANNEL",),
+    "email": ("EMAIL_HOME_ADDRESS", "EMAIL_HOME_CHANNEL"),
+    "dingtalk": ("DINGTALK_HOME_CHANNEL",),
+    "feishu": ("FEISHU_HOME_CHANNEL",),
+    "wecom": ("WECOM_HOME_CHANNEL",),
+    "weixin": ("WEIXIN_HOME_CHANNEL",),
+    "bluebubbles": ("BLUEBUBBLES_HOME_CHANNEL",),
+    "qqbot": ("QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"),
+}
+
+_DELIVERY_HOME_FALLBACK_ORDER = (
+    "matrix", "telegram", "discord", "slack", "signal", "mattermost",
+    "sms", "email", "dingtalk", "bluebubbles", "feishu", "wecom",
+    "weixin", "qqbot",
+)
+
+
+def _home_channel_for_platform(platform_name: str) -> str:
+    """Return the configured home channel/address for a supported platform."""
+    for env_var in _DELIVERY_HOME_ENV_VARS.get(platform_name.lower(), (f"{platform_name.upper()}_HOME_CHANNEL",)):
+        value = os.getenv(env_var, "").strip()
+        if value:
+            return value
+    return ""
+
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -93,8 +127,8 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
             }
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in ("matrix", "telegram", "discord", "slack", "bluebubbles"):
-            chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
+        for platform_name in _DELIVERY_HOME_FALLBACK_ORDER:
+            chat_id = _home_channel_for_platform(platform_name)
             if chat_id:
                 logger.info(
                     "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
@@ -149,7 +183,7 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
 
     if platform_name.lower() not in _KNOWN_DELIVERY_PLATFORMS:
         return None
-    chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
+    chat_id = _home_channel_for_platform(platform_name)
     if not chat_id:
         return None
 
@@ -188,7 +222,11 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
             future = asyncio.run_coroutine_threadsafe(coro, loop)
-            result = future.result(timeout=30)
+            try:
+                result = future.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                raise
             if result and not getattr(result, "success", True):
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
@@ -318,7 +356,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
                     loop,
                 )
-                send_result = future.result(timeout=60)
+                try:
+                    send_result = future.result(timeout=60)
+                except concurrent.futures.TimeoutError:
+                    future.cancel()
+                    raise
                 if send_result and not getattr(send_result, "success", True):
                     err = getattr(send_result, "error", "unknown")
                     logger.warning(
@@ -350,7 +392,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
         # fresh thread that has no running loop.
         coro.close()
-        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
             result = future.result(timeout=30)
@@ -487,15 +528,43 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
-def _build_job_prompt(job: dict) -> str:
-    """Build the effective prompt for a cron job, optionally loading one or more skills first."""
+def _parse_wake_gate(script_output: str) -> bool:
+    """Return whether a cron pre-run script should wake the agent.
+
+    If the last non-empty stdout line is JSON like ``{"wakeAgent": false}``,
+    skip the LLM run entirely. Everything else defaults to waking the agent.
+    Only strict boolean ``False`` suppresses the run.
+    """
+    if not script_output:
+        return True
+    stripped_lines = [line for line in str(script_output).splitlines() if line.strip()]
+    if not stripped_lines:
+        return True
+    try:
+        gate = json.loads(stripped_lines[-1].strip())
+    except (json.JSONDecodeError, ValueError):
+        return True
+    if not isinstance(gate, dict):
+        return True
+    return gate.get("wakeAgent", True) is not False
+
+
+def _build_job_prompt(job: dict, prerun_script: Optional[tuple[bool, str]] = None) -> str:
+    """Build the effective prompt for a cron job, optionally loading one or more skills first.
+
+    ``prerun_script`` lets ``run_job`` execute a data-collection script once
+    for wake-gate handling, then reuse the same result for prompt injection.
+    """
     prompt = job.get("prompt", "")
     skills = job.get("skills")
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
     if script_path:
-        success, script_output = _run_job_script(script_path)
+        if prerun_script is not None:
+            success, script_output = prerun_script
+        else:
+            success, script_output = _run_job_script(script_path)
         if success:
             if script_output:
                 prompt = (
@@ -597,7 +666,26 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     
     job_id = job["id"]
     job_name = job["name"]
-    prompt = _build_job_prompt(job)
+
+    # Wake-gate: if a pre-run script ends with {"wakeAgent": false}, skip the
+    # expensive agent run and delivery entirely. Pass the cached result into
+    # _build_job_prompt so wake=true scripts still execute only once.
+    prerun_script = None
+    script_path = job.get("script")
+    if script_path:
+        prerun_script = _run_job_script(script_path)
+        ran_ok, script_output = prerun_script
+        if ran_ok and not _parse_wake_gate(script_output):
+            logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Script gate returned `wakeAgent=false` — agent skipped.\n"
+            )
+            return True, silent_doc, SILENT_MARKER, None
+
+    prompt = _build_job_prompt(job, prerun_script=prerun_script)
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 

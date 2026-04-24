@@ -534,7 +534,10 @@ def describe_auto_reset_reason(
         )
     if reason == "oversized":
         return (
-            "[System note: The user's previous session grew too large and was automatically rotated. This is a fresh conversation with no prior context.]",
+            "[System note: The user's previous session grew too large and was automatically rotated. "
+            "This is a fresh conversation with no prior context. If the user's message refers to prior context "
+            "with words like 'that', 'this', 'it', 'they', or 'as above', do not guess; first recover context "
+            "with /resume or session_search, or ask the user for the missing context.]",
             "session grew too large",
         )
 
@@ -542,7 +545,10 @@ def describe_auto_reset_reason(
     mins = policy.idle_minutes % 60
     duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
     return (
-        "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]",
+        "[System note: The user's previous session expired due to inactivity. This is a fresh conversation "
+        "with no prior context. If the user's message refers to prior context with words like 'that', 'this', "
+        "'it', 'they', or 'as above', do not guess; first recover context with /resume or session_search, "
+        "or ask the user for the missing context.]",
         f"inactive for {duration}",
     )
 
@@ -821,9 +827,22 @@ class SessionStore:
         )
         if hard_exceeded:
             if entry.size_warning_sent:
-                entry.size_warning_sent = False
-                self._save()
-            return None
+                return None
+            entry.size_warning_sent = True
+            self._save()
+            if max_input_tokens > 0 and input_tokens >= max_input_tokens:
+                return (
+                    f"⚠️ Heads up — this session has exceeded the auto-rotation limit "
+                    f"({input_tokens:,} / {max_input_tokens:,} input tokens). "
+                    f"The next message in this conversation may start a fresh session. "
+                    f"Use /compact now if older context still matters, or /resume after rotation."
+                )
+            return (
+                f"⚠️ Heads up — this session has exceeded the auto-rotation limit "
+                f"({message_count:,} / {max_message_count:,} messages). "
+                f"The next message in this conversation may start a fresh session. "
+                f"Use /compact now if older context still matters, or /resume after rotation."
+            )
 
         warning_text = None
         if max_input_tokens > 0 and input_tokens >= int(max_input_tokens * warning_fraction):
@@ -977,9 +996,12 @@ class SessionStore:
                     # Size-based resets should always be treated as having
                     # activity because they only trigger from persisted session
                     # stats after at least one real turn was stored.
+                    stats = self._get_session_usage_stats(entry) or {}
                     reset_had_activity = (
                         reset_reason == "oversized"
                         or entry.total_tokens > 0
+                        or int(stats.get("message_count") or 0) > 0
+                        or int(stats.get("input_tokens") or 0) > 0
                     )
                     db_end_session_id = entry.session_id
             else:

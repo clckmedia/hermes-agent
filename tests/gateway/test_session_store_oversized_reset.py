@@ -6,7 +6,7 @@ stats from SQLite so it still works even when the in-memory SessionEntry has
 stale counters.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
@@ -113,6 +113,35 @@ class TestOversizedSessionReset:
 
         assert new_entry.session_id != "sess-too-many-messages"
         assert new_entry.auto_reset_reason == "oversized"
+
+    def test_get_or_create_session_notifies_idle_reset_when_db_has_activity(self, tmp_path):
+        source = _make_source()
+        old_entry = _make_entry(source, session_id="sess-idle-active")
+        old_entry.updated_at = datetime.now() - timedelta(minutes=181)
+        old_entry.total_tokens = 0  # modern token stats live in SQLite, not this legacy counter
+        db = FakeDB(
+            {
+                "sess-idle-active": {
+                    "id": "sess-idle-active",
+                    "input_tokens": 50_000,
+                    "message_count": 12,
+                }
+            }
+        )
+        store = _make_store(
+            tmp_path,
+            SessionResetPolicy(mode="idle", idle_minutes=180, max_input_tokens=2_000_000),
+            db,
+        )
+        store._entries[old_entry.session_key] = old_entry
+
+        new_entry = store.get_or_create_session(source)
+
+        assert new_entry.session_id != "sess-idle-active"
+        assert new_entry.was_auto_reset is True
+        assert new_entry.auto_reset_reason == "idle"
+        assert new_entry.reset_had_activity is True
+        assert db.ended == [("sess-idle-active", "session_reset")]
 
     def test_get_or_create_session_keeps_session_when_below_oversized_limits(self, tmp_path):
         source = _make_source()

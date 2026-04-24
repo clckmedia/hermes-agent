@@ -4281,6 +4281,11 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+            await self._maybe_send_session_size_warning(
+                source,
+                session_entry,
+                metadata=getattr(event, "metadata", None),
+            )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
