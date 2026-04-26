@@ -693,6 +693,12 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "prompt_index": {
+            # Skill names listed here are loaded as full bodies into the normal
+            # system prompt in addition to the compact skill index. Category-wide
+            # always-include support is intentionally deferred.
+            "always_include_skills": [],
+        },
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
