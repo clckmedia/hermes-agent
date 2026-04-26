@@ -500,6 +500,9 @@ _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
+_ALWAYS_INCLUDE_DEFAULT_MAX_CATEGORIES = 5
+_ALWAYS_INCLUDE_DEFAULT_MAX_SKILLS_PER_CATEGORY = 3
+_ALWAYS_INCLUDE_DEFAULT_MAX_TOTAL_SKILLS = 20
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -651,60 +654,22 @@ def _skill_should_show(
     return True
 
 
-def build_skills_system_prompt(
+def _collect_skill_index_categories(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
-) -> str:
-    """Build a compact skill index for the system prompt.
-
-    Two-layer cache:
-      1. In-process LRU dict keyed by (skills_dir, tools, toolsets)
-      2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
-         mtime/size manifest — survives process restarts
-
-    Falls back to a full filesystem scan when both layers miss.
-
-    External skill directories (``skills.external_dirs`` in config.yaml) are
-    scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
-    are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
-    """
+) -> tuple[dict[str, list[tuple[str, str]]], dict[str, str]]:
+    """Return the same filtered category index data used by the compact prompt."""
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
     if not skills_dir.exists() and not external_dirs:
-        return ""
+        return {}, {}
 
-    # ── Layer 1: in-process LRU cache ─────────────────────────────────
-    # Include the resolved platform so per-platform disabled-skill lists
-    # produce distinct cache entries (gateway serves multiple platforms).
-    from gateway.session_context import get_session_env
-    _platform_hint = (
-        os.environ.get("HERMES_PLATFORM")
-        or get_session_env("HERMES_SESSION_PLATFORM")
-        or ""
-    )
     disabled = get_disabled_skill_names()
-    cache_key = (
-        str(skills_dir.resolve()),
-        tuple(str(d) for d in external_dirs),
-        tuple(sorted(str(t) for t in (available_tools or set()))),
-        tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
-        _platform_hint,
-        tuple(sorted(disabled)),
-    )
-    with _SKILLS_PROMPT_CACHE_LOCK:
-        cached = _SKILLS_PROMPT_CACHE.get(cache_key)
-        if cached is not None:
-            _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
-            return cached
-
-    # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
-
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
 
+    snapshot = _load_skills_snapshot(skills_dir)
     if snapshot is not None:
         # Fast path: use pre-parsed metadata from disk
         for entry in snapshot.get("skills", []):
@@ -825,6 +790,62 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
+    return skills_by_category, category_descriptions
+
+
+def build_skills_system_prompt(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+) -> str:
+    """Build a compact skill index for the system prompt.
+
+    Two-layer cache:
+      1. In-process LRU dict keyed by (skills_dir, tools, toolsets)
+      2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
+         mtime/size manifest — survives process restarts
+
+    Falls back to a full filesystem scan when both layers miss.
+
+    External skill directories (``skills.external_dirs`` in config.yaml) are
+    scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
+    are read-only — they appear in the index but new skills are always created
+    in the local dir.  Local skills take precedence when names collide.
+    """
+    skills_dir = get_skills_dir()
+    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+
+    if not skills_dir.exists() and not external_dirs:
+        return ""
+
+    # ── Layer 1: in-process LRU cache ─────────────────────────────────
+    # Include the resolved platform so per-platform disabled-skill lists
+    # produce distinct cache entries (gateway serves multiple platforms).
+    from gateway.session_context import get_session_env
+    _platform_hint = (
+        os.environ.get("HERMES_PLATFORM")
+        or get_session_env("HERMES_SESSION_PLATFORM")
+        or ""
+    )
+    disabled = get_disabled_skill_names()
+    cache_key = (
+        str(skills_dir.resolve()),
+        tuple(str(d) for d in external_dirs),
+        tuple(sorted(str(t) for t in (available_tools or set()))),
+        tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
+        _platform_hint,
+        tuple(sorted(disabled)),
+    )
+    with _SKILLS_PROMPT_CACHE_LOCK:
+        cached = _SKILLS_PROMPT_CACHE.get(cache_key)
+        if cached is not None:
+            _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+            return cached
+
+    skills_by_category, category_descriptions = _collect_skill_index_categories(
+        available_tools=available_tools,
+        available_toolsets=available_toolsets,
+    )
+
     if not skills_by_category:
         result = ""
     else:
@@ -908,28 +929,46 @@ def _normalize_always_include_skill_identifiers(value: Any) -> list[str]:
     return identifiers
 
 
-def _configured_always_include_skills(config: dict | None = None) -> list[str]:
-    """Read skills.prompt_index.always_include_skills from config.yaml.
+def _coerce_always_include_limit(value: Any, default: int) -> int:
+    """Coerce a prompt-index cap to a non-negative integer."""
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
-    ``always_include_categories`` is intentionally not implemented in this pass.
-    """
+
+def _read_skills_prompt_index_config(
+    config: dict | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (skills_cfg, skills.prompt_index cfg) for always-include settings."""
     if config is None:
         try:
             from hermes_cli.config import load_config
 
             config = load_config() or {}
         except Exception as exc:
-            logger.debug("Could not read config for always_include_skills: %s", exc)
-            return []
+            logger.debug("Could not read config for always-include skills: %s", exc)
+            return {}, {}
 
     skills_cfg = config.get("skills") if isinstance(config, dict) else None
     if not isinstance(skills_cfg, dict):
-        return []
+        return {}, {}
 
     prompt_index_cfg = skills_cfg.get("prompt_index")
-    value = None
-    if isinstance(prompt_index_cfg, dict):
-        value = prompt_index_cfg.get("always_include_skills")
+    if not isinstance(prompt_index_cfg, dict):
+        prompt_index_cfg = {}
+    return skills_cfg, prompt_index_cfg
+
+
+def _configured_always_include_skills(config: dict | None = None) -> list[str]:
+    """Read skills.prompt_index.always_include_skills from config.yaml."""
+    skills_cfg, prompt_index_cfg = _read_skills_prompt_index_config(config)
+    if not skills_cfg:
+        return []
+
+    value = prompt_index_cfg.get("always_include_skills")
 
     # Backwards-compatible fallback for any early configs that placed the key
     # directly under ``skills`` instead of ``skills.prompt_index``.
@@ -937,6 +976,107 @@ def _configured_always_include_skills(config: dict | None = None) -> list[str]:
         value = skills_cfg.get("always_include_skills")
 
     return _normalize_always_include_skill_identifiers(value)
+
+
+def _configured_always_include_categories(
+    config: dict | None = None,
+) -> tuple[list[str], int, int, int]:
+    """Read always_include_categories and caps from skills.prompt_index."""
+    skills_cfg, prompt_index_cfg = _read_skills_prompt_index_config(config)
+    if not skills_cfg:
+        return (
+            [],
+            _ALWAYS_INCLUDE_DEFAULT_MAX_CATEGORIES,
+            _ALWAYS_INCLUDE_DEFAULT_MAX_SKILLS_PER_CATEGORY,
+            _ALWAYS_INCLUDE_DEFAULT_MAX_TOTAL_SKILLS,
+        )
+
+    value = prompt_index_cfg.get("always_include_categories")
+    if value is None:
+        value = skills_cfg.get("always_include_categories")
+
+    def _cap(name: str, default: int) -> int:
+        raw = prompt_index_cfg.get(name)
+        if raw is None:
+            raw = skills_cfg.get(name)
+        return _coerce_always_include_limit(raw, default)
+
+    return (
+        _normalize_always_include_skill_identifiers(value),
+        _cap("max_categories", _ALWAYS_INCLUDE_DEFAULT_MAX_CATEGORIES),
+        _cap(
+            "max_skills_per_category",
+            _ALWAYS_INCLUDE_DEFAULT_MAX_SKILLS_PER_CATEGORY,
+        ),
+        _cap("max_total_skills", _ALWAYS_INCLUDE_DEFAULT_MAX_TOTAL_SKILLS),
+    )
+
+
+def _category_always_include_skill_candidates(
+    *,
+    config: dict | None,
+    existing_skill_keys: set[str] | None = None,
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+) -> tuple[list[tuple[str, str]], int, int]:
+    """Resolve configured category pins to ordered skill candidates and caps."""
+    (
+        categories,
+        max_categories,
+        max_skills_per_category,
+        max_total_skills,
+    ) = _configured_always_include_categories(config)
+    if (
+        not categories
+        or max_categories <= 0
+        or max_skills_per_category <= 0
+        or max_total_skills <= 0
+    ):
+        return [], max_skills_per_category, max_total_skills
+
+    selected_categories = categories[:max_categories]
+    existing_keys = {
+        str(skill_key).strip().lower()
+        for skill_key in (existing_skill_keys or set())
+        if str(skill_key).strip()
+    }
+
+    skills_by_category, _category_descriptions = _collect_skill_index_categories(
+        available_tools=available_tools,
+        available_toolsets=available_toolsets,
+    )
+    if not skills_by_category:
+        for category in selected_categories:
+            logger.warning(
+                "Configured always_include_categories entry could not be resolved: %s",
+                category,
+            )
+        return [], max_skills_per_category, max_total_skills
+
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set(existing_keys)
+    for category in selected_categories:
+        category_skills = skills_by_category.get(category)
+        if category_skills is None:
+            logger.warning(
+                "Configured always_include_categories entry could not be resolved: %s",
+                category,
+            )
+            continue
+
+        seen_in_category: set[str] = set()
+        for skill_name, _desc in sorted(category_skills, key=lambda item: item[0]):
+            skill_name = str(skill_name or "").strip()
+            skill_key = skill_name.lower()
+            if not skill_name or skill_key in seen_in_category:
+                continue
+            seen_in_category.add(skill_key)
+            if skill_key in seen:
+                continue
+            candidates.append((skill_name, category))
+            seen.add(skill_key)
+
+    return candidates, max_skills_per_category, max_total_skills
 
 
 def _existing_prompt_contains_skill_body(existing_prompt_text: str, skill_name: str) -> bool:
@@ -952,6 +1092,7 @@ def _existing_prompt_contains_skill_body(existing_prompt_text: str, skill_name: 
         f'"{skill_name}" skill preloaded',
         f'"{skill_name}" skill, indicating',
         f'"{skill_name}" skill is configured in always_include_skills',
+        f'"{skill_name}" skill is configured via always_include_categories',
         f"\nname: {skill_name}\n",
         f"\r\nname: {skill_name}\r\n",
     )
@@ -963,47 +1104,61 @@ def build_always_include_skills_prompt(
     existing_prompt_text: str = "",
     task_id: str | None = None,
     config: dict | None = None,
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
 ) -> str:
-    """Load full skill bodies configured by ``always_include_skills``.
+    """Load full skill bodies configured by name or category pins.
 
-    This is additive to the compact skill index. Missing configured skills are
-    skipped with a warning so normal sessions still start.
+    This is additive to the compact skill index. Missing configured skills or
+    categories are skipped with a warning so normal sessions still start.
     """
-    identifiers = _configured_always_include_skills(config)
-    if not identifiers:
+    explicit_identifiers = _configured_always_include_skills(config)
+    configured_categories, _max_categories, _max_per_category, _max_total = (
+        _configured_always_include_categories(config)
+    )
+    if not explicit_identifiers and not configured_categories:
         return ""
 
     try:
         from agent.skill_commands import _build_skill_message, _load_skill_payload
     except Exception as exc:
-        logger.warning("Could not load always_include_skills helpers: %s", exc)
+        logger.warning("Could not load always-include skill helpers: %s", exc)
         return ""
 
     prompt_parts: list[str] = []
     seen_skill_names: set[str] = set()
-    for identifier in identifiers:
+
+    def _append_skill(identifier: str, source: str) -> bool:
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
             logger.warning(
-                "Configured always_include_skills entry could not be loaded: %s",
+                "Configured always_include_%s entry could not be loaded: %s",
+                "skills" if source == "skill" else "categories-derived skill",
                 identifier,
             )
-            continue
+            return False
 
         loaded_skill, skill_dir, skill_name = loaded
         skill_key = skill_name.strip().lower()
         if not skill_key or skill_key in seen_skill_names:
-            continue
+            return False
         seen_skill_names.add(skill_key)
 
         if _existing_prompt_contains_skill_body(existing_prompt_text, skill_name):
-            continue
+            return False
 
-        activation_note = (
-            f'[SYSTEM: The "{skill_name}" skill is configured in always_include_skills. '
-            "Treat its instructions as active guidance for every normal prompt "
-            "unless the user overrides them. The full skill content is loaded below.]"
-        )
+        if source == "skill":
+            activation_note = (
+                f'[SYSTEM: The "{skill_name}" skill is configured in always_include_skills. '
+                "Treat its instructions as active guidance for every normal prompt "
+                "unless the user overrides them. The full skill content is loaded below.]"
+            )
+        else:
+            activation_note = (
+                f'[SYSTEM: The "{skill_name}" skill is configured via always_include_categories. '
+                "Treat its instructions as active guidance for every normal prompt "
+                "unless the user overrides them. The full skill content is loaded below.]"
+            )
         prompt_parts.append(
             _build_skill_message(
                 loaded_skill,
@@ -1012,6 +1167,27 @@ def build_always_include_skills_prompt(
                 session_id=task_id,
             )
         )
+        return True
+
+    for identifier in explicit_identifiers:
+        _append_skill(identifier, "skill")
+
+    category_candidates, max_skills_per_category, max_total_skills = (
+        _category_always_include_skill_candidates(
+            config=config,
+            existing_skill_keys=seen_skill_names,
+            available_tools=available_tools,
+            available_toolsets=available_toolsets,
+        )
+    )
+    category_counts: dict[str, int] = {}
+    for identifier, category in category_candidates:
+        if len(prompt_parts) >= max_total_skills:
+            break
+        if category_counts.get(category, 0) >= max_skills_per_category:
+            continue
+        if _append_skill(identifier, "category"):
+            category_counts[category] = category_counts.get(category, 0) + 1
 
     return "\n\n".join(prompt_parts)
 
