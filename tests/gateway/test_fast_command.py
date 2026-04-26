@@ -1,5 +1,6 @@
 """Tests for gateway /fast support and Priority Processing routing."""
 
+import logging
 import sys
 import threading
 import types
@@ -119,6 +120,35 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.3-codex", runtime_kwargs)
 
     assert route["request_overrides"] is None
+
+
+def test_turn_route_logs_routing_decision(caplog):
+    runner = _make_runner()
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://openrouter.ai/api/v1",
+        "provider": "openrouter",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+            runner,
+            "hi",
+            "gpt-5.4",
+            runtime_kwargs,
+            platform_key="discord",
+            channel_id="chan-1",
+        )
+
+    assert route["model"] == "gpt-5.4"
+    assert (
+        "routing: platform=discord channel=chan-1 prompt_chars=2 "
+        "selected_model=gpt-5.4 reason=primary_model"
+    ) in [record.getMessage() for record in caplog.records]
 
 
 @pytest.mark.asyncio

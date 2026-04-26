@@ -988,6 +988,8 @@ class GatewayRunner:
         runtime_kwargs: dict,
         *,
         has_prior_context: bool = False,
+        platform_key: str | None = None,
+        channel_id: str | None = None,
     ) -> dict:
         from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
@@ -1007,6 +1009,18 @@ class GatewayRunner:
             getattr(self, "_smart_model_routing", {}),
             primary,
             has_prior_context=has_prior_context,
+        )
+        routing_reason = (
+            route.get("routing_reason")
+            or ("smart_route" if route.get("label") else "primary_model")
+        )
+        logger.info(
+            "routing: platform=%s channel=%s prompt_chars=%d selected_model=%s reason=%s",
+            platform_key or "unknown",
+            channel_id or "unknown",
+            len(user_message or ""),
+            route.get("model") or "unknown",
+            routing_reason,
         )
 
         service_tier = getattr(self, "_service_tier", None)
@@ -5899,7 +5913,13 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier(platform_key)
             self._smart_reasoning_routing = self._load_smart_reasoning_routing()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                prompt,
+                model,
+                runtime_kwargs,
+                platform_key=platform_key,
+                channel_id=source.chat_id,
+            )
 
             def run_sync():
                 agent = AIAgent(
@@ -6070,7 +6090,13 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             self._smart_reasoning_routing = self._load_smart_reasoning_routing()
-            turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                question,
+                model,
+                runtime_kwargs,
+                platform_key=platform_key,
+                channel_id=source.chat_id,
+            )
 
             # Snapshot history from running agent or stored transcript
             running_agent = self._running_agents.get(session_key)
@@ -8812,6 +8838,8 @@ class GatewayRunner:
                 model,
                 runtime_kwargs,
                 has_prior_context=bool(history),
+                platform_key=platform_key,
+                channel_id=source.chat_id,
             )
 
             # Check agent cache — reuse the AIAgent from the previous message

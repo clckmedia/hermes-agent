@@ -340,6 +340,7 @@ def resolve_turn_route(
                 "credential_pool": primary.get("credential_pool"),
             },
             "label": None,
+            "routing_reason": "primary_model",
             "signature": (
                 primary.get("model"),
                 primary.get("provider"),
@@ -376,6 +377,7 @@ def resolve_turn_route(
                 "credential_pool": primary.get("credential_pool"),
             },
             "label": None,
+            "routing_reason": "route_runtime_error",
             "signature": (
                 primary.get("model"),
                 primary.get("provider"),
@@ -398,6 +400,7 @@ def resolve_turn_route(
             "credential_pool": runtime.get("credential_pool"),
         },
         "label": f"smart route → {route.get('model')} ({runtime.get('provider')})",
+        "routing_reason": route.get("routing_reason") or "smart_route",
         "signature": (
             route.get("model"),
             runtime.get("provider"),

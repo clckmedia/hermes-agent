@@ -109,6 +109,52 @@ def test_dynamic_reasoning_keeps_explicit_base_xhigh():
     assert result == {"enabled": True, "effort": "xhigh"}
 
 
+def test_resolve_turn_route_preserves_primary_reason_when_not_routed():
+    from agent.smart_model_routing import resolve_turn_route
+
+    result = resolve_turn_route(
+        "debug this traceback: ```python\nraise ValueError('bad')\n```",
+        _BASE_CONFIG,
+        {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+            "api_key": "***",
+        },
+    )
+
+    assert result["routing_reason"] == "primary_model"
+
+
+def test_resolve_turn_route_preserves_smart_route_reason(monkeypatch):
+    from agent.smart_model_routing import resolve_turn_route
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+            "api_key": "***",
+        },
+    )
+    result = resolve_turn_route(
+        "what time is it in tokyo?",
+        _BASE_CONFIG,
+        {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+            "api_key": "***",
+        },
+    )
+
+    assert result["model"] == "google/gemini-2.5-flash"
+    assert result["routing_reason"] == "simple_turn"
+
+
 def test_resolve_turn_route_falls_back_to_primary_when_route_runtime_cannot_be_resolved(monkeypatch):
     from agent.smart_model_routing import resolve_turn_route
 
@@ -130,3 +176,4 @@ def test_resolve_turn_route_falls_back_to_primary_when_route_runtime_cannot_be_r
     assert result["model"] == "anthropic/claude-sonnet-4"
     assert result["runtime"]["provider"] == "openrouter"
     assert result["label"] is None
+    assert result["routing_reason"] == "route_runtime_error"
