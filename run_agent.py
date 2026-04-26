@@ -3536,6 +3536,7 @@ class AIAgent:
                 pass
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+        avail_toolsets = set()
         if has_skills_tools:
             avail_toolsets = {
                 toolset
@@ -3556,6 +3557,8 @@ class AIAgent:
         always_include_skills_prompt = build_always_include_skills_prompt(
             existing_prompt_text="\n\n".join(p.strip() for p in prompt_parts if p.strip()),
             task_id=self.session_id,
+            available_tools=self.valid_tool_names,
+            available_toolsets=avail_toolsets,
         )
         if always_include_skills_prompt:
             prompt_parts.append(always_include_skills_prompt)

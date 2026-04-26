@@ -695,8 +695,12 @@ DEFAULT_CONFIG = {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         "prompt_index": {
             # Skill names listed here are loaded as full bodies into the normal
-            # system prompt in addition to the compact skill index. Category-wide
-            # always-include support is intentionally deferred.
+            # system prompt in addition to the compact skill index. Category
+            # pins load after explicit names and are capped to avoid prompt bloat.
+            "always_include_categories": [],
+            "max_categories": 5,
+            "max_skills_per_category": 3,
+            "max_total_skills": 20,
             "always_include_skills": [],
         },
     },
