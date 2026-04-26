@@ -3,6 +3,7 @@
 import sys
 import threading
 import types
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,9 +30,9 @@ def _ensure_discord_mock():
 
 
 import gateway.run as gateway_run
-from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionEntry, SessionSource
 
 
 class _CapturingAgent:
@@ -182,6 +183,110 @@ class TestResolveChannelPrompts:
 
 
 @pytest.mark.asyncio
+async def test_first_real_message_after_reset_autoloads_discord_forum_skill(monkeypatch):
+    """A post-/reset Discord forum thread has empty history even if timestamps drift.
+
+    /reset can pre-create a fresh session and update ``updated_at`` before the
+    next real user turn.  Auto-skill loading must key off the empty transcript,
+    not exact timestamp equality, so bound forum skills still load.
+    """
+    runner = _make_runner()
+    runner._handle_message_with_agent = gateway_run.GatewayRunner._handle_message_with_agent.__get__(
+        runner,
+        gateway_run.GatewayRunner,
+    )
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._maybe_send_session_size_warning = AsyncMock()
+    runner._set_session_env = MagicMock(return_value=[])
+    runner._clear_session_env = MagicMock()
+    runner._get_guild_id = MagicMock(return_value=None)
+    runner._clear_restart_failure_count = MagicMock()
+    runner._should_send_voice_reply = MagicMock(return_value=False)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+            "tools": [],
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    async def _return_event_text(**kwargs):
+        return kwargs["event"].text
+
+    runner._prepare_inbound_message_text = AsyncMock(side_effect=_return_event_text)
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1494526366954295347",
+        chat_name="CLCK / tech / Hermes Management",
+        chat_type="thread",
+        user_id="1072968993842933780",
+        user_name="Damien",
+        thread_id="1494526366954295347",
+        parent_chat_id="1494177793121194193",
+    )
+    created_at = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:discord:thread:1494526366954295347:1494526366954295347",
+        session_id="fresh-after-reset",
+        created_at=created_at,
+        updated_at=created_at + timedelta(milliseconds=3),
+        origin=source,
+        display_name="CLCK / tech / Hermes Management",
+        platform=Platform.DISCORD,
+        chat_type="thread",
+    )
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=MagicMock(return_value=entry),
+        load_transcript=MagicMock(return_value=[]),
+        append_to_transcript=MagicMock(),
+        update_session=MagicMock(),
+        has_any_sessions=MagicMock(return_value=True),
+    )
+
+    import agent.skill_commands as skill_commands
+
+    monkeypatch.setattr(
+        skill_commands,
+        "_load_skill_payload",
+        lambda name, task_id=None: (f"payload for {name}", "/tmp/skills/forum-skill", name),
+    )
+    monkeypatch.setattr(
+        skill_commands,
+        "_build_skill_message",
+        lambda loaded_skill, skill_dir, note: f"{note}\n{loaded_skill}",
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "test-model")
+
+    event = MessageEvent(
+        text="Check the skill binding",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m-after-reset",
+        auto_skill=["forum-skill"],
+    )
+
+    run_generation = runner._begin_session_run_generation(entry.session_key)
+    result = await runner._handle_message_with_agent(
+        event,
+        source,
+        entry.session_key,
+        run_generation,
+    )
+
+    assert result == "ok"
+    agent_message = runner._run_agent.await_args.kwargs["message"]
+    assert '[IMPORTANT: The "forum-skill" skill is auto-loaded.' in agent_message
+    assert "payload for forum-skill" in agent_message
+    assert agent_message.endswith("Check the skill binding")
+
+
+@pytest.mark.asyncio
 async def test_retry_preserves_channel_prompt(monkeypatch):
     runner = _make_runner()
     runner.session_store = SimpleNamespace(
@@ -233,7 +338,11 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
 
     import hermes_cli.tools_config as tools_config
 
-    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key, **kwargs: {"core"},
+    )
 
     _CapturingAgent.last_init = None
     event = MessageEvent(
