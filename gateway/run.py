@@ -345,6 +345,27 @@ def should_gate_auto_reset_message(reset_reason: str | None) -> bool:
     return str(reset_reason or "").strip().lower() == "suspended"
 
 
+_REAL_TRANSCRIPT_ROLES = {"user", "assistant", "tool"}
+
+
+def _is_first_real_transcript_turn(history: list[dict[str, Any]] | None) -> bool:
+    """Return True when no real conversation turn has been persisted yet.
+
+    Fresh sessions can have timestamp drift after commands like ``/reset``
+    pre-create the new SessionEntry.  The transcript is the durable source of
+    truth for whether the next inbound text is the first real user turn.  Ignore
+    metadata-only rows such as ``session_meta`` so a partially initialised
+    transcript does not suppress first-turn behaviour.
+    """
+    if not history:
+        return True
+    return not any(
+        isinstance(message, dict)
+        and message.get("role") in _REAL_TRANSCRIPT_ROLES
+        for message in history
+    )
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
@@ -3592,19 +3613,6 @@ class GatewayRunner:
             metadata=getattr(event, "metadata", None),
         )
         
-        # Emit session:start for new or auto-reset sessions
-        _is_new_session = (
-            session_entry.created_at == session_entry.updated_at
-            or getattr(session_entry, "was_auto_reset", False)
-        )
-        if _is_new_session:
-            await self.hooks.emit("session:start", {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "session_id": session_entry.session_id,
-                "session_key": session_key,
-            })
-        
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -3702,12 +3710,25 @@ class GatewayRunner:
                     logger.debug("Auto-reset gate state save failed (non-fatal): %s", e)
                 return None
 
+        # Load conversation history before first-turn gates.  The transcript is
+        # the source of truth here: after /reset the fresh SessionEntry can have
+        # tiny created_at/updated_at drift before the next real user turn.
+        history = self.session_store.load_transcript(session_entry.session_id)
+        _is_first_real_turn = _is_first_real_transcript_turn(history)
+        if _is_first_real_turn:
+            await self.hooks.emit("session:start", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "session_id": session_entry.session_id,
+                "session_key": session_key,
+            })
+
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Only inject on the first real user turn — ongoing conversations already
+        # have the skill content in their conversation history from that turn.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
+        if _is_first_real_turn and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message
@@ -3738,9 +3759,6 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
-        
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
