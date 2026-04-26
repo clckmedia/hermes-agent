@@ -334,6 +334,17 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+def should_gate_auto_reset_message(reset_reason: str | None) -> bool:
+    """Return True when an auto-reset should stop before processing user text.
+
+    Gateway restart/crash safety resets (`suspended`) are the high-risk case:
+    the user usually expects continuity, so processing their next message in a
+    fresh session can send Hermes off doing the wrong work. Idle/daily/oversized
+    rotations keep the existing behaviour by default.
+    """
+    return str(reset_reason or "").strip().lower() == "suspended"
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
@@ -1593,7 +1604,8 @@ class GatewayRunner:
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
             "Your current task will be interrupted. "
-            "Send any message after restart to resume where it left off."
+            "Send any message after restart and I'll try to resume where it left off. "
+            "If that doesn't happen, use /resume to restore the named session."
             if self._restart_requested
             else "Your current task will be interrupted."
         )
@@ -2388,6 +2400,19 @@ class GatewayRunner:
                     timeout,
                     self._running_agent_count(),
                 )
+                # Preserve restart continuity for sessions still running at the
+                # drain deadline.  ``resume_pending`` tells the next startup not
+                # to convert these into suspended/fresh sessions; the transcript
+                # is kept and the next user turn can continue on the same
+                # session unless the stuck-loop counter later escalates.
+                resume_reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
+                for _session_key, _agent in list(self._running_agents.items()):
+                    if _agent is _AGENT_PENDING_SENTINEL:
+                        continue
+                    try:
+                        self.session_store.mark_resume_pending(_session_key, resume_reason)
+                    except Exception as e:
+                        logger.debug("Failed to mark resume_pending for %s: %s", _session_key[:30], e)
                 self._interrupt_running_agents(
                     "Gateway restarting" if self._restart_requested else "Gateway shutting down"
                 )
@@ -3603,6 +3628,8 @@ class GatewayRunner:
             context_note, reason_text = describe_auto_reset_reason(reset_reason, policy)
             context_prompt = context_note + "\n\n" + context_prompt
 
+            reset_gate = should_gate_auto_reset_message(reset_reason)
+
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
             # - the platform is excluded (e.g. api_server, webhook)
@@ -3619,19 +3646,32 @@ class GatewayRunner:
                 )
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                    notice = (
+                        f"◐ Session automatically reset ({reason_text}). "
+                        f"Conversation history cleared.\n"
+                        f"Use /resume to browse and restore a previous session.\n"
+                        f"Adjust reset timing in config.yaml under session_reset."
+                    )
+                    if reset_gate:
+                        previous_session_id = getattr(
+                            session_entry, "reset_previous_session_id", None
                         )
-                        try:
-                            session_info = self._format_session_info()
-                            if session_info:
-                                notice = f"{notice}\n\n{session_info}"
-                        except Exception:
-                            pass
+                        recovery_hint = "Use /resume interrupted to restore the previous session"
+                        if previous_session_id:
+                            recovery_hint += f" ({previous_session_id})"
+                        notice = (
+                            f"{notice}\n\n"
+                            "I haven't processed your message yet. "
+                            f"{recovery_hint}, or resend the message "
+                            "if you want me to answer it in this fresh context."
+                        )
+                    try:
+                        session_info = self._format_session_info()
+                        if session_info:
+                            notice = f"{notice}\n\n{session_info}"
+                    except Exception:
+                        pass
+                    if adapter:
                         await adapter.send(
                             source.chat_id, notice,
                             metadata=getattr(event, 'metadata', None),
@@ -3641,6 +3681,12 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+            if reset_gate:
+                try:
+                    self.session_store._save()
+                except Exception as e:
+                    logger.debug("Auto-reset gate state save failed (non-fatal): %s", e)
+                return None
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
@@ -6544,8 +6590,24 @@ class GatewayRunner:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return f"Could not list sessions: {e}"
 
+        # Load the current session before resolving a target. Special recovery
+        # aliases like `/resume interrupted` use metadata on the fresh session
+        # that was created after a crash/restart-style reset.
+        current_entry = self.session_store.get_or_create_session(source)
+
         # Resolve the name to a session ID
-        target_id = self._session_db.resolve_session_by_title(name)
+        recovery_aliases = {"interrupted", "last", "previous"}
+        if name.lower() in recovery_aliases:
+            target_id = getattr(current_entry, "reset_previous_session_id", None)
+            if not target_id:
+                return (
+                    "No interrupted session is recorded for this conversation.\n"
+                    "Use `/resume` with no arguments to browse named sessions."
+                )
+            target_label = "interrupted session"
+        else:
+            target_id = self._session_db.resolve_session_by_title(name)
+            target_label = name
         if not target_id:
             return (
                 f"No session found matching '**{name}**'.\n"
@@ -6553,9 +6615,8 @@ class GatewayRunner:
             )
 
         # Check if already on that session
-        current_entry = self.session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
-            return f"📌 Already on session **{name}**."
+            return f"📌 Already on session **{target_label}**."
 
         # Flush memories for current session before switching
         try:
@@ -6577,7 +6638,7 @@ class GatewayRunner:
             return "Failed to switch session."
 
         # Get the title for confirmation
-        title = self._session_db.get_session_title(target_id) or name
+        title = self._session_db.get_session_title(target_id) or target_label
 
         # Count messages for context
         history = self.session_store.load_transcript(target_id)

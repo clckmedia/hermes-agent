@@ -364,8 +364,9 @@ class SessionEntry:
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
     was_auto_reset: bool = False
-    auto_reset_reason: Optional[str] = None  # "idle", "daily", or "oversized"
+    auto_reset_reason: Optional[str] = None  # "idle", "daily", "oversized", or "suspended"
     reset_had_activity: bool = False  # whether the expired session had any messages
+    reset_previous_session_id: Optional[str] = None  # exact prior sid for /resume interrupted
 
     # One-shot approaching-limit warning state. Cleared automatically if the
     # session later drops back below the warning threshold.
@@ -411,7 +412,10 @@ class SessionEntry:
             "last_prompt_tokens": self.last_prompt_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
+            "was_auto_reset": self.was_auto_reset,
+            "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
+            "reset_previous_session_id": self.reset_previous_session_id,
             "size_warning_sent": self.size_warning_sent,
             "memory_flushed": self.memory_flushed,
             "suspended": self.suspended,
@@ -465,7 +469,10 @@ class SessionEntry:
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
+            was_auto_reset=data.get("was_auto_reset", False),
+            auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
+            reset_previous_session_id=data.get("reset_previous_session_id"),
             size_warning_sent=data.get("size_warning_sent", False),
             memory_flushed=data.get("memory_flushed", False),
             suspended=data.get("suspended", False),
@@ -1024,6 +1031,7 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                reset_previous_session_id=db_end_session_id,
             )
 
             self._entries[session_key] = entry

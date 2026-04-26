@@ -32,6 +32,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
@@ -113,6 +115,7 @@ class TestSessionEntryResumeFields:
         assert entry.resume_pending is False
         assert entry.resume_reason is None
         assert entry.last_resume_marked_at is None
+        assert entry.reset_previous_session_id is None
 
     def test_roundtrip_with_resume_fields(self):
         now = datetime(2026, 4, 18, 12, 0, 0)
@@ -124,11 +127,13 @@ class TestSessionEntryResumeFields:
             resume_pending=True,
             resume_reason="restart_timeout",
             last_resume_marked_at=now,
+            reset_previous_session_id="old-session-id",
         )
-        restored = SessionEntry.from_dict(entry.to_dict())
-        assert restored.resume_pending is True
-        assert restored.resume_reason == "restart_timeout"
-        assert restored.last_resume_marked_at == now
+        roundtripped = SessionEntry.from_dict(entry.to_dict())
+        assert roundtripped.resume_pending is True
+        assert roundtripped.resume_reason == "restart_timeout"
+        assert roundtripped.last_resume_marked_at == now
+        assert roundtripped.reset_previous_session_id == "old-session-id"
 
     def test_from_dict_legacy_without_resume_fields(self):
         """Old sessions.json without the new fields deserialize cleanly."""
@@ -276,6 +281,7 @@ class TestGetOrCreateResumePending:
         assert second.session_id != original_sid
         assert second.was_auto_reset is True
         assert second.auto_reset_reason == "suspended"
+        assert second.reset_previous_session_id == original_sid
 
     def test_suspended_overrides_resume_pending(self, tmp_path):
         """Terminal escalation: a session that somehow has BOTH flags must
@@ -614,6 +620,160 @@ async def test_restart_banner_uses_try_to_resume_wording():
     msg = adapter.sent[0]
     assert "restarting" in msg
     assert "try to resume" in msg
+
+
+# ---------------------------------------------------------------------------
+# Reset gate UX
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_suspended_auto_reset_notifies_and_does_not_process_user_message():
+    """A restart/crash-style suspended reset should stop before agent work.
+
+    The user's first post-restart message must not be spent in a fresh context
+    before they have seen that continuity was lost.
+    """
+    runner, adapter = make_restart_runner()
+    runner._handle_message_with_agent = GatewayRunner._handle_message_with_agent.__get__(
+        runner, GatewayRunner
+    )
+    runner._maybe_send_session_size_warning = AsyncMock()
+    runner._set_session_env = MagicMock(return_value=[])
+    runner._clear_session_env = MagicMock()
+    runner._format_session_info = MagicMock(return_value="◆ Model: `test`")
+    runner._run_agent = AsyncMock(return_value={"final_response": "should not run"})
+
+    source = make_restart_source(chat_id="reset-gate")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:reset-gate",
+        session_id="fresh-after-suspend",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        was_auto_reset=True,
+        auto_reset_reason="suspended",
+        reset_had_activity=True,
+        reset_previous_session_id="interrupted-session-123",
+    )
+
+    runner.session_store.get_or_create_session = MagicMock(return_value=entry)
+    runner.session_store.config = GatewayConfig()
+    runner.session_store.load_transcript = MagicMock(return_value=[])
+    runner.session_store._save = MagicMock()
+
+    event = MessageEvent(
+        text="ok keep going with that",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+    )
+
+    result = await runner._handle_message_with_agent(
+        event,
+        source,
+        entry.session_key,
+    )
+
+    assert result is None
+    assert adapter.sent, "reset gate should send a user-facing notice"
+    notice = adapter.sent[-1]
+    assert "I haven't processed your message yet" in notice
+    assert "/resume interrupted" in notice
+    assert "interrupted-session-123" in notice
+    assert "resend" in notice
+    runner._run_agent.assert_not_called()
+    runner.session_store.load_transcript.assert_not_called()
+    assert entry.was_auto_reset is False
+    assert entry.auto_reset_reason is None
+    runner.session_store._save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_interrupted_switches_to_recorded_previous_session():
+    """`/resume interrupted` should recover the exact suspended session without requiring a title."""
+    runner, adapter = make_restart_runner()
+    runner._handle_resume_command = GatewayRunner._handle_resume_command.__get__(runner, GatewayRunner)
+    runner._format_session_info = MagicMock(return_value="◆ Model: `test`")
+    runner._async_flush_memories = AsyncMock()
+    runner._session_db = MagicMock()
+    runner._session_db.get_session_title.return_value = None
+
+    source = make_restart_source(chat_id="resume-interrupted")
+    session_key = "agent:main:telegram:dm:resume-interrupted"
+    current = SessionEntry(
+        session_key=session_key,
+        session_id="fresh-after-reset",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        reset_previous_session_id="interrupted-session-123",
+    )
+    target = SessionEntry(
+        session_key=session_key,
+        session_id="interrupted-session-123",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+
+    runner.session_store.get_or_create_session = MagicMock(return_value=current)
+    runner.session_store.switch_session = MagicMock(return_value=target)
+    runner.session_store.load_transcript = MagicMock(return_value=[{"role": "user", "content": "prior"}])
+
+    event = MessageEvent(
+        text="/resume interrupted",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m-resume",
+    )
+
+    response = await runner._handle_resume_command(event)
+
+    assert "Resumed session **interrupted session**" in response
+    assert "(1 message)" in response
+    runner.session_store.switch_session.assert_called_once_with(session_key, "interrupted-session-123")
+    assert not adapter.sent
+
+
+@pytest.mark.asyncio
+async def test_resume_interrupted_without_recorded_target_is_clear():
+    runner, adapter = make_restart_runner()
+    runner._handle_resume_command = GatewayRunner._handle_resume_command.__get__(runner, GatewayRunner)
+    runner._session_db = MagicMock()
+
+    source = make_restart_source(chat_id="no-interrupted")
+    current = SessionEntry(
+        session_key="agent:main:telegram:dm:no-interrupted",
+        session_id="current-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.get_or_create_session = MagicMock(return_value=current)
+    runner.session_store.switch_session = MagicMock()
+
+    event = MessageEvent(
+        text="/resume interrupted",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m-resume-missing",
+    )
+
+    response = await runner._handle_resume_command(event)
+
+    assert "No interrupted session is recorded" in response
+    assert "/resume" in response
+    runner.session_store.switch_session.assert_not_called()
+    assert not adapter.sent
 
 
 # ---------------------------------------------------------------------------

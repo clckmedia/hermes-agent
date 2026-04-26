@@ -30,6 +30,7 @@ class TestCliTurnRoutePool:
             acp_args=[],
             _credential_pool=fake_pool,
             service_tier=None,
+            _smart_model_routing={},
         )
 
         from cli import HermesCLI

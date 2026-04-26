@@ -743,13 +743,34 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning + service tier config from config.yaml (cron can have its own override)
+        # Reasoning + service tier config from config.yaml (cron can have its own override).
+        # Individual cron jobs can narrow reasoning further for routine/script-heavy jobs.
         from hermes_constants import get_agent_setting, parse_reasoning_effort, parse_service_tier
         effort, _ = get_agent_setting(_cfg, "reasoning_effort", "cron")
+        job_effort = job.get("reasoning_effort")
+        if job_effort not in (None, ""):
+            effort = str(job_effort).strip()
         reasoning_config = parse_reasoning_effort(effort)
 
         service_tier_raw, _ = get_agent_setting(_cfg, "service_tier", "cron")
         service_tier = parse_service_tier(service_tier_raw)
+
+        enabled_toolsets = None
+        if "enabled_toolsets" in job:
+            enabled_toolsets = job.get("enabled_toolsets")
+        elif "toolsets" in job:  # Backwards-compatible alias for hand-authored jobs.
+            enabled_toolsets = job.get("toolsets")
+        if isinstance(enabled_toolsets, str):
+            enabled_toolsets = [part.strip() for part in enabled_toolsets.split(",") if part.strip()]
+        elif isinstance(enabled_toolsets, list):
+            enabled_toolsets = [str(item).strip() for item in enabled_toolsets if str(item).strip()]
+        elif enabled_toolsets is not None:
+            logger.warning(
+                "Job '%s': ignoring invalid enabled_toolsets value %r",
+                job_id,
+                enabled_toolsets,
+            )
+            enabled_toolsets = None
 
         # Prefill messages from env or config.yaml
         prefill_messages = None
@@ -853,6 +874,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
+            enabled_toolsets=enabled_toolsets,
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
             skip_context_files=True,  # Don't inject SOUL.md/AGENTS.md from scheduler cwd
