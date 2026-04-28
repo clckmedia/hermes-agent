@@ -738,6 +738,35 @@ class TestParseTargetRefDiscord:
         assert is_explicit is True
 
 
+class TestParseTargetRefSlack:
+    """_parse_target_ref correctly handles Slack conversation IDs and threads."""
+
+    def test_slack_channel_group_and_dm_ids_are_explicit(self):
+        """Slack C/G/D conversation IDs should not be resolved as labels."""
+        for target_ref in ("C0ASUMH4F3Q", "G0123PRIVATE", "D0123DMID"):
+            chat_id, thread_id, is_explicit = _parse_target_ref("slack", target_ref)
+            assert chat_id == target_ref
+            assert thread_id is None
+            assert is_explicit is True
+
+    def test_slack_thread_ref_splits_channel_and_thread_ts(self):
+        """Slack channel:thread_ts refs should split into chat_id and thread_id."""
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "slack",
+            "C0ASUMH4F3Q:1777242585.810809",
+        )
+        assert chat_id == "C0ASUMH4F3Q"
+        assert thread_id == "1777242585.810809"
+        assert is_explicit is True
+
+    def test_slack_label_is_not_explicit(self):
+        """Human-friendly Slack labels should still go through channel directory resolution."""
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "arlo-alerts")
+        assert chat_id is None
+        assert thread_id is None
+        assert is_explicit is False
+
+
 class TestParseTargetRefMatrix:
     """_parse_target_ref correctly handles Matrix room IDs and user MXIDs."""
 

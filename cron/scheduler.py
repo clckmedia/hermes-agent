@@ -155,17 +155,18 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
             chat_id, thread_id = rest, None
 
         # Resolve human-friendly labels like "Alice (dm)" to real IDs.
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
-            if resolved:
-                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
-                if resolved_is_explicit:
-                    chat_id, thread_id = parsed_chat_id, parsed_thread_id
-                else:
-                    chat_id = resolved
-        except Exception:
-            pass
+        if not is_explicit:
+            try:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform_key, chat_id)
+                if resolved:
+                    parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+                    if resolved_is_explicit:
+                        chat_id, thread_id = parsed_chat_id, parsed_thread_id
+                    else:
+                        chat_id = resolved
+            except Exception:
+                pass
 
         return {
             "platform": platform_name,
@@ -898,7 +899,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             enabled_toolsets=enabled_toolsets,
-            disabled_toolsets=["cronjob", "messaging", "clarify"],
+            disabled_toolsets=disabled_toolsets,
             quiet_mode=True,
             skip_context_files=True,  # Don't inject SOUL.md/AGENTS.md from scheduler cwd
             skip_memory=True,  # Cron system prompts would corrupt user representations
