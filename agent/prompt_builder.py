@@ -13,7 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import Any, Optional
 
 from agent.skill_utils import (
     extract_skill_conditions,
@@ -883,6 +883,137 @@ def build_skills_system_prompt(
             _SKILLS_PROMPT_CACHE.popitem(last=False)
 
     return result
+
+
+def _normalize_always_include_skill_identifiers(value: Any) -> list[str]:
+    """Return a de-duplicated, ordered list from a config value."""
+    if not value:
+        return []
+
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        return []
+
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        identifier = str(item or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        identifiers.append(identifier)
+        seen.add(identifier)
+    return identifiers
+
+
+def _configured_always_include_skills(config: dict | None = None) -> list[str]:
+    """Read skills.prompt_index.always_include_skills from config.yaml.
+
+    ``always_include_categories`` is intentionally not implemented in this pass.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+        except Exception as exc:
+            logger.debug("Could not read config for always_include_skills: %s", exc)
+            return []
+
+    skills_cfg = config.get("skills") if isinstance(config, dict) else None
+    if not isinstance(skills_cfg, dict):
+        return []
+
+    prompt_index_cfg = skills_cfg.get("prompt_index")
+    value = None
+    if isinstance(prompt_index_cfg, dict):
+        value = prompt_index_cfg.get("always_include_skills")
+
+    # Backwards-compatible fallback for any early configs that placed the key
+    # directly under ``skills`` instead of ``skills.prompt_index``.
+    if value is None:
+        value = skills_cfg.get("always_include_skills")
+
+    return _normalize_always_include_skill_identifiers(value)
+
+
+def _existing_prompt_contains_skill_body(existing_prompt_text: str, skill_name: str) -> bool:
+    """Best-effort guard against duplicating full skill payloads.
+
+    CLI-preloaded and slash-invoked skills use explicit activation-note markers;
+    full SKILL.md payloads also include YAML frontmatter with ``name: ...``.
+    """
+    if not existing_prompt_text or not skill_name:
+        return False
+
+    markers = (
+        f'"{skill_name}" skill preloaded',
+        f'"{skill_name}" skill, indicating',
+        f'"{skill_name}" skill is configured in always_include_skills',
+        f"\nname: {skill_name}\n",
+        f"\r\nname: {skill_name}\r\n",
+    )
+    return any(marker in existing_prompt_text for marker in markers)
+
+
+def build_always_include_skills_prompt(
+    *,
+    existing_prompt_text: str = "",
+    task_id: str | None = None,
+    config: dict | None = None,
+) -> str:
+    """Load full skill bodies configured by ``always_include_skills``.
+
+    This is additive to the compact skill index. Missing configured skills are
+    skipped with a warning so normal sessions still start.
+    """
+    identifiers = _configured_always_include_skills(config)
+    if not identifiers:
+        return ""
+
+    try:
+        from agent.skill_commands import _build_skill_message, _load_skill_payload
+    except Exception as exc:
+        logger.warning("Could not load always_include_skills helpers: %s", exc)
+        return ""
+
+    prompt_parts: list[str] = []
+    seen_skill_names: set[str] = set()
+    for identifier in identifiers:
+        loaded = _load_skill_payload(identifier, task_id=task_id)
+        if not loaded:
+            logger.warning(
+                "Configured always_include_skills entry could not be loaded: %s",
+                identifier,
+            )
+            continue
+
+        loaded_skill, skill_dir, skill_name = loaded
+        skill_key = skill_name.strip().lower()
+        if not skill_key or skill_key in seen_skill_names:
+            continue
+        seen_skill_names.add(skill_key)
+
+        if _existing_prompt_contains_skill_body(existing_prompt_text, skill_name):
+            continue
+
+        activation_note = (
+            f'[SYSTEM: The "{skill_name}" skill is configured in always_include_skills. '
+            "Treat its instructions as active guidance for every normal prompt "
+            "unless the user overrides them. The full skill content is loaded below.]"
+        )
+        prompt_parts.append(
+            _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                activation_note,
+                session_id=task_id,
+            )
+        )
+
+    return "\n\n".join(prompt_parts)
 
 
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:

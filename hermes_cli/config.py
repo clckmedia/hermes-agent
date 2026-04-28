@@ -923,6 +923,12 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        "prompt_index": {
+            # Skill names/categories listed here are loaded as full bodies into
+            # the normal system prompt in addition to the compact skill index.
+            "always_include_skills": [],
+            "always_include_categories": [],
+        },
     },
 
     # Curator — background skill maintenance.
