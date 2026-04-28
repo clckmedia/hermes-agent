@@ -694,6 +694,12 @@ DEFAULT_CONFIG = {
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         "prompt_index": {
+            # Compact category catalogue shown in the system prompt. Categories
+            # stay discoverable; individual skill rows are capped so large skill
+            # libraries do not dominate every session prompt.
+            "enabled": True,
+            "index_skills": 32,
+            "show_browse_hint": True,
             # Skill names listed here are loaded as full bodies into the normal
             # system prompt in addition to the compact skill index. Category
             # pins load after explicit names and are capped to avoid prompt bloat.

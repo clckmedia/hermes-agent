@@ -4,6 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -240,6 +241,28 @@ class TestPromptBuilderImports:
 # =========================================================================
 
 
+def _write_prompt_index_skill(tmp_path, category, name, description):
+    skill_dir = tmp_path / "skills" / category / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n",
+        encoding="utf-8",
+    )
+
+
+def _write_prompt_index_category_description(tmp_path, category, description):
+    category_dir = tmp_path / "skills" / category
+    category_dir.mkdir(parents=True, exist_ok=True)
+    (category_dir / "DESCRIPTION.md").write_text(
+        f"---\ndescription: {description}\n---\n",
+        encoding="utf-8",
+    )
+
+
+def _individual_skill_index_lines(prompt):
+    return [line for line in prompt.splitlines() if line.startswith("    - ")]
+
+
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
     def _clear_skills_cache(self):
@@ -265,6 +288,95 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_prompt_index_caps_individual_skill_shortlist(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, names in {
+            "docs": ["docs-alpha", "docs-beta"],
+            "outbound": ["outbound-alpha", "outbound-beta"],
+        }.items():
+            for name in names:
+                _write_prompt_index_skill(
+                    tmp_path,
+                    category,
+                    name,
+                    f"{name} description.",
+                )
+        config = {
+            "skills": {
+                "prompt_index": {
+                    "enabled": True,
+                    "index_skills": 2,
+                    "show_browse_hint": False,
+                }
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            result = build_skills_system_prompt()
+
+        skill_lines = _individual_skill_index_lines(result)
+        assert len(skill_lines) == 2
+        assert "docs-alpha" in result
+        assert "outbound-alpha" in result
+        assert "docs-beta" not in result
+        assert "outbound-beta" not in result
+
+    def test_prompt_index_keeps_all_categories_when_skills_hidden(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, description in {
+            "docs": "Docs workflows.",
+            "outbound": "Outbound workflows.",
+            "sales": "Sales workflows.",
+        }.items():
+            _write_prompt_index_category_description(tmp_path, category, description)
+            _write_prompt_index_skill(
+                tmp_path,
+                category,
+                f"{category}-skill",
+                f"{category} skill description.",
+            )
+        config = {
+            "skills": {
+                "prompt_index": {
+                    "enabled": True,
+                    "index_skills": 0,
+                    "show_browse_hint": False,
+                }
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            result = build_skills_system_prompt()
+
+        assert "  docs: Docs workflows." in result
+        assert "  outbound: Outbound workflows." in result
+        assert "  sales: Sales workflows." in result
+        assert _individual_skill_index_lines(result) == []
+
+    def test_prompt_index_browse_hint_when_skills_are_hidden(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _write_prompt_index_skill(tmp_path, "docs", "docs-alpha", "Alpha docs.")
+        _write_prompt_index_skill(tmp_path, "docs", "docs-beta", "Beta docs.")
+        config = {
+            "skills": {
+                "prompt_index": {
+                    "enabled": True,
+                    "index_skills": 1,
+                    "show_browse_hint": True,
+                }
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            result = build_skills_system_prompt()
+
+        assert "skills_list(category=" in result
+        assert "skill_view(name)" in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

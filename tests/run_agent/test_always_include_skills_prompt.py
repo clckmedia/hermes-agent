@@ -110,6 +110,33 @@ def test_always_include_skills_loads_full_body_and_keeps_skill_index():
     assert "INDEX_ONLY_BODY_SENTINEL" not in prompt
 
 
+def test_always_include_skills_full_body_still_loads_when_index_skills_hidden(tmp_path):
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    skills_dir = tmp_path / "skills"
+    _make_skill(
+        skills_dir,
+        "pinned-skill",
+        "Pinned index description.",
+        "PINNED_FULL_BODY_SENTINEL",
+    )
+    config = {
+        "agent": {"tool_use_enforcement": False},
+        "skills": {
+            "prompt_index": {
+                "enabled": True,
+                "index_skills": 0,
+                "show_browse_hint": False,
+                "always_include_skills": ["pinned-skill"],
+            }
+        },
+    }
+
+    prompt = _build_agent_prompt(config, skills_dir=skills_dir)
+
+    assert "PINNED_FULL_BODY_SENTINEL" in prompt
+    assert "- pinned-skill: Pinned index description." not in prompt
+
+
 def test_missing_always_include_skill_logs_warning_but_does_not_crash(caplog):
     clear_skills_system_prompt_cache(clear_snapshot=True)
     skills_dir = get_skills_dir()

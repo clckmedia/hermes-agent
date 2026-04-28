@@ -441,6 +441,8 @@ _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
+_PROMPT_INDEX_DEFAULT_INDEX_SKILLS = 32
+_PROMPT_INDEX_DEFAULT_SHOW_BROWSE_HINT = True
 _ALWAYS_INCLUDE_DEFAULT_MAX_CATEGORIES = 5
 _ALWAYS_INCLUDE_DEFAULT_MAX_SKILLS_PER_CATEGORY = 3
 _ALWAYS_INCLUDE_DEFAULT_MAX_TOTAL_SKILLS = 20
@@ -734,6 +736,102 @@ def _collect_skill_index_categories(
     return skills_by_category, category_descriptions
 
 
+def _dedupe_sorted_skill_index_items(
+    skills: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Return alphabetized, de-duplicated skill index rows for one category."""
+    items: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, desc in sorted(skills, key=lambda item: item[0]):
+        name = str(name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append((name, str(desc or "").strip()))
+    return items
+
+
+def _select_prompt_index_skill_shortlist(
+    category_skill_items: dict[str, list[tuple[str, str]]],
+    *,
+    index_skills: int,
+) -> tuple[dict[str, list[tuple[str, str]]], int, int]:
+    """Select a capped, category-balanced shortlist of individual skills."""
+    total_skills = sum(len(items) for items in category_skill_items.values())
+    selected: dict[str, list[tuple[str, str]]] = {
+        category: [] for category in category_skill_items
+    }
+    if index_skills <= 0 or total_skills == 0:
+        return selected, 0, total_skills
+
+    rendered = 0
+    max_category_size = max(
+        (len(items) for items in category_skill_items.values()),
+        default=0,
+    )
+    categories = sorted(category_skill_items.keys())
+    for skill_offset in range(max_category_size):
+        for category in categories:
+            items = category_skill_items[category]
+            if skill_offset >= len(items):
+                continue
+            selected[category].append(items[skill_offset])
+            rendered += 1
+            if rendered >= index_skills:
+                return selected, rendered, total_skills
+
+    return selected, rendered, total_skills
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _configured_skills_prompt_index_options(
+    config: dict | None = None,
+) -> tuple[bool, int, bool]:
+    """Read compact skill-index controls from skills.prompt_index."""
+    skills_cfg, prompt_index_cfg = _read_skills_prompt_index_config(config)
+    if not skills_cfg:
+        return (
+            True,
+            _PROMPT_INDEX_DEFAULT_INDEX_SKILLS,
+            _PROMPT_INDEX_DEFAULT_SHOW_BROWSE_HINT,
+        )
+
+    enabled = _coerce_bool(prompt_index_cfg.get("enabled"), True)
+
+    index_skills = prompt_index_cfg.get("index_skills")
+    if index_skills is None:
+        index_skills = skills_cfg.get("index_skills")
+
+    show_browse_hint = prompt_index_cfg.get("show_browse_hint")
+    if show_browse_hint is None:
+        show_browse_hint = skills_cfg.get("show_browse_hint")
+
+    return (
+        enabled,
+        _coerce_always_include_limit(
+            index_skills,
+            _PROMPT_INDEX_DEFAULT_INDEX_SKILLS,
+        ),
+        _coerce_bool(
+            show_browse_hint,
+            _PROMPT_INDEX_DEFAULT_SHOW_BROWSE_HINT,
+        ),
+    )
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -761,6 +859,12 @@ def build_skills_system_prompt(
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
+    index_enabled, index_skills, show_browse_hint = (
+        _configured_skills_prompt_index_options()
+    )
+    if not index_enabled:
+        return ""
+
     from gateway.session_context import get_session_env
     _platform_hint = (
         os.environ.get("HERMES_PLATFORM")
@@ -775,6 +879,8 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        index_skills,
+        show_browse_hint,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -790,6 +896,18 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        category_skill_items = {
+            category: _dedupe_sorted_skill_index_items(skills)
+            for category, skills in skills_by_category.items()
+        }
+        selected_skills, rendered_skill_count, total_skill_count = (
+            _select_prompt_index_skill_shortlist(
+                category_skill_items,
+                index_skills=index_skills,
+            )
+        )
+        hidden_skill_count = max(0, total_skill_count - rendered_skill_count)
+
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             cat_desc = category_descriptions.get(category, "")
@@ -797,16 +915,21 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
+            for name, desc in selected_skills.get(category, []):
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+
+        browse_hint = ""
+        if hidden_skill_count and show_browse_hint:
+            browse_hint = (
+                "\n<skills_browse_hint>\n"
+                f"{hidden_skill_count} individual skills are hidden from this compact index. "
+                "Use skills_list(category=\"category-name\") to browse a relevant "
+                "category, then skill_view(name) to load the selected skill before acting.\n"
+                "</skills_browse_hint>\n"
+            )
 
         result = (
             "## Skills (mandatory)\n"
@@ -828,7 +951,8 @@ def build_skills_system_prompt(
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
-            "\n"
+            + browse_hint
+            + "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
         )
 
@@ -878,14 +1002,14 @@ def _coerce_always_include_limit(value: Any, default: int) -> int:
 def _read_skills_prompt_index_config(
     config: dict | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return (skills_cfg, skills.prompt_index cfg) for always-include settings."""
+    """Return (skills cfg, skills.prompt_index cfg) for skill-index settings."""
     if config is None:
         try:
             from hermes_cli.config import load_config
 
             config = load_config() or {}
         except Exception as exc:
-            logger.debug("Could not read config for always-include skills: %s", exc)
+            logger.debug("Could not read config for skills prompt index: %s", exc)
             return {}, {}
 
     skills_cfg = config.get("skills") if isinstance(config, dict) else None
