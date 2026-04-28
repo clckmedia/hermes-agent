@@ -288,12 +288,14 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
-        # Track timestamps of messages sent by the bot so we can respond
-        # to thread replies even without an explicit @mention.
+        # Track timestamps of messages sent by the bot for thread metadata
+        # and bounded bookkeeping. Mention gating for incoming thread replies
+        # is handled explicitly in _handle_slack_message().
         self._bot_message_ts: set = set()
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
-        # Track threads where the bot has been @mentioned — once mentioned,
-        # respond to ALL subsequent messages in that thread automatically.
+        # Track threads where the bot has been @mentioned. This is retained
+        # as bounded thread metadata; it does not bypass the fresh-mention
+        # gate for non-free-response channel thread replies.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
@@ -1567,44 +1569,28 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
-        # In channels, respond if:
-        #   0. Channel is in free_response_channels, OR require_mention is
-        #      disabled — always process regardless of mention.
-        #   1. The bot is @mentioned in this message, OR
-        #   2. The message is a reply in a thread the bot started/participated in, OR
-        #   3. The message is in a thread where the bot was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
+        # In channels, top-level messages may use free-response / global
+        # mention settings. Thread replies inherit per-channel free-response
+        # overrides, but otherwise stay fresh-mention-only.
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        free_response_channel = channel_id in self._slack_free_response_channels()
 
         if not is_dm and bot_uid:
-            if channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process
+            if is_thread_reply:
+                if not is_mentioned and not free_response_channel:
+                    return
+            elif free_response_channel:
+                pass  # Free-response channel — process top-level messages
             elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
+                pass  # Mention requirement disabled globally for top-level Slack messages
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = (
-                    is_thread_reply
-                    and self._has_active_session_for_thread(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        user_id=user_id,
-                    )
-                )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
-                    return
+                return
 
         if is_mentioned:
             # Strip the bot mention from the text

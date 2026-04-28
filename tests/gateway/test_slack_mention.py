@@ -233,15 +233,15 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
     is_mentioned = bot_uid and f"<@{bot_uid}>" in text
 
     if not is_dm:
-        if channel_id in adapter._slack_free_response_channels():
+        free_response_channel = channel_id in adapter._slack_free_response_channels()
+        if thread_reply:
+            return bool(is_mentioned) or free_response_channel
+        if free_response_channel:
             return True
         elif not adapter._slack_require_mention():
             return True
         elif not is_mentioned:
-            if thread_reply and active_session:
-                return True
-            else:
-                return False
+            return False
     return True
 
 
@@ -281,12 +281,29 @@ def test_mentioned_message_always_processed():
     assert _would_process(adapter, mentioned=True, text="what's up") is True
 
 
-def test_thread_reply_with_active_session_processed():
+def test_thread_reply_with_active_session_still_requires_mention():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="followup",
         thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_thread_reply_in_free_response_channel_inherits_free_response():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_channels=[CHANNEL_ID],
+    )
+    assert _would_process(
+        adapter, channel_id=CHANNEL_ID, text="followup", thread_reply=True,
     ) is True
+
+
+def test_thread_reply_with_global_require_mention_disabled_still_requires_mention():
+    adapter = _make_adapter(require_mention=False)
+    assert _would_process(
+        adapter, text="followup", thread_reply=True,
+    ) is False
 
 
 def test_thread_reply_without_active_session_ignored():
