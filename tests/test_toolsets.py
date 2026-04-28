@@ -109,6 +109,40 @@ class TestValidateToolset:
         assert validate_toolset("web") is True
         assert validate_toolset("terminal") is True
 
+    def test_instantly_readonly_toolset_exposes_only_watcher_read_tools(self):
+        expected = {
+            "mcp_instantly_get_account",
+            "mcp_instantly_get_campaign",
+            "mcp_instantly_get_campaign_analytics",
+            "mcp_instantly_get_daily_campaign_analytics",
+            "mcp_instantly_get_email",
+            "mcp_instantly_list_accounts",
+            "mcp_instantly_list_campaigns",
+            "mcp_instantly_list_emails",
+            "mcp_instantly_list_leads",
+        }
+        tools = set(resolve_toolset("instantly-readonly"))
+
+        assert validate_toolset("instantly-readonly") is True
+        assert tools == expected
+        assert not any(
+            marker in tool
+            for tool in tools
+            for marker in (
+                "activate",
+                "add_",
+                "create",
+                "delete",
+                "manage_",
+                "mark_",
+                "move_",
+                "pause",
+                "reply",
+                "update",
+                "verify",
+            )
+        )
+
     def test_all_alias_valid(self):
         assert validate_toolset("all") is True
         assert validate_toolset("*") is True

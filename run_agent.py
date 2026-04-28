@@ -2410,6 +2410,8 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        enabled_toolsets=self.enabled_toolsets,
+                        disabled_toolsets=self.disabled_toolsets,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled

@@ -542,6 +542,127 @@ def _parse_enabled_flag(value, default: bool = True) -> bool:
     return default
 
 
+def _toolset_names_from_value(value) -> Optional[List[str]]:
+    """Extract a list of toolset names from a channel override value."""
+    if isinstance(value, dict):
+        if "toolsets" in value:
+            value = value.get("toolsets")
+        elif "tools" in value:
+            value = value.get("tools")
+        else:
+            return None
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value]
+
+
+def _iter_channel_toolset_overrides(config: dict, platform: str):
+    """Yield configured channel toolset override blocks for a platform."""
+    if not isinstance(config, dict):
+        return
+
+    platform_cfg = config.get(platform)
+    if isinstance(platform_cfg, dict) and "channel_toolsets" in platform_cfg:
+        yield platform_cfg.get("channel_toolsets")
+
+    platforms_cfg = config.get("platforms")
+    if isinstance(platforms_cfg, dict):
+        platform_block = platforms_cfg.get(platform)
+        if isinstance(platform_block, dict):
+            extra = platform_block.get("extra")
+            if isinstance(extra, dict) and "channel_toolsets" in extra:
+                yield extra.get("channel_toolsets")
+
+    gateway_cfg = config.get("gateway")
+    if isinstance(gateway_cfg, dict):
+        gateway_platforms = gateway_cfg.get("platforms")
+        if isinstance(gateway_platforms, dict):
+            platform_block = gateway_platforms.get(platform)
+            if isinstance(platform_block, dict):
+                extra = platform_block.get("extra")
+                if isinstance(extra, dict) and "channel_toolsets" in extra:
+                    yield extra.get("channel_toolsets")
+
+
+def _match_channel_toolset_names(config: dict, platform: str, *channel_ids: Optional[str]) -> Optional[List[str]]:
+    """Return override toolset names for the first matching channel ID."""
+    wanted = [str(ch_id) for ch_id in channel_ids if ch_id is not None and str(ch_id)]
+    if not wanted:
+        return None
+
+    for overrides in _iter_channel_toolset_overrides(config, platform):
+        if isinstance(overrides, dict):
+            normalized = {str(k): v for k, v in overrides.items()}
+            for channel_id in wanted:
+                names = _toolset_names_from_value(normalized.get(channel_id))
+                if names is not None:
+                    return names
+        elif isinstance(overrides, list):
+            for channel_id in wanted:
+                for entry in overrides:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_ids = entry.get("ids")
+                    if entry_ids is None:
+                        entry_ids = entry.get("id") or entry.get("channel_id") or entry.get("chat_id")
+                    if isinstance(entry_ids, (list, tuple, set)):
+                        ids = {str(value) for value in entry_ids}
+                    elif entry_ids is not None:
+                        ids = {str(entry_ids)}
+                    else:
+                        ids = set()
+                    if channel_id not in ids:
+                        continue
+                    names = _toolset_names_from_value(entry)
+                    if names is not None:
+                        return names
+    return None
+
+
+def _config_with_platform_toolsets(config: dict, platform: str, toolset_names: List[str]) -> dict:
+    """Return a shallow config copy with one platform's toolset list replaced."""
+    scoped = dict(config or {})
+    platform_toolsets = dict(scoped.get("platform_toolsets") or {})
+    platform_toolsets[platform] = list(toolset_names)
+    scoped["platform_toolsets"] = platform_toolsets
+    return scoped
+
+
+def _get_scoped_platform_tools(
+    config: dict,
+    platform: str,
+    *,
+    channel_id: Optional[str] = None,
+    parent_channel_id: Optional[str] = None,
+    include_default_mcp_servers: bool = True,
+) -> Set[str]:
+    """Resolve enabled toolsets for a platform, allowing channel/forum overrides.
+
+    ``channel_toolsets`` may be configured under ``<platform>:`` as either a
+    mapping of channel/forum IDs to toolset lists or a list of entries with
+    ``id``/``ids`` and ``toolsets``.  The exact channel/thread ID wins, then the
+    parent channel/forum ID wins, then the platform-wide toolset selection is
+    used.  Overrides replace the platform list rather than merging with it.
+    """
+    override_names = _match_channel_toolset_names(
+        config or {},
+        platform,
+        channel_id,
+        parent_channel_id,
+    )
+    if override_names is None:
+        return _get_platform_tools(
+            config or {},
+            platform,
+            include_default_mcp_servers=include_default_mcp_servers,
+        )
+    return _get_platform_tools(
+        _config_with_platform_toolsets(config, platform, override_names),
+        platform,
+        include_default_mcp_servers=include_default_mcp_servers,
+    )
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,

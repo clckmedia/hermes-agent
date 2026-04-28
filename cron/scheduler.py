@@ -772,6 +772,29 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             enabled_toolsets = None
 
+        disabled_toolsets = ["cronjob", "messaging", "clarify"]
+        if enabled_toolsets is None:
+            # If a job has no explicit toolset allowlist, retain the historical
+            # broad built-in tool surface but deny configured MCP servers by
+            # default. Explicit cron allowlists such as ``instantly-readonly``
+            # bypass this branch and remain available.
+            try:
+                from hermes_cli.tools_config import _parse_enabled_flag
+                from toolsets import TOOLSETS
+                mcp_servers = _cfg.get("mcp_servers") or {}
+                if isinstance(mcp_servers, dict):
+                    for name, server_cfg in sorted(mcp_servers.items(), key=lambda item: str(item[0])):
+                        if not isinstance(server_cfg, dict):
+                            continue
+                        if not _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
+                            continue
+                        server_name = str(name)
+                        if server_name not in TOOLSETS:
+                            disabled_toolsets.append(server_name)
+                        disabled_toolsets.append(f"mcp-{server_name}")
+            except Exception as exc:
+                logger.debug("Job '%s': failed to build default MCP denylist: %s", job_id, exc)
+
         # Prefill messages from env or config.yaml
         prefill_messages = None
         prefill_file = os.getenv("HERMES_PREFILL_MESSAGES_FILE", "") or _cfg.get("prefill_messages_file", "")

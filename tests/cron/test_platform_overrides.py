@@ -161,7 +161,7 @@ def test_run_job_honors_job_reasoning_and_enabled_toolsets(tmp_path, monkeypatch
             "schedule_display": "manual",
             "skills": [],
             "reasoning_effort": "medium",
-            "enabled_toolsets": ["terminal", "web"],
+            "enabled_toolsets": ["terminal", "instantly-readonly"],
         }
     )
 
@@ -170,5 +170,83 @@ def test_run_job_honors_job_reasoning_and_enabled_toolsets(tmp_path, monkeypatch
     assert final_response == "ok"
     assert _CapturingAgent.last_init is not None
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "medium"}
-    assert _CapturingAgent.last_init["enabled_toolsets"] == ["terminal", "web"]
+    assert _CapturingAgent.last_init["enabled_toolsets"] == ["terminal", "instantly-readonly"]
     assert _CapturingAgent.last_init["disabled_toolsets"] == ["cronjob", "messaging", "clarify"]
+
+
+def test_run_job_disables_mcp_server_toolsets_when_job_has_no_explicit_toolsets(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  default: gpt-5.4\n"
+        "mcp_servers:\n"
+        "  activepieces:\n"
+        "    url: https://cloud.activepieces.com/mcp\n"
+        "  twilio:\n"
+        "    command: npx\n"
+        "  disabled-server:\n"
+        "    url: https://example.invalid/mcp\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(scheduler, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    fake_state = types.ModuleType("hermes_state")
+    fake_db = MagicMock()
+    fake_state.SessionDB = lambda: fake_db
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_state)
+
+    import dotenv
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+
+    import hermes_cli.runtime_provider as runtime_provider
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+            "command": None,
+            "args": [],
+        },
+    )
+
+    import agent.smart_model_routing as smart_model_routing
+    monkeypatch.setattr(
+        smart_model_routing,
+        "resolve_turn_route",
+        lambda prompt, smart_routing, primary: {
+            "model": "gpt-5.4",
+            "runtime": dict(primary),
+            "label": None,
+            "signature": ("gpt-5.4", "openrouter", "https://openrouter.ai/api/v1", "chat_completions", None, ()),
+        },
+    )
+
+    _CapturingAgent.last_init = None
+    ok, _output, final_response, error = scheduler.run_job(
+        {
+            "id": "job789",
+            "name": "Default MCP hardening test",
+            "prompt": "Say hi",
+            "schedule_display": "manual",
+            "skills": [],
+        }
+    )
+
+    assert ok is True
+    assert error is None
+    assert final_response == "ok"
+    assert _CapturingAgent.last_init is not None
+    disabled = set(_CapturingAgent.last_init["disabled_toolsets"])
+    assert {"cronjob", "messaging", "clarify"}.issubset(disabled)
+    assert {"activepieces", "mcp-activepieces", "twilio", "mcp-twilio"}.issubset(disabled)
+    assert "disabled-server" not in disabled
+    assert "mcp-disabled-server" not in disabled

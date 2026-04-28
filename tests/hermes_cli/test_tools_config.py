@@ -7,6 +7,7 @@ from hermes_cli.tools_config import (
     _apply_toolset_change,
     _configure_provider,
     _get_platform_tools,
+    _get_scoped_platform_tools,
     _platform_toolset_summary,
     _save_platform_tools,
     _toolset_has_keys,
@@ -113,6 +114,25 @@ def test_get_platform_tools_includes_enabled_mcp_servers_by_default():
     assert "disabled-server" not in enabled
 
 
+def test_get_platform_tools_can_deny_default_mcp_servers_but_keep_explicit_allowlist():
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "activepieces"]},
+        "mcp_servers": {
+            "activepieces": {"url": "https://cloud.activepieces.com/mcp"},
+            "instantly": {"url": "https://mcp.instantly.ai/mcp"},
+            "plusvibe": {"url": "https://mcp.plusvibe.ai/mcp"},
+        },
+    }
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert "web" in enabled
+    assert "memory" in enabled
+    assert "activepieces" in enabled
+    assert "instantly" not in enabled
+    assert "plusvibe" not in enabled
+
+
 def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_selection():
     config = {
         "platform_toolsets": {"cli": ["web", "memory"]},
@@ -167,6 +187,88 @@ def test_get_platform_tools_no_mcp_sentinel_does_not_affect_other_platforms():
     # cli (not configured with no_mcp) should include MCP
     cli_enabled = _get_platform_tools(config, "cli")
     assert "exa" in cli_enabled
+
+
+def test_get_scoped_platform_tools_applies_exact_channel_override():
+    config = {
+        "platform_toolsets": {"discord": ["hermes-discord", "no_mcp"]},
+        "mcp_servers": {
+            "instantly": {"url": "https://mcp.instantly.ai/mcp"},
+            "activepieces": {"url": "https://cloud.activepieces.com/mcp"},
+            "plusvibe": {"url": "https://mcp.plusvibe.ai/mcp"},
+        },
+        "discord": {
+            "channel_toolsets": {
+                "tech-forum": ["hermes-discord", "activepieces"],
+            }
+        },
+    }
+
+    enabled = _get_scoped_platform_tools(config, "discord", channel_id="tech-forum")
+
+    assert "activepieces" in enabled
+    assert "instantly" not in enabled
+    assert "plusvibe" not in enabled
+
+
+def test_get_scoped_platform_tools_uses_parent_channel_override_for_forum_threads():
+    config = {
+        "platform_toolsets": {"discord": ["hermes-discord", "no_mcp"]},
+        "mcp_servers": {
+            "activepieces": {"url": "https://cloud.activepieces.com/mcp"},
+        },
+        "discord": {
+            "channel_toolsets": {
+                "parent-forum": ["hermes-discord", "activepieces"],
+            }
+        },
+    }
+
+    enabled = _get_scoped_platform_tools(
+        config,
+        "discord",
+        channel_id="thread-id",
+        parent_channel_id="parent-forum",
+    )
+
+    assert "activepieces" in enabled
+
+
+def test_get_scoped_platform_tools_channel_override_can_run_lean_without_mcp():
+    config = {
+        "platform_toolsets": {"discord": ["hermes-discord", "activepieces"]},
+        "mcp_servers": {
+            "activepieces": {"url": "https://cloud.activepieces.com/mcp"},
+        },
+        "discord": {
+            "channel_toolsets": {
+                "child-execution": ["terminal", "file", "code_execution", "no_mcp"],
+            }
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        enabled = _get_scoped_platform_tools(config, "discord", channel_id="child-execution")
+
+    assert enabled == {"terminal", "file", "code_execution"}
+
+
+def test_get_scoped_platform_tools_supports_list_entries_for_channel_toolsets():
+    config = {
+        "platform_toolsets": {"slack": ["hermes-slack", "no_mcp"]},
+        "mcp_servers": {
+            "plusvibe": {"url": "https://mcp.plusvibe.ai/mcp"},
+        },
+        "slack": {
+            "channel_toolsets": [
+                {"id": "reply-triage", "toolsets": ["hermes-slack", "plusvibe"]},
+            ]
+        },
+    }
+
+    enabled = _get_scoped_platform_tools(config, "slack", channel_id="reply-triage")
+
+    assert "plusvibe" in enabled
 
 
 def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):

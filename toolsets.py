@@ -216,6 +216,22 @@ TOOLSETS = {
         "includes": []
     },
 
+    "instantly-readonly": {
+        "description": "Read-only Instantly MCP tools for CLCK sales ops watcher jobs",
+        "tools": [
+            "mcp_instantly_get_account",
+            "mcp_instantly_get_campaign",
+            "mcp_instantly_get_campaign_analytics",
+            "mcp_instantly_get_daily_campaign_analytics",
+            "mcp_instantly_get_email",
+            "mcp_instantly_list_accounts",
+            "mcp_instantly_list_campaigns",
+            "mcp_instantly_list_emails",
+            "mcp_instantly_list_leads",
+        ],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
