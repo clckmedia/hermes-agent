@@ -4532,7 +4532,11 @@ class HermesCLI:
         # Reset session so the new tool config is picked up from a clean state
         from hermes_cli.tools_config import _get_platform_tools
         from hermes_cli.config import load_config
-        self.enabled_toolsets = _get_platform_tools(load_config(), "cli")
+        self.enabled_toolsets = _get_platform_tools(
+            load_config(),
+            "cli",
+            include_default_mcp_servers=False,
+        )
         self.new_session()
         _cprint(f"{_DIM}Session reset. New tool configuration is active.{_RST}")
 
@@ -11263,9 +11267,16 @@ def main(
                 else:
                     toolsets_list.append(str(t))
     else:
-        # Use the shared resolver so MCP servers are included at runtime
+        # Use the shared resolver so explicit MCP allowlists are included at
+        # runtime, without pulling every configured MCP server in by default.
         from hermes_cli.tools_config import _get_platform_tools
-        toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
+        toolsets_list = sorted(
+            _get_platform_tools(
+                CLI_CONFIG,
+                "cli",
+                include_default_mcp_servers=False,
+            )
+        )
     
     parsed_skills = _parse_skills_argument(skills)
 

@@ -5130,6 +5130,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                channel_parent_id=getattr(source, "parent_chat_id", None) or getattr(event, "channel_parent_id", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7096,7 +7097,12 @@ class GatewayRunner:
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id)
+            self._run_background_task(
+                prompt,
+                source,
+                task_id,
+                channel_parent_id=getattr(event, "channel_parent_id", None),
+            )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
@@ -7105,7 +7111,11 @@ class GatewayRunner:
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        channel_parent_id: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -7133,8 +7143,16 @@ class GatewayRunner:
 
             platform_key = _platform_config_key(source.platform)
 
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            from hermes_cli.tools_config import _get_scoped_platform_tools
+            enabled_toolsets = sorted(
+                _get_scoped_platform_tools(
+                    user_config,
+                    platform_key,
+                    channel_id=source.chat_id,
+                    parent_channel_id=channel_parent_id,
+                    include_default_mcp_servers=False,
+                )
+            )
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -9961,6 +9979,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        channel_parent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -9997,9 +10016,18 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        channel_parent_id = channel_parent_id or getattr(source, "parent_chat_id", None)
 
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        from hermes_cli.tools_config import _get_scoped_platform_tools
+        enabled_toolsets = sorted(
+            _get_scoped_platform_tools(
+                user_config,
+                platform_key,
+                channel_id=source.chat_id,
+                parent_channel_id=channel_parent_id,
+                include_default_mcp_servers=False,
+            )
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

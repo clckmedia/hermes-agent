@@ -830,6 +830,40 @@ class TestRunJobSessionPersistence:
         # run cannot accidentally spin up frontier models.
         assert "moa" not in kwargs["enabled_toolsets"]
 
+    def test_run_job_default_toolsets_exclude_unlisted_mcp_servers(self, tmp_path):
+        """Cron jobs should not inherit every enabled MCP server by default."""
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n"
+            "  activepieces:\n"
+            "    url: https://example.invalid/activepieces\n"
+            "  twilio:\n"
+            "    command: npx\n"
+            "  disabled-server:\n"
+            "    url: https://example.invalid/disabled\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "default-mcp-hardened-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        enabled = set(mock_agent_cls.call_args.kwargs["enabled_toolsets"])
+        assert "activepieces" not in enabled
+        assert "mcp-activepieces" not in enabled
+        assert "twilio" not in enabled
+        assert "mcp-twilio" not in enabled
+        assert "disabled-server" not in enabled
+        assert "mcp-disabled-server" not in enabled
+
     def test_run_job_per_job_toolsets_win_over_platform_config(self, tmp_path):
         """Per-job enabled_toolsets (via cronjob tool) always take precedence
         over the platform-level ``hermes tools`` config."""

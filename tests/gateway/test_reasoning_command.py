@@ -299,7 +299,7 @@ class TestReasoningCommand:
         assert _CapturingAgent.last_init is not None
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
-    def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):
+    def test_run_agent_excludes_default_mcp_servers_from_gateway_toolsets(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(
@@ -323,7 +323,7 @@ class TestReasoningCommand:
                 "provider": "openrouter",
                 "api_mode": "chat_completions",
                 "base_url": "https://openrouter.ai/api/v1",
-                "api_key": "test-key",
+                "api_key": "***",
             },
         )
         fake_run_agent = types.ModuleType("run_agent")
@@ -357,8 +357,75 @@ class TestReasoningCommand:
         enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
         assert "web" in enabled_toolsets
         assert "memory" in enabled_toolsets
-        assert "exa" in enabled_toolsets
-        assert "web-search-prime" in enabled_toolsets
+        assert "exa" not in enabled_toolsets
+        assert "web-search-prime" not in enabled_toolsets
+
+    def test_run_agent_preserves_explicit_mcp_channel_allowlist(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platform_toolsets:\n"
+            "  discord: [hermes-discord, no_mcp]\n"
+            "mcp_servers:\n"
+            "  activepieces:\n"
+            "    url: https://cloud.activepieces.com/mcp\n"
+            "  instantly:\n"
+            "    url: https://mcp.instantly.ai/mcp\n"
+            "  plusvibe:\n"
+            "    url: https://mcp.plusvibe.ai/mcp\n"
+            "discord:\n"
+            "  channel_toolsets:\n"
+            "    'parent-forum': [hermes-discord, activepieces]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "***",
+            },
+        )
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-id",
+            chat_name="Activepieces thread",
+            chat_type="thread",
+            user_id="user-1",
+            thread_id="thread-id",
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message="ping",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:discord:thread",
+                channel_parent_id="parent-forum",
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
+        assert "activepieces" in enabled_toolsets
+        assert "instantly" not in enabled_toolsets
+        assert "plusvibe" not in enabled_toolsets
 
     def test_run_agent_homeassistant_uses_default_platform_toolset(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
