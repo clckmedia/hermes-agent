@@ -1142,18 +1142,20 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
         # In channels, top-level messages may use free-response / global
-        # mention settings, but thread replies are always mention-only.
+        # mention settings. Thread replies inherit per-channel free-response
+        # overrides, but otherwise stay fresh-mention-only.
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         is_mentioned = bot_uid and f"<@{bot_uid}>" in text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        free_response_channel = channel_id in self._slack_free_response_channels()
 
         if not is_dm and bot_uid:
             if is_thread_reply:
-                if not is_mentioned:
+                if not is_mentioned and not free_response_channel:
                     return
-            elif channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process top-level messages
+            elif free_response_channel:
+                pass  # Free-response channel — process top-level messages
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for top-level Slack messages
             elif not is_mentioned:
@@ -1751,10 +1753,11 @@ class SlackAdapter(BasePlatformAdapter):
         thread_ts: str,
         user_id: str,
     ) -> bool:
-        """Check if there's an active session for a thread.
+        """Check whether a session already exists for a Slack thread.
 
-        Used to determine if thread replies without @mentions should be
-        processed (they should if there's an active session).
+        Used to decide how much thread context to fetch before handing a
+        thread reply to the agent. Mention gating itself is handled earlier
+        in `_handle_slack_message()`.
 
         Uses ``build_session_key()`` as the single source of truth for key
         construction — avoids the bug where manual key building didn't

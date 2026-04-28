@@ -531,6 +531,50 @@ class TestMessageRouting:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_thread_reply_in_free_response_channel_inherits_channel_gating(self, adapter):
+        """Thread replies in free-response channels should not require mentions."""
+        adapter.config.extra["require_mention"] = True
+        adapter.config.extra["free_response_channels"] = ["C123"]
+        adapter._has_active_session_for_thread = MagicMock(return_value=True)
+        adapter._fetch_channel_client_context = AsyncMock(return_value="")
+        adapter._resolve_user_name = AsyncMock(return_value="User")
+
+        event = {
+            "text": "carry on with this",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000001",
+            "ts": "1234567890.000002",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.reply_to_message_id == "1234567890.000001"
+        assert msg_event.text == "carry on with this"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_in_default_channel_still_requires_mention(self, adapter):
+        """Threads outside free-response channels stay fresh-mention-only."""
+        adapter.config.extra["require_mention"] = True
+        adapter.config.extra["free_response_channels"] = ["C_OTHER"]
+
+        event = {
+            "text": "carry on with this",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000001",
+            "ts": "1234567890.000003",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_channel_mention_strips_bot_id(self, adapter):
         """When mentioned in a channel, the bot mention should be stripped."""
         event = {
