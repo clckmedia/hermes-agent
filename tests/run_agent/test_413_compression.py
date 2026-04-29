@@ -553,6 +553,93 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
+    def test_large_tool_result_body_triggers_compression_even_when_reported_prompt_is_low(self, agent):
+        """Newly appended tool output should count before the next API call.
+
+        Provider usage is for the request that produced the tool call. The tool
+        result is appended afterwards, so compression must compare the prompt-only
+        usage with a fresh rough request estimate that includes messages and tools.
+        """
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 80_000
+        agent.context_compressor.last_prompt_tokens = 10_000
+        agent.context_compressor.last_completion_tokens = 500
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
+        )
+        tool_resp = _mock_response(
+            content=None, finish_reason="stop", tool_calls=[tc],
+            usage={"prompt_tokens": 10_000, "completion_tokens": 500, "total_tokens": 10_500},
+        )
+        ok_resp = _mock_response(
+            content="Done after compression", finish_reason="stop",
+            usage={"prompt_tokens": 30_000, "completion_tokens": 100, "total_tokens": 30_100},
+        )
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+        large_result = "x" * 400_000  # ≈100k rough tokens, appended after provider usage
+
+        def append_large_tool_result(_assistant_message, messages, _task_id, _api_call_count=0):
+            messages.append({
+                "role": "tool",
+                "tool_call_id": "tc1",
+                "content": large_result,
+            })
+
+        with (
+            patch.object(agent, "_execute_tool_calls", side_effect=append_large_tool_result),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}], "compressed prompt",
+            )
+            result = agent.run_conversation("hello")
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+
+    def test_high_completion_tokens_alone_do_not_trigger_post_tool_compression(self, agent):
+        """Reasoning/completion tokens should not be added to prompt context use."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 80_000
+        agent.context_compressor.last_prompt_tokens = 10_000
+        agent.context_compressor.last_completion_tokens = 120_000
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
+        )
+        tool_resp = _mock_response(
+            content=None, finish_reason="stop", tool_calls=[tc],
+            usage={"prompt_tokens": 10_000, "completion_tokens": 120_000, "total_tokens": 130_000},
+        )
+        ok_resp = _mock_response(
+            content="Done without compression", finish_reason="stop",
+            usage={"prompt_tokens": 12_000, "completion_tokens": 100, "total_tokens": 12_100},
+        )
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+
+        def append_small_tool_result(_assistant_message, messages, _task_id, _api_call_count=0):
+            messages.append({"role": "tool", "tool_call_id": "tc1", "content": "small"})
+
+        with (
+            patch.object(agent, "_execute_tool_calls", side_effect=append_small_tool_result),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        mock_compress.assert_not_called()
+        assert result["completed"] is True
+
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' error triggers compression as safety net."""
         err_400 = Exception(

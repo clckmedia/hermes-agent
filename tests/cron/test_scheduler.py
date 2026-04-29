@@ -156,6 +156,63 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_explicit_slack_channel_id_does_not_use_channel_directory(self):
+        """deliver: 'slack:C...' should target that channel, not a cached thread label."""
+        job = {"deliver": "slack:C0ASUMH4F3Q"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0ASUMH4F3Q:1777242585.810809",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_not_called()
+        assert result == {
+            "platform": "slack",
+            "chat_id": "C0ASUMH4F3Q",
+            "thread_id": None,
+        }
+
+    def test_explicit_slack_thread_target_splits_channel_and_thread_id(self):
+        """deliver: 'slack:C...:thread_ts' should target the explicit Slack thread."""
+        job = {"deliver": "slack:C0ASUMH4F3Q:1777242585.810809"}
+        with patch("gateway.channel_directory.resolve_channel_name") as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_not_called()
+        assert result == {
+            "platform": "slack",
+            "chat_id": "C0ASUMH4F3Q",
+            "thread_id": "1777242585.810809",
+        }
+
+    def test_human_friendly_slack_label_resolved_via_channel_directory(self):
+        """deliver: 'slack:label' should still resolve to a Slack conversation ID."""
+        job = {"deliver": "slack:arlo-alerts"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="G0123PRIVATE",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_called_once_with("slack", "arlo-alerts")
+        assert result == {
+            "platform": "slack",
+            "chat_id": "G0123PRIVATE",
+            "thread_id": None,
+        }
+
+    def test_human_friendly_slack_thread_label_preserves_thread_ts(self):
+        """Resolved Slack session labels should split channel_id and thread_ts."""
+        job = {"deliver": "slack:arlo-alerts / smoke test"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0ASUMH4F3Q:1777242585.810809",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_called_once_with("slack", "arlo-alerts / smoke test")
+        assert result == {
+            "platform": "slack",
+            "chat_id": "C0ASUMH4F3Q",
+            "thread_id": "1777242585.810809",
+        }
+
     def test_human_friendly_label_resolved_via_channel_directory(self):
         """deliver: 'whatsapp:Alice (dm)' resolves to the real JID."""
         job = {"deliver": "whatsapp:Alice (dm)"}
@@ -646,6 +703,15 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_lock(self, tmp_path):
+        """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
+        lock_dir = tmp_path / "cron"
+        lock_dir.mkdir(exist_ok=True)
+        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+            yield
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -830,6 +896,40 @@ class TestRunJobSessionPersistence:
         # run cannot accidentally spin up frontier models.
         assert "moa" not in kwargs["enabled_toolsets"]
 
+    def test_run_job_default_toolsets_exclude_unlisted_mcp_servers(self, tmp_path):
+        """Cron jobs should not inherit every enabled MCP server by default."""
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n"
+            "  activepieces:\n"
+            "    url: https://example.invalid/activepieces\n"
+            "  twilio:\n"
+            "    command: npx\n"
+            "  disabled-server:\n"
+            "    url: https://example.invalid/disabled\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "default-mcp-hardened-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        enabled = set(mock_agent_cls.call_args.kwargs["enabled_toolsets"])
+        assert "activepieces" not in enabled
+        assert "mcp-activepieces" not in enabled
+        assert "twilio" not in enabled
+        assert "mcp-twilio" not in enabled
+        assert "disabled-server" not in enabled
+        assert "mcp-disabled-server" not in enabled
+
     def test_run_job_per_job_toolsets_win_over_platform_config(self, tmp_path):
         """Per-job enabled_toolsets (via cronjob tool) always take precedence
         over the platform-level ``hermes tools`` config."""
@@ -855,6 +955,69 @@ class TestRunJobSessionPersistence:
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["terminal"]
+
+    def test_run_job_honors_cron_platform_reasoning_and_service_tier(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "agent:\n"
+            "  reasoning_effort: low\n"
+            "  service_tier: normal\n"
+            "  platforms:\n"
+            "    cron:\n"
+            "      reasoning_effort: xhigh\n"
+            "      service_tier: fast\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "platform-override-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("hermes_cli.models.resolve_fast_mode_overrides", return_value={"service_tier": "priority"}), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert kwargs["service_tier"] == "priority"
+        assert kwargs["request_overrides"] == {"service_tier": "priority"}
+
+    def test_run_job_honors_per_job_reasoning_override(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "agent:\n"
+            "  reasoning_effort: high\n"
+            "  platforms:\n"
+            "    cron:\n"
+            "      reasoning_effort: xhigh\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "reasoning-override-job",
+            "name": "test",
+            "prompt": "hello",
+            "reasoning_effort": "medium",
+            "enabled_toolsets": ["terminal", "web"],
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "medium"}
+        assert kwargs["enabled_toolsets"] == ["terminal", "web"]
+        assert kwargs["disabled_toolsets"] == ["cronjob", "messaging", "clarify"]
 
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
@@ -933,6 +1096,38 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0] == "empty-job"
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
+
+    def test_tick_preserves_output_and_marks_delivery_failure_unhealthy(self, tmp_path, monkeypatch):
+        """Generated output is durable, but failed delivery must not leave last_status=ok."""
+        from cron import jobs as jobs_mod
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import tick
+        import cron.scheduler as scheduler_mod
+
+        cron_dir = tmp_path / "cron"
+        monkeypatch.setattr(jobs_mod, "CRON_DIR", cron_dir)
+        monkeypatch.setattr(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json")
+        monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", cron_dir / "output")
+        monkeypatch.setattr(scheduler_mod, "_LOCK_DIR", tmp_path / "locks")
+        monkeypatch.setattr(scheduler_mod, "_LOCK_FILE", tmp_path / "locks" / "cron.lock")
+
+        job = create_job(prompt="Report", schedule="every 1h", deliver="slack:C0ASUMH4F3Q")
+        delivery_error = "delivery error: Slack API error: channel_not_found"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, "# full output", "Summary", None)), \
+             patch("cron.scheduler._deliver_result", return_value=delivery_error):
+            executed = tick(verbose=False)
+
+        assert executed == 1
+        output_files = list((cron_dir / "output" / job["id"]).glob("*.md"))
+        assert len(output_files) == 1
+        assert output_files[0].read_text() == "# full output"
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "delivery_error"
+        assert updated["last_error"] is None
+        assert updated["last_delivery_error"] == delivery_error
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
@@ -1252,6 +1447,15 @@ class TestRunJobSkillBacked:
 
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_lock(self, tmp_path):
+        """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
+        lock_dir = tmp_path / "cron"
+        lock_dir.mkdir(exist_ok=True)
+        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+            yield
 
     def _make_job(self):
         return {

@@ -379,6 +379,50 @@ class TestToolNamePreservation(unittest.TestCase):
                     f"_saved_tool_names leaked back into wrong scope: {exc}"
                 )
 
+    @patch("tools.delegate_tool._load_config")
+    def test_config_default_toolsets_limit_child_when_no_explicit_toolsets(self, mock_cfg):
+        """delegation.default_toolsets narrows inherited parent toolsets."""
+        mock_cfg.return_value = {"default_toolsets": ["terminal", "file", "web"]}
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file", "browser"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            _build_child_agent(
+                task_index=0,
+                goal="regression check",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(sorted(kwargs["enabled_toolsets"]), ["file", "terminal"])
+
+    @patch("tools.delegate_tool._load_config")
+    def test_explicit_toolsets_override_config_default_toolsets(self, mock_cfg):
+        """Call-site toolsets remain stronger than delegation.default_toolsets."""
+        mock_cfg.return_value = {"default_toolsets": ["web"]}
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file", "web", "skills"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            _build_child_agent(
+                task_index=0,
+                goal="regression check",
+                context=None,
+                toolsets=["terminal", "skills"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(sorted(kwargs["enabled_toolsets"]), ["skills", "terminal"])
+
     def test_saved_tool_names_set_on_child_before_run(self):
         """_run_single_child must set _delegate_saved_tool_names on the child
         from model_tools._last_resolved_tool_names before run_conversation."""
@@ -566,6 +610,37 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
+
+    @patch("tools.delegate_tool._get_child_timeout", return_value=0.01)
+    def test_timeout_reports_child_activity_snapshot(self, _mock_timeout):
+        """Timed-out children should report observed progress and metadata."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.3-codex-spark"
+            mock_child.session_prompt_tokens = 1234
+            mock_child.session_completion_tokens = 56
+            mock_child.get_activity_summary.return_value = {
+                "api_call_count": 7,
+                "current_tool": "read_file",
+                "last_activity_desc": "running read_file",
+                "max_iterations": 25,
+            }
+            mock_child.run_conversation.side_effect = lambda **_kwargs: time.sleep(0.2)
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Timeout regression", parent_agent=parent))
+            entry = result["results"][0]
+
+        self.assertEqual(entry["status"], "timeout")
+        self.assertEqual(entry["exit_reason"], "timeout")
+        self.assertEqual(entry["api_calls"], 7)
+        self.assertEqual(entry["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(entry["tokens"], {"input": 1234, "output": 56})
+        self.assertEqual(entry["last_activity"]["current_tool"], "read_file")
+        self.assertEqual(entry["last_activity"]["max_iterations"], 25)
+        mock_child.interrupt.assert_called_once()
 
 
 class TestSubagentCostRollup(unittest.TestCase):

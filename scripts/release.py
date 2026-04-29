@@ -39,6 +39,8 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    # CLCK fork staging author
+    "damien@clck.com.au": "clckmedia",
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
     "qiyin.zuo@pcitc.com": "qiyin-code",

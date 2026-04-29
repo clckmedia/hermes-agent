@@ -141,7 +141,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_always_include_skills_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -4807,6 +4807,7 @@ class AIAgent:
                 pass
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+        avail_toolsets = set()
         if has_skills_tools:
             avail_toolsets = {
                 toolset
@@ -4823,6 +4824,15 @@ class AIAgent:
             skills_prompt = ""
         if skills_prompt:
             prompt_parts.append(skills_prompt)
+
+        always_include_skills_prompt = build_always_include_skills_prompt(
+            existing_prompt_text="\n\n".join(p.strip() for p in prompt_parts if p.strip()),
+            task_id=self.session_id,
+            available_tools=self.valid_tool_names,
+            available_toolsets=avail_toolsets,
+        )
+        if always_include_skills_prompt:
+            prompt_parts.append(always_include_skills_prompt)
 
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway
@@ -12859,36 +12869,33 @@ class AIAgent:
                     if _tc_names == {"execute_code"}:
                         self.iteration_budget.refund()
                     
-                    # Use real token counts from the API response to decide
-                    # compression.  prompt_tokens + completion_tokens is the
-                    # actual context size the provider reported plus the
-                    # assistant turn — a tight lower bound for the next prompt.
-                    # Tool results appended above aren't counted yet, but the
-                    # threshold (default 50%) leaves ample headroom; if tool
-                    # results push past it, the next API call will report the
-                    # real total and trigger compression then.
-                    #
-                    # If last_prompt_tokens is 0 (stale after API disconnect
-                    # or provider returned no usage data), fall back to rough
-                    # estimate to avoid missing compression.  Without this,
-                    # a session can grow unbounded after disconnects because
-                    # should_compress(0) never fires.  (#2153)
+                    # Decide whether the next LLM call should be compressed.
+                    # Provider-reported prompt tokens are accurate for the
+                    # request that produced the tool call, but they do not
+                    # include the tool result contents appended above. Large
+                    # file reads, MCP dumps, or terminal output can therefore
+                    # push the *next* request over the context limit even when
+                    # last_prompt_tokens is still comfortably below threshold.
+                    # Compare prompt-only usage with a fresh rough estimate
+                    # that includes current messages, the active system prompt,
+                    # and tool schemas. Do not add completion/reasoning tokens:
+                    # those don't consume the next prompt context window.
                     _compressor = self.context_compressor
+                    _reported_prompt_tokens = 0
                     if _compressor.last_prompt_tokens > 0:
-                        # Only use prompt_tokens — completion/reasoning
-                        # tokens don't consume context window space.
-                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                        # inflate completion_tokens with reasoning,
-                        # causing premature compression.  (#12026)
-                        _real_tokens = _compressor.last_prompt_tokens
-                    else:
-                        _real_tokens = estimate_messages_tokens_rough(messages)
+                        _reported_prompt_tokens = _compressor.last_prompt_tokens
+                    _rough_request_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or system_message or "",
+                        tools=self.tools or None,
+                    )
+                    _real_tokens = max(_reported_prompt_tokens, _rough_request_tokens)
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         self._safe_print("  ⟳ compacting context…")
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
-                            approx_tokens=self.context_compressor.last_prompt_tokens,
+                            approx_tokens=_real_tokens,
                             task_id=effective_task_id,
                         )
                         # Compression created a new session — clear history so

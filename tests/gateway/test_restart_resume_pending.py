@@ -34,13 +34,17 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import (
+    GatewayRunner,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    should_gate_auto_reset_message,
 )
+from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
+    RestartTestAdapter,
     make_restart_runner,
     make_restart_source,
 )
@@ -186,6 +190,26 @@ class TestSessionEntryResumeFields:
         assert restored.resume_pending is True
         assert restored.resume_reason == "restart_timeout"
         assert restored.last_resume_marked_at == now
+
+    def test_roundtrip_preserves_auto_reset_recovery_fields(self):
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:1",
+            session_id="fresh-sid",
+            created_at=now,
+            updated_at=now,
+            was_auto_reset=True,
+            auto_reset_reason="suspended",
+            reset_had_activity=True,
+            reset_previous_session_id="interrupted-sid",
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+
+        assert restored.was_auto_reset is True
+        assert restored.auto_reset_reason == "suspended"
+        assert restored.reset_had_activity is True
+        assert restored.reset_previous_session_id == "interrupted-sid"
 
     def test_from_dict_legacy_without_resume_fields(self):
         """Old sessions.json without the new fields deserialize cleanly."""
@@ -333,6 +357,7 @@ class TestGetOrCreateResumePending:
         assert second.session_id != original_sid
         assert second.was_auto_reset is True
         assert second.auto_reset_reason == "suspended"
+        assert second.reset_previous_session_id == original_sid
 
     def test_suspended_overrides_resume_pending(self, tmp_path):
         """Terminal escalation: a session that somehow has BOTH flags must
@@ -356,6 +381,104 @@ class TestGetOrCreateResumePending:
         assert second.session_id != original_sid
         assert second.was_auto_reset is True
         assert second.auto_reset_reason == "suspended"
+        assert second.reset_previous_session_id == original_sid
+
+    def test_only_suspended_auto_resets_gate_the_next_message(self):
+        assert should_gate_auto_reset_message("suspended") is True
+        assert should_gate_auto_reset_message("idle") is False
+        assert should_gate_auto_reset_message("daily") is False
+
+    @pytest.mark.asyncio
+    async def test_suspended_auto_reset_notice_gates_before_agent_work(self):
+        adapter = RestartTestAdapter()
+        runner, adapter = make_restart_runner(adapter)
+        source = make_restart_source()
+        session_key = runner._session_key_for_source(source)
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id="fresh-sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            was_auto_reset=True,
+            auto_reset_reason="suspended",
+            reset_had_activity=True,
+            reset_previous_session_id="interrupted-sid",
+        )
+        runner.session_store.get_or_create_session.return_value = entry
+        runner.session_store.config = GatewayConfig()
+        runner.session_store._save = MagicMock()
+        runner.session_store.load_transcript.return_value = [
+            {"role": "user", "content": "previous"},
+        ]
+        runner.session_store.has_any_sessions.return_value = True
+        runner._set_session_env = MagicMock(return_value={})
+        runner._set_session_reasoning_override = MagicMock()
+        runner._format_session_info = MagicMock(return_value="")
+        runner._prepare_inbound_message_text = AsyncMock(return_value="should not run")
+        runner._bind_adapter_run_generation = MagicMock()
+        runner._run_agent = AsyncMock(side_effect=AssertionError("agent should not run"))
+
+        event = MessageEvent(text="continue the task", source=source, message_id="m1")
+
+        result = await GatewayRunner._handle_message_with_agent(
+            runner,
+            event,
+            source,
+            session_key,
+            1,
+        )
+
+        assert result is None
+        assert runner._run_agent.await_count == 0
+        assert adapter.sent
+        assert "I haven't processed your message yet" in adapter.sent[-1]
+        assert "/resume interrupted" in adapter.sent[-1]
+        assert entry.was_auto_reset is False
+        assert entry.auto_reset_reason is None
+        runner.session_store._save.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_interrupted_alias_uses_recorded_previous_session(self):
+        runner, _adapter = make_restart_runner()
+        source = make_restart_source()
+        session_key = runner._session_key_for_source(source)
+        current = SessionEntry(
+            session_key=session_key,
+            session_id="fresh-sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            reset_previous_session_id="interrupted-sid",
+        )
+        resumed = SessionEntry(
+            session_key=session_key,
+            session_id="interrupted-sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        runner._session_db = MagicMock()
+        runner._session_db.resolve_session_by_title.return_value = None
+        runner._session_db.resolve_resume_session_id.side_effect = lambda sid: sid
+        runner._session_db.get_session_title.return_value = None
+        runner.session_store.get_or_create_session.return_value = current
+        runner.session_store.switch_session.return_value = resumed
+        runner.session_store.load_transcript.return_value = [
+            {"role": "user", "content": "previous"},
+        ]
+        runner._release_running_agent_state = MagicMock()
+        runner._clear_session_boundary_security_state = MagicMock()
+
+        event = MessageEvent(text="/resume interrupted", source=source)
+
+        result = await GatewayRunner._handle_resume_command(runner, event)
+
+        runner._session_db.resolve_session_by_title.assert_not_called()
+        runner.session_store.switch_session.assert_called_once_with(
+            session_key,
+            "interrupted-sid",
+        )
+        assert "interrupted session" in result
 
 
 # ---------------------------------------------------------------------------

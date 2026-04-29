@@ -41,6 +41,42 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _normalize_cron_toolsets(value) -> list[str] | None:
+    """Normalize a cron toolset override into a non-empty list."""
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()] or None
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()] or None
+    return None
+
+
+def _resolve_cron_agent_setting(cfg: dict, key: str):
+    """Resolve an agent setting with agent.platforms.cron taking precedence."""
+    if not isinstance(cfg, dict):
+        return None
+    agent_cfg = cfg.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        return None
+    value = agent_cfg.get(key)
+    platforms = agent_cfg.get("platforms") or {}
+    if isinstance(platforms, dict):
+        cron_cfg = platforms.get("cron") or {}
+        if isinstance(cron_cfg, dict) and key in cron_cfg:
+            value = cron_cfg.get(key)
+    return value
+
+
+def _parse_cron_service_tier(raw: str) -> str | None:
+    """Parse a persisted cron service-tier preference into an API value."""
+    value = str(raw or "").strip().lower()
+    if not value or value in {"normal", "default", "standard", "off", "none"}:
+        return None
+    if value in {"fast", "priority", "on"}:
+        return "priority"
+    logger.warning("Unknown cron service_tier %r, ignoring", raw)
+    return None
+
+
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
@@ -59,11 +95,26 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     surprise $4.63 run).
     """
     per_job = job.get("enabled_toolsets")
-    if per_job:
-        return per_job
+    if per_job is None and "toolsets" in job:
+        per_job = job.get("toolsets")
+    if per_job is not None:
+        normalized = _normalize_cron_toolsets(per_job)
+        if normalized is not None:
+            return normalized
+        logger.warning(
+            "Job '%s': ignoring invalid enabled_toolsets value %r",
+            job.get("id", "?"),
+            per_job,
+        )
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        return sorted(
+            _get_platform_tools(
+                cfg or {},
+                "cron",
+                include_default_mcp_servers=False,
+            )
+        )
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
@@ -192,19 +243,21 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
             chat_id, thread_id = rest, None
 
         # Resolve human-friendly labels like "Alice (dm)" to real IDs.
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
-            if resolved:
-                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
-                if resolved_is_explicit:
-                    chat_id = parsed_chat_id
-                    if parsed_thread_id is not None:
-                        thread_id = parsed_thread_id
-                else:
-                    chat_id = resolved
-        except Exception:
-            pass
+        # Explicit platform IDs must not be looked up in the channel directory:
+        # a cached label can legitimately resolve to a thread, but a concrete
+        # target such as slack:C0ASUMH4F3Q should stay on that channel.
+        if not is_explicit:
+            try:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform_key, chat_id)
+                if resolved:
+                    parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+                    if resolved_is_explicit:
+                        chat_id, thread_id = parsed_chat_id, parsed_thread_id
+                    else:
+                        chat_id = resolved
+            except Exception:
+                pass
 
         return {
             "platform": platform_name,
@@ -909,10 +962,25 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning config from config.yaml
+        # Reasoning + service tier config from config.yaml (cron can have its own override).
+        # Individual cron jobs can narrow reasoning further for routine/script-heavy jobs.
         from hermes_constants import parse_reasoning_effort
-        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
-        reasoning_config = parse_reasoning_effort(effort)
+        effort_raw = _resolve_cron_agent_setting(_cfg, "reasoning_effort")
+        job_effort = job.get("reasoning_effort")
+        if job_effort not in (None, ""):
+            effort_raw = job_effort
+        reasoning_config = parse_reasoning_effort(str(effort_raw or "").strip())
+
+        service_tier = _parse_cron_service_tier(
+            _resolve_cron_agent_setting(_cfg, "service_tier")
+        )
+        request_overrides = None
+        if service_tier:
+            try:
+                from hermes_cli.models import resolve_fast_mode_overrides
+                request_overrides = resolve_fast_mode_overrides(model)
+            except Exception:
+                request_overrides = None
 
         # Prefill messages from env or config.yaml
         prefill_messages = None
@@ -1003,6 +1071,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             acp_args=runtime.get("args"),
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
             credential_pool=credential_pool,

@@ -858,6 +858,21 @@ class TestParseTargetRefSlack:
     def test_dm_id_is_explicit(self):
         assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
 
+    def test_thread_ref_splits_channel_and_thread_ts(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "slack",
+            "C0ASUMH4F3Q:1777242585.810809",
+        )
+        assert chat_id == "C0ASUMH4F3Q"
+        assert thread_id == "1777242585.810809"
+        assert is_explicit is True
+
+    def test_label_is_not_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "arlo-alerts")
+        assert chat_id is None
+        assert thread_id is None
+        assert is_explicit is False
+
     def test_user_id_is_not_explicit(self):
         """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
         targets. chat.postMessage rejects them — a DM must be opened first via

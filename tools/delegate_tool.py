@@ -644,6 +644,57 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _normalise_toolset_list(value: Any, *, config_key: str) -> Optional[List[str]]:
+    """Return a clean toolset list from config/user input, or None if unset/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw_items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        logger.warning("delegation.%s=%r is not a list/string; ignoring", config_key, value)
+        return None
+
+    toolsets: List[str] = []
+    for item in raw_items:
+        if item is None:
+            continue
+        name = str(item).strip()
+        if name:
+            toolsets.append(name)
+    return toolsets
+
+
+def _child_activity_snapshot(child) -> Dict[str, Any]:
+    """Best-effort child progress snapshot for timeout/error reporting."""
+    raw: Dict[str, Any] = {}
+    try:
+        get_summary = getattr(child, "get_activity_summary", None)
+        if callable(get_summary):
+            candidate = get_summary()
+            if isinstance(candidate, dict):
+                raw = candidate
+    except Exception:
+        raw = {}
+
+    snapshot: Dict[str, Any] = {}
+    api_calls = raw.get("api_call_count", getattr(child, "session_api_calls", 0))
+    if isinstance(api_calls, (int, float)):
+        snapshot["api_call_count"] = int(api_calls)
+
+    max_iterations = raw.get("max_iterations", getattr(child, "max_iterations", None))
+    if isinstance(max_iterations, (int, float)):
+        snapshot["max_iterations"] = int(max_iterations)
+
+    for key in ("current_tool", "last_activity_desc"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            snapshot[key] = value
+
+    return snapshot
+
+
 def _build_child_progress_callback(
     task_index: int,
     goal: str,
@@ -914,12 +965,22 @@ def _build_child_agent(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        configured_default_toolsets = _normalise_toolset_list(
+            delegation_cfg.get("default_toolsets"), config_key="default_toolsets"
+        )
+        if configured_default_toolsets is not None:
+            # Operator default narrows broad parent sessions, but still cannot
+            # grant a toolset the parent does not already have.
+            child_toolsets = _strip_blocked_tools([
+                t for t in configured_default_toolsets if t in parent_toolsets
+            ])
+        elif parent_agent and parent_enabled is not None:
+            child_toolsets = _strip_blocked_tools(parent_enabled)
+        elif parent_toolsets:
+            child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+        else:
+            child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -1445,23 +1506,24 @@ def _run_single_child(
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             duration = round(time.monotonic() - child_start, 2)
+            activity = _child_activity_snapshot(child)
+            child_api_calls = activity.get("api_call_count", 0)
+            _input_tokens = getattr(child, "session_prompt_tokens", 0)
+            _output_tokens = getattr(child, "session_completion_tokens", 0)
+            _model = getattr(child, "model", None)
             logger.warning(
-                "Subagent %d %s after %.1fs",
+                "Subagent %d %s after %.1fs (observed_api_calls=%s, current_tool=%s)",
                 task_index,
                 "timed out" if is_timeout else f"raised {type(_timeout_exc).__name__}",
                 duration,
+                child_api_calls,
+                activity.get("current_tool"),
             )
 
             # When a subagent times out BEFORE making any API call, dump a
             # diagnostic to help users (and us) see what the child was doing.
             # See #14726 — without this, 0-API-call hangs are black boxes.
             diagnostic_path: Optional[str] = None
-            child_api_calls = 0
-            try:
-                _summary = child.get_activity_summary()
-                child_api_calls = int(_summary.get("api_call_count", 0) or 0)
-            except Exception:
-                pass
             if is_timeout and child_api_calls == 0:
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
@@ -1513,7 +1575,7 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
-            return {
+            entry = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
@@ -1521,9 +1583,17 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                "model": _model if isinstance(_model, str) else None,
+                "tokens": {
+                    "input": int(_input_tokens) if isinstance(_input_tokens, (int, float)) else 0,
+                    "output": int(_output_tokens) if isinstance(_output_tokens, (int, float)) else 0,
+                },
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            if activity:
+                entry["last_activity"] = activity
+            return entry
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -2424,7 +2494,7 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Toolsets to enable for this subagent. "
-                    "Default: inherits your enabled toolsets. "
+                    "Default: uses delegation.default_toolsets when configured, otherwise inherits your enabled toolsets. "
                     f"Available toolsets: {_TOOLSET_LIST_STR}. "
                     "Common patterns: ['terminal', 'file'] for code work, "
                     "['web'] for research, ['browser'] for web interaction, "

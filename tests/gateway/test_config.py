@@ -360,6 +360,40 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
+    def test_bridges_channel_toolsets_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_toolsets:\n"
+            "    \"123\":\n"
+            "      - hermes-discord\n"
+            "      - activepieces\n"
+            "    456:\n"
+            "      - terminal\n"
+            "      - file\n"
+            "      - no_mcp\n"
+            "slack:\n"
+            "  channel_toolsets:\n"
+            "    \"C01ABC\":\n"
+            "      - hermes-slack\n"
+            "      - plusvibe\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["channel_toolsets"] == {
+            "123": ["hermes-discord", "activepieces"],
+            "456": ["terminal", "file", "no_mcp"],
+        }
+        assert config.platforms[Platform.SLACK].extra["channel_toolsets"] == {
+            "C01ABC": ["hermes-slack", "plusvibe"],
+        }
+
     def test_invalid_quick_commands_in_config_yaml_are_ignored(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

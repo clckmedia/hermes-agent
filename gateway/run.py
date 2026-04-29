@@ -462,6 +462,38 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+def should_gate_auto_reset_message(reset_reason: str | None) -> bool:
+    """Return True when an auto-reset should stop before processing user text.
+
+    Gateway restart/crash safety resets (`suspended`) are the high-risk case:
+    the user usually expects continuity, so processing their next message in a
+    fresh session can send Hermes off doing the wrong work. Idle/daily/oversized
+    rotations keep the existing behaviour by default.
+    """
+    return str(reset_reason or "").strip().lower() == "suspended"
+
+
+_REAL_TRANSCRIPT_ROLES = {"user", "assistant", "tool"}
+
+
+def _is_first_real_transcript_turn(history: list[dict[str, Any]] | None) -> bool:
+    """Return True when no real conversation turn has been persisted yet.
+
+    Fresh sessions can have timestamp drift after commands like ``/reset``
+    pre-create the new SessionEntry.  The transcript is the durable source of
+    truth for whether the next inbound text is the first real user turn.  Ignore
+    metadata-only rows such as ``session_meta`` so a partially initialised
+    transcript does not suppress first-turn behaviour.
+    """
+    if not history:
+        return True
+    return not any(
+        isinstance(message, dict)
+        and message.get("role") in _REAL_TRANSCRIPT_ROLES
+        for message in history
+    )
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -1558,27 +1590,66 @@ class GatewayRunner:
         return ""
 
     @staticmethod
-    def _load_reasoning_config() -> dict | None:
-        """Load reasoning effort from config.yaml.
+    def _load_reasoning_config(
+        platform_key: str | None = None,
+        channel_id: str | None = None,
+        parent_channel_id: str | None = None,
+    ) -> dict | None:
+        """Load reasoning effort from config.yaml, honoring platform/channel overrides.
 
-        Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh". Returns None to use
-        default (medium).
+        Resolution order:
+        1. agent.platforms.<platform>.channel_reasoning_overrides.<channel_id>
+        2. agent.platforms.<platform>.channel_reasoning_overrides.<parent_channel_id>
+        3. agent.platforms.<platform>.reasoning_effort
+        4. agent.reasoning_effort
         """
         from hermes_constants import parse_reasoning_effort
+
+        cfg = _load_gateway_config()
         effort = ""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                effort = str(cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip()
-        except Exception:
-            pass
+        used_platform_override = False
+        channel_scope = None
+
+        if platform_key:
+            platform_cfg = cfg_get(cfg, "agent", "platforms", platform_key, default={})
+            if isinstance(platform_cfg, dict):
+                overrides = cfg_get(platform_cfg, "channel_reasoning_overrides", default={})
+                if isinstance(overrides, dict):
+                    for candidate, label in (
+                        (channel_id, "channel"),
+                        (parent_channel_id, "parent channel"),
+                    ):
+                        if not candidate:
+                            continue
+                        candidate_key = str(candidate)
+                        raw = overrides.get(candidate_key)
+                        if raw is None and candidate_key.isdigit():
+                            raw = overrides.get(int(candidate_key))
+                        if raw not in (None, ""):
+                            effort = str(raw).strip()
+                            channel_scope = f"{label} '{candidate}'"
+                            break
+
+                if not channel_scope:
+                    raw_platform_effort = cfg_get(platform_cfg, "reasoning_effort", default="")
+                    if raw_platform_effort not in (None, ""):
+                        effort = str(raw_platform_effort).strip()
+                        used_platform_override = True
+
+        if not effort:
+            effort = str(cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip()
         result = parse_reasoning_effort(effort)
         if effort and effort.strip() and result is None:
-            logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+            if channel_scope and platform_key:
+                logger.warning(
+                    "Unknown reasoning_effort '%s' for %s on platform '%s', using default (medium)",
+                    effort,
+                    channel_scope,
+                    platform_key,
+                )
+            else:
+                scope = f" for platform '{platform_key}'" if used_platform_override and platform_key else ""
+                logger.warning("Unknown reasoning_effort '%s'%s, using default (medium)", effort, scope)
         return result
 
     @staticmethod
@@ -1612,8 +1683,9 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        channel_parent_id: Optional[str] = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session and channel overrides."""
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -1624,7 +1696,23 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
-        return self._load_reasoning_config()
+
+        platform_key = None
+        channel_id = None
+        parent_channel_id = channel_parent_id
+        if source is not None:
+            try:
+                platform_key = _platform_config_key(source.platform)
+            except Exception:
+                platform_key = None
+            channel_id = getattr(source, "chat_id", None)
+            parent_channel_id = parent_channel_id or getattr(source, "parent_chat_id", None)
+
+        return self._load_reasoning_config(
+            platform_key,
+            channel_id=channel_id,
+            parent_channel_id=parent_channel_id,
+        )
 
     def _set_session_reasoning_override(
         self,
@@ -4593,19 +4681,6 @@ class GatewayRunner:
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
         
-        # Emit session:start for new or auto-reset sessions
-        _is_new_session = (
-            session_entry.created_at == session_entry.updated_at
-            or getattr(session_entry, "was_auto_reset", False)
-        )
-        if _is_new_session:
-            await self.hooks.emit("session:start", {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "session_id": session_entry.session_id,
-                "session_key": session_key,
-            })
-        
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -4634,6 +4709,7 @@ class GatewayRunner:
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
             context_prompt = context_note + "\n\n" + context_prompt
+            reset_gate = should_gate_auto_reset_message(reset_reason)
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -4655,28 +4731,43 @@ class GatewayRunner:
                 )
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
-                        elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
-                        else:
-                            hours = policy.idle_minutes // 60
-                            mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                    if reset_reason == "suspended":
+                        reason_text = "previous session was stopped or interrupted"
+                    elif reset_reason == "daily":
+                        reason_text = f"daily schedule at {policy.at_hour}:00"
+                    else:
+                        hours = policy.idle_minutes // 60
+                        mins = policy.idle_minutes % 60
+                        duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
+                        reason_text = f"inactive for {duration}"
+                    notice = (
+                        f"◐ Session automatically reset ({reason_text}). "
+                        f"Conversation history cleared.\n"
+                        f"Use /resume to browse and restore a previous session.\n"
+                        f"Adjust reset timing in config.yaml under session_reset."
+                    )
+                    if reset_gate:
+                        previous_session_id = getattr(
+                            session_entry,
+                            "reset_previous_session_id",
+                            None,
                         )
-                        try:
-                            session_info = self._format_session_info()
-                            if session_info:
-                                notice = f"{notice}\n\n{session_info}"
-                        except Exception:
-                            pass
+                        recovery_hint = "Use /resume interrupted to restore the previous session"
+                        if previous_session_id:
+                            recovery_hint += f" ({previous_session_id})"
+                        notice = (
+                            f"{notice}\n\n"
+                            "I haven't processed your message yet. "
+                            f"{recovery_hint}, or resend the message "
+                            "if you want me to answer it in this fresh context."
+                        )
+                    try:
+                        session_info = self._format_session_info()
+                        if session_info:
+                            notice = f"{notice}\n\n{session_info}"
+                    except Exception:
+                        pass
+                    if adapter:
                         await adapter.send(
                             source.chat_id, notice,
                             metadata=getattr(event, 'metadata', None),
@@ -4686,13 +4777,32 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+            if reset_gate:
+                try:
+                    self.session_store._save()
+                except Exception as e:
+                    logger.debug("Auto-reset gate state save failed (non-fatal): %s", e)
+                return None
+
+        # Load conversation history before first-turn gates.  The transcript is
+        # the source of truth here: after /reset the fresh SessionEntry can have
+        # tiny created_at/updated_at drift before the next real user turn.
+        history = self.session_store.load_transcript(session_entry.session_id)
+        _is_first_real_turn = _is_first_real_transcript_turn(history)
+        if _is_first_real_turn:
+            await self.hooks.emit("session:start", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "session_id": session_entry.session_id,
+                "session_key": session_key,
+            })
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Only inject on the first real user turn — ongoing conversations already
+        # have the skill content in their conversation history from that turn.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
+        if _is_first_real_turn and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message
@@ -4723,9 +4833,6 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
-        
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
@@ -5130,6 +5237,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                channel_parent_id=getattr(source, "parent_chat_id", None) or getattr(event, "channel_parent_id", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7096,7 +7204,12 @@ class GatewayRunner:
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id)
+            self._run_background_task(
+                prompt,
+                source,
+                task_id,
+                channel_parent_id=getattr(source, "parent_chat_id", None) or getattr(event, "channel_parent_id", None),
+            )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
@@ -7105,7 +7218,11 @@ class GatewayRunner:
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        channel_parent_id: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -7133,12 +7250,23 @@ class GatewayRunner:
 
             platform_key = _platform_config_key(source.platform)
 
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            from hermes_cli.tools_config import _get_scoped_platform_tools
+            enabled_toolsets = sorted(
+                _get_scoped_platform_tools(
+                    user_config,
+                    platform_key,
+                    channel_id=source.chat_id,
+                    parent_channel_id=channel_parent_id,
+                    include_default_mcp_servers=False,
+                )
+            )
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source,
+                channel_parent_id=channel_parent_id,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -7331,7 +7459,10 @@ class GatewayRunner:
             if persist_global:
                 return "⚠️ `/reasoning reset --global` is not supported. Use `/reasoning <level> --global` to change the global default."
             self._set_session_reasoning_override(session_key, None)
-            self._reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = self._resolve_session_reasoning_config(
+                source=event.source,
+                session_key=session_key,
+            )
             self._evict_cached_agent(session_key)
             return "🧠 ✓ Session reasoning override cleared; falling back to global config."
         if effort == "none":
@@ -7789,13 +7920,29 @@ class GatewayRunner:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return f"Could not list sessions: {e}"
 
+        # Load the current session before resolving a target. Special recovery
+        # aliases like `/resume interrupted` use metadata on the fresh session
+        # that was created after a crash/restart-style reset.
+        current_entry = self.session_store.get_or_create_session(source)
+
         # Resolve the name to a session ID.
-        target_id = self._session_db.resolve_session_by_title(name)
-        if not target_id:
-            return (
-                f"No session found matching '**{name}**'.\n"
-                "Use `/resume` with no arguments to see available sessions."
-            )
+        recovery_aliases = {"interrupted", "last", "previous"}
+        if name.lower() in recovery_aliases:
+            target_id = getattr(current_entry, "reset_previous_session_id", None)
+            if not target_id:
+                return (
+                    "No interrupted session is recorded for this conversation.\n"
+                    "Use `/resume` with no arguments to browse named sessions."
+                )
+            target_label = "interrupted session"
+        else:
+            target_id = self._session_db.resolve_session_by_title(name)
+            target_label = name
+            if not target_id:
+                return (
+                    f"No session found matching '**{name}**'.\n"
+                    "Use `/resume` with no arguments to see available sessions."
+                )
         # Compression creates child continuations that hold the live transcript.
         # Follow that chain so gateway /resume matches CLI behavior (#15000).
         try:
@@ -7804,9 +7951,8 @@ class GatewayRunner:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
         # Check if already on that session
-        current_entry = self.session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
-            return f"📌 Already on session **{name}**."
+            return f"📌 Already on session **{target_label}**."
 
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
@@ -7818,7 +7964,7 @@ class GatewayRunner:
         self._clear_session_boundary_security_state(session_key)
 
         # Get the title for confirmation
-        title = self._session_db.get_session_title(target_id) or name
+        title = self._session_db.get_session_title(target_id) or target_label
 
         # Count messages for context
         history = self.session_store.load_transcript(target_id)
@@ -9961,6 +10107,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        channel_parent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -9997,9 +10144,18 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        channel_parent_id = channel_parent_id or getattr(source, "parent_chat_id", None)
 
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        from hermes_cli.tools_config import _get_scoped_platform_tools
+        enabled_toolsets = sorted(
+            _get_scoped_platform_tools(
+                user_config,
+                platform_key,
+                channel_id=source.chat_id,
+                parent_channel_id=channel_parent_id,
+                include_default_mcp_servers=False,
+            )
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -10467,6 +10623,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                channel_parent_id=channel_parent_id,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
