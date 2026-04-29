@@ -198,19 +198,21 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
             chat_id, thread_id = rest, None
 
         # Resolve human-friendly labels like "Alice (dm)" to real IDs.
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
-            if resolved:
-                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
-                if resolved_is_explicit:
-                    chat_id = parsed_chat_id
-                    if parsed_thread_id is not None:
-                        thread_id = parsed_thread_id
-                else:
-                    chat_id = resolved
-        except Exception:
-            pass
+        # Explicit platform IDs must not be looked up in the channel directory:
+        # a cached label can legitimately resolve to a thread, but a concrete
+        # target such as slack:C0ASUMH4F3Q should stay on that channel.
+        if not is_explicit:
+            try:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform_key, chat_id)
+                if resolved:
+                    parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+                    if resolved_is_explicit:
+                        chat_id, thread_id = parsed_chat_id, parsed_thread_id
+                    else:
+                        chat_id = resolved
+            except Exception:
+                pass
 
         return {
             "platform": platform_name,

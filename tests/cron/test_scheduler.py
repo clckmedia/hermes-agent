@@ -156,6 +156,63 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_explicit_slack_channel_id_does_not_use_channel_directory(self):
+        """deliver: 'slack:C...' should target that channel, not a cached thread label."""
+        job = {"deliver": "slack:C0ASUMH4F3Q"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0ASUMH4F3Q:1777242585.810809",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_not_called()
+        assert result == {
+            "platform": "slack",
+            "chat_id": "C0ASUMH4F3Q",
+            "thread_id": None,
+        }
+
+    def test_explicit_slack_thread_target_splits_channel_and_thread_id(self):
+        """deliver: 'slack:C...:thread_ts' should target the explicit Slack thread."""
+        job = {"deliver": "slack:C0ASUMH4F3Q:1777242585.810809"}
+        with patch("gateway.channel_directory.resolve_channel_name") as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_not_called()
+        assert result == {
+            "platform": "slack",
+            "chat_id": "C0ASUMH4F3Q",
+            "thread_id": "1777242585.810809",
+        }
+
+    def test_human_friendly_slack_label_resolved_via_channel_directory(self):
+        """deliver: 'slack:label' should still resolve to a Slack conversation ID."""
+        job = {"deliver": "slack:arlo-alerts"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="G0123PRIVATE",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_called_once_with("slack", "arlo-alerts")
+        assert result == {
+            "platform": "slack",
+            "chat_id": "G0123PRIVATE",
+            "thread_id": None,
+        }
+
+    def test_human_friendly_slack_thread_label_preserves_thread_ts(self):
+        """Resolved Slack session labels should split channel_id and thread_ts."""
+        job = {"deliver": "slack:arlo-alerts / smoke test"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0ASUMH4F3Q:1777242585.810809",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_called_once_with("slack", "arlo-alerts / smoke test")
+        assert result == {
+            "platform": "slack",
+            "chat_id": "C0ASUMH4F3Q",
+            "thread_id": "1777242585.810809",
+        }
+
     def test_human_friendly_label_resolved_via_channel_directory(self):
         """deliver: 'whatsapp:Alice (dm)' resolves to the real JID."""
         job = {"deliver": "whatsapp:Alice (dm)"}
@@ -967,6 +1024,38 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0] == "empty-job"
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
+
+    def test_tick_preserves_output_and_marks_delivery_failure_unhealthy(self, tmp_path, monkeypatch):
+        """Generated output is durable, but failed delivery must not leave last_status=ok."""
+        from cron import jobs as jobs_mod
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import tick
+        import cron.scheduler as scheduler_mod
+
+        cron_dir = tmp_path / "cron"
+        monkeypatch.setattr(jobs_mod, "CRON_DIR", cron_dir)
+        monkeypatch.setattr(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json")
+        monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", cron_dir / "output")
+        monkeypatch.setattr(scheduler_mod, "_LOCK_DIR", tmp_path / "locks")
+        monkeypatch.setattr(scheduler_mod, "_LOCK_FILE", tmp_path / "locks" / "cron.lock")
+
+        job = create_job(prompt="Report", schedule="every 1h", deliver="slack:C0ASUMH4F3Q")
+        delivery_error = "delivery error: Slack API error: channel_not_found"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, "# full output", "Summary", None)), \
+             patch("cron.scheduler._deliver_result", return_value=delivery_error):
+            executed = tick(verbose=False)
+
+        assert executed == 1
+        output_files = list((cron_dir / "output" / job["id"]).glob("*.md"))
+        assert len(output_files) == 1
+        assert output_files[0].read_text() == "# full output"
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "delivery_error"
+        assert updated["last_error"] is None
+        assert updated["last_delivery_error"] == delivery_error
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
