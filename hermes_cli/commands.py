@@ -822,11 +822,71 @@ def discord_skill_commands_by_category(
 # ---------------------------------------------------------------------------
 
 # Slack slash command name constraints: lowercase a-z, 0-9, hyphens,
-# underscores. Max 32 chars. Slack app manifest accepts up to 50 slash
-# commands per app.
-_SLACK_MAX_SLASH_COMMANDS = 50
+# underscores. Max 32 chars. Slack app manifest currently accepts up to
+# 25 slash commands per app in practice, despite some docs mentioning 50.
+_SLACK_MAX_SLASH_COMMANDS = 25
 _SLACK_NAME_LIMIT = 32
 _SLACK_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
+
+# Slack built-ins/reserved names fail manifest validation or collide with
+# Slack UX. Keep these available through /hermes <subcommand> instead.
+_SLACK_RESERVED_COMMAND_NAMES = {
+    "archive",
+    "away",
+    "call",
+    "collapse",
+    "dnd",
+    "expand",
+    "feed",
+    "help",
+    "invite",
+    "join",
+    "leave",
+    "me",
+    "msg",
+    "mute",
+    "open",
+    "prefs",
+    "remind",
+    "rename",
+    "search",
+    "shortcuts",
+    "shrug",
+    "star",
+    "status",
+    "topic",
+    "who",
+}
+
+# Prioritise the commands that are most useful in Slack's limited native
+# command picker. Everything else remains accessible through /hermes.
+_SLACK_PRIORITY_COMMAND_NAMES = [
+    "hermes",
+    "new",
+    "retry",
+    "undo",
+    "title",
+    "branch",
+    "compress",
+    "rollback",
+    "stop",
+    "approve",
+    "deny",
+    "btw",
+    "background",
+    "agents",
+    "queue",
+    "steer",
+    "profile",
+    "sethome",
+    "resume",
+    "model",
+    "reasoning",
+    "fast",
+    "voice",
+    "commands",
+    "reload-mcp",
+]
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -853,22 +913,36 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     documented form (e.g. ``/background``, ``/bg``, and ``/btw`` all work).
     Plugin-registered slash commands are included too.
 
-    Results are clamped to Slack's 50-command limit with duplicate-name
-    avoidance. ``/hermes`` is always reserved as the first entry so the
-    legacy ``/hermes <subcommand>`` form keeps working for anything that
-    gets dropped by the clamp or for free-form questions.
+    Results are clamped to Slack's practical 25-command limit with
+    duplicate-name and reserved-name avoidance. ``/hermes`` is always kept
+    as the catch-all entry so commands outside the native picker still work
+    as ``/hermes <subcommand>``.
     """
     overrides = _resolve_config_gates()
     entries: list[tuple[str, str, str]] = []
     seen: set[str] = set()
 
-    # Reserve /hermes as the catch-all top-level command.
-    entries.append(("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]"))
-    seen.add("hermes")
+    command_entries: dict[str, tuple[str, str, str]] = {
+        "hermes": ("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]")
+    }
+
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        command_entries[cmd.name] = (cmd.name, cmd.description, cmd.args_hint or "")
+        for alias in cmd.aliases:
+            command_entries[alias] = (
+                alias,
+                f"Alias for /{cmd.name} — {cmd.description}",
+                cmd.args_hint or "",
+            )
+
+    for name, description, args_hint in _iter_plugin_command_entries():
+        command_entries.setdefault(name, (name, description, args_hint or ""))
 
     def _add(name: str, desc: str, hint: str) -> None:
         slack_name = _sanitize_slack_name(name)
-        if not slack_name or slack_name in seen:
+        if not slack_name or slack_name in seen or slack_name in _SLACK_RESERVED_COMMAND_NAMES:
             return
         if len(entries) >= _SLACK_MAX_SLASH_COMMANDS:
             return
@@ -876,24 +950,16 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # First pass: canonical names (so they win slots if we hit the cap).
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
-        _add(cmd.name, cmd.description, cmd.args_hint or "")
+    for name in _SLACK_PRIORITY_COMMAND_NAMES:
+        entry = command_entries.get(name)
+        if entry:
+            _add(*entry)
 
-    # Second pass: aliases.
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
-        for alias in cmd.aliases:
-            # Skip aliases that only differ from canonical by case/punctuation
-            # normalization (already covered by _add dedup).
-            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
-
-    # Third pass: plugin commands.
-    for name, description, args_hint in _iter_plugin_command_entries():
-        _add(name, description, args_hint or "")
+    # Fill any remaining slots deterministically. In CLCK's current setup the
+    # priority list exactly fills the cap, but this keeps plugin/smaller builds
+    # useful without widening past Slack's practical limit.
+    for name, entry in command_entries.items():
+        _add(*entry)
 
     return entries
 
