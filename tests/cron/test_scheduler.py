@@ -703,6 +703,15 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_lock(self, tmp_path):
+        """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
+        lock_dir = tmp_path / "cron"
+        lock_dir.mkdir(exist_ok=True)
+        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+            yield
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -946,6 +955,69 @@ class TestRunJobSessionPersistence:
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["terminal"]
+
+    def test_run_job_honors_cron_platform_reasoning_and_service_tier(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "agent:\n"
+            "  reasoning_effort: low\n"
+            "  service_tier: normal\n"
+            "  platforms:\n"
+            "    cron:\n"
+            "      reasoning_effort: xhigh\n"
+            "      service_tier: fast\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "platform-override-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("hermes_cli.models.resolve_fast_mode_overrides", return_value={"service_tier": "priority"}), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert kwargs["service_tier"] == "priority"
+        assert kwargs["request_overrides"] == {"service_tier": "priority"}
+
+    def test_run_job_honors_per_job_reasoning_override(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "agent:\n"
+            "  reasoning_effort: high\n"
+            "  platforms:\n"
+            "    cron:\n"
+            "      reasoning_effort: xhigh\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "reasoning-override-job",
+            "name": "test",
+            "prompt": "hello",
+            "reasoning_effort": "medium",
+            "enabled_toolsets": ["terminal", "web"],
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "medium"}
+        assert kwargs["enabled_toolsets"] == ["terminal", "web"]
+        assert kwargs["disabled_toolsets"] == ["cronjob", "messaging", "clarify"]
 
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
@@ -1375,6 +1447,15 @@ class TestRunJobSkillBacked:
 
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_lock(self, tmp_path):
+        """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
+        lock_dir = tmp_path / "cron"
+        lock_dir.mkdir(exist_ok=True)
+        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+            yield
 
     def _make_job(self):
         return {

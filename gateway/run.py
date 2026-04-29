@@ -4653,6 +4653,7 @@ class GatewayRunner:
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
             context_prompt = context_note + "\n\n" + context_prompt
+            reset_gate = should_gate_auto_reset_message(reset_reason)
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -4674,28 +4675,43 @@ class GatewayRunner:
                 )
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
-                        elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
-                        else:
-                            hours = policy.idle_minutes // 60
-                            mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                    if reset_reason == "suspended":
+                        reason_text = "previous session was stopped or interrupted"
+                    elif reset_reason == "daily":
+                        reason_text = f"daily schedule at {policy.at_hour}:00"
+                    else:
+                        hours = policy.idle_minutes // 60
+                        mins = policy.idle_minutes % 60
+                        duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
+                        reason_text = f"inactive for {duration}"
+                    notice = (
+                        f"◐ Session automatically reset ({reason_text}). "
+                        f"Conversation history cleared.\n"
+                        f"Use /resume to browse and restore a previous session.\n"
+                        f"Adjust reset timing in config.yaml under session_reset."
+                    )
+                    if reset_gate:
+                        previous_session_id = getattr(
+                            session_entry,
+                            "reset_previous_session_id",
+                            None,
                         )
-                        try:
-                            session_info = self._format_session_info()
-                            if session_info:
-                                notice = f"{notice}\n\n{session_info}"
-                        except Exception:
-                            pass
+                        recovery_hint = "Use /resume interrupted to restore the previous session"
+                        if previous_session_id:
+                            recovery_hint += f" ({previous_session_id})"
+                        notice = (
+                            f"{notice}\n\n"
+                            "I haven't processed your message yet. "
+                            f"{recovery_hint}, or resend the message "
+                            "if you want me to answer it in this fresh context."
+                        )
+                    try:
+                        session_info = self._format_session_info()
+                        if session_info:
+                            notice = f"{notice}\n\n{session_info}"
+                    except Exception:
+                        pass
+                    if adapter:
                         await adapter.send(
                             source.chat_id, notice,
                             metadata=getattr(event, 'metadata', None),
@@ -4705,6 +4721,12 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+            if reset_gate:
+                try:
+                    self.session_store._save()
+                except Exception as e:
+                    logger.debug("Auto-reset gate state save failed (non-fatal): %s", e)
+                return None
 
         # Load conversation history before first-turn gates.  The transcript is
         # the source of truth here: after /reset the fresh SessionEntry can have
@@ -7836,13 +7858,29 @@ class GatewayRunner:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return f"Could not list sessions: {e}"
 
+        # Load the current session before resolving a target. Special recovery
+        # aliases like `/resume interrupted` use metadata on the fresh session
+        # that was created after a crash/restart-style reset.
+        current_entry = self.session_store.get_or_create_session(source)
+
         # Resolve the name to a session ID.
-        target_id = self._session_db.resolve_session_by_title(name)
-        if not target_id:
-            return (
-                f"No session found matching '**{name}**'.\n"
-                "Use `/resume` with no arguments to see available sessions."
-            )
+        recovery_aliases = {"interrupted", "last", "previous"}
+        if name.lower() in recovery_aliases:
+            target_id = getattr(current_entry, "reset_previous_session_id", None)
+            if not target_id:
+                return (
+                    "No interrupted session is recorded for this conversation.\n"
+                    "Use `/resume` with no arguments to browse named sessions."
+                )
+            target_label = "interrupted session"
+        else:
+            target_id = self._session_db.resolve_session_by_title(name)
+            target_label = name
+            if not target_id:
+                return (
+                    f"No session found matching '**{name}**'.\n"
+                    "Use `/resume` with no arguments to see available sessions."
+                )
         # Compression creates child continuations that hold the live transcript.
         # Follow that chain so gateway /resume matches CLI behavior (#15000).
         try:
@@ -7851,9 +7889,8 @@ class GatewayRunner:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
         # Check if already on that session
-        current_entry = self.session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
-            return f"📌 Already on session **{name}**."
+            return f"📌 Already on session **{target_label}**."
 
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
@@ -7865,7 +7902,7 @@ class GatewayRunner:
         self._clear_session_boundary_security_state(session_key)
 
         # Get the title for confirmation
-        title = self._session_db.get_session_title(target_id) or name
+        title = self._session_db.get_session_title(target_id) or target_label
 
         # Count messages for context
         history = self.session_store.load_transcript(target_id)
