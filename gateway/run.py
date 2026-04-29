@@ -1590,27 +1590,66 @@ class GatewayRunner:
         return ""
 
     @staticmethod
-    def _load_reasoning_config() -> dict | None:
-        """Load reasoning effort from config.yaml.
+    def _load_reasoning_config(
+        platform_key: str | None = None,
+        channel_id: str | None = None,
+        parent_channel_id: str | None = None,
+    ) -> dict | None:
+        """Load reasoning effort from config.yaml, honoring platform/channel overrides.
 
-        Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh". Returns None to use
-        default (medium).
+        Resolution order:
+        1. agent.platforms.<platform>.channel_reasoning_overrides.<channel_id>
+        2. agent.platforms.<platform>.channel_reasoning_overrides.<parent_channel_id>
+        3. agent.platforms.<platform>.reasoning_effort
+        4. agent.reasoning_effort
         """
         from hermes_constants import parse_reasoning_effort
+
+        cfg = _load_gateway_config()
         effort = ""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                effort = str(cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip()
-        except Exception:
-            pass
+        used_platform_override = False
+        channel_scope = None
+
+        if platform_key:
+            platform_cfg = cfg_get(cfg, "agent", "platforms", platform_key, default={})
+            if isinstance(platform_cfg, dict):
+                overrides = cfg_get(platform_cfg, "channel_reasoning_overrides", default={})
+                if isinstance(overrides, dict):
+                    for candidate, label in (
+                        (channel_id, "channel"),
+                        (parent_channel_id, "parent channel"),
+                    ):
+                        if not candidate:
+                            continue
+                        candidate_key = str(candidate)
+                        raw = overrides.get(candidate_key)
+                        if raw is None and candidate_key.isdigit():
+                            raw = overrides.get(int(candidate_key))
+                        if raw not in (None, ""):
+                            effort = str(raw).strip()
+                            channel_scope = f"{label} '{candidate}'"
+                            break
+
+                if not channel_scope:
+                    raw_platform_effort = cfg_get(platform_cfg, "reasoning_effort", default="")
+                    if raw_platform_effort not in (None, ""):
+                        effort = str(raw_platform_effort).strip()
+                        used_platform_override = True
+
+        if not effort:
+            effort = str(cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip()
         result = parse_reasoning_effort(effort)
         if effort and effort.strip() and result is None:
-            logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+            if channel_scope and platform_key:
+                logger.warning(
+                    "Unknown reasoning_effort '%s' for %s on platform '%s', using default (medium)",
+                    effort,
+                    channel_scope,
+                    platform_key,
+                )
+            else:
+                scope = f" for platform '{platform_key}'" if used_platform_override and platform_key else ""
+                logger.warning("Unknown reasoning_effort '%s'%s, using default (medium)", effort, scope)
         return result
 
     @staticmethod
@@ -1644,8 +1683,9 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        channel_parent_id: Optional[str] = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session and channel overrides."""
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -1656,7 +1696,23 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
-        return self._load_reasoning_config()
+
+        platform_key = None
+        channel_id = None
+        parent_channel_id = channel_parent_id
+        if source is not None:
+            try:
+                platform_key = _platform_config_key(source.platform)
+            except Exception:
+                platform_key = None
+            channel_id = getattr(source, "chat_id", None)
+            parent_channel_id = parent_channel_id or getattr(source, "parent_chat_id", None)
+
+        return self._load_reasoning_config(
+            platform_key,
+            channel_id=channel_id,
+            parent_channel_id=parent_channel_id,
+        )
 
     def _set_session_reasoning_override(
         self,
@@ -7152,7 +7208,7 @@ class GatewayRunner:
                 prompt,
                 source,
                 task_id,
-                channel_parent_id=getattr(event, "channel_parent_id", None),
+                channel_parent_id=getattr(source, "parent_chat_id", None) or getattr(event, "channel_parent_id", None),
             )
         )
         self._background_tasks.add(_task)
@@ -7207,7 +7263,10 @@ class GatewayRunner:
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source,
+                channel_parent_id=channel_parent_id,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -7400,7 +7459,10 @@ class GatewayRunner:
             if persist_global:
                 return "⚠️ `/reasoning reset --global` is not supported. Use `/reasoning <level> --global` to change the global default."
             self._set_session_reasoning_override(session_key, None)
-            self._reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = self._resolve_session_reasoning_config(
+                source=event.source,
+                session_key=session_key,
+            )
             self._evict_cached_agent(session_key)
             return "🧠 ✓ Session reasoning override cleared; falling back to global config."
         if effort == "none":
@@ -10561,6 +10623,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                channel_parent_id=channel_parent_id,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()

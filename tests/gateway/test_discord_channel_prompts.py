@@ -157,6 +157,21 @@ class TestResolveChannelPrompts:
 
         assert event.channel_prompt == "Command prompt"
 
+    def test_build_message_event_sets_parent_chat_id_for_thread_slash_command(self):
+        adapter = _make_adapter()
+        adapter.build_source = MagicMock(return_value=SimpleNamespace())
+
+        interaction = SimpleNamespace(
+            channel_id=999,
+            channel=SimpleNamespace(name="thread", guild=None, parent_id=200),
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+        adapter._get_effective_topic = MagicMock(return_value=None)
+
+        adapter._build_slash_event(interaction, "/retry")
+
+        assert adapter.build_source.call_args.kwargs["parent_chat_id"] == "200"
+
     @pytest.mark.asyncio
     async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):
         adapter = _make_adapter()
@@ -175,6 +190,7 @@ class TestResolveChannelPrompts:
 
         dispatched_event = adapter.handle_message.await_args.args[0]
         assert dispatched_event.channel_prompt == "Parent prompt"
+        assert adapter.build_source.call_args.kwargs["parent_chat_id"] == "200"
 
     def test_blank_prompts_are_ignored(self):
         adapter = _make_adapter()
