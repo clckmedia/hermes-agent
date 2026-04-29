@@ -234,6 +234,19 @@ class HermesTokenStorage:
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
         payload = tokens.model_dump(mode="json", exclude_none=True)
+        # OAuth refresh responses are allowed to omit refresh_token when the
+        # existing refresh token remains valid. The MCP SDK validates that
+        # response into a fresh OAuthToken and then calls storage.set_tokens();
+        # without preserving the old value here, a successful refresh silently
+        # downgrades durable auth into a short-lived access token and the next
+        # restart falls back to full browser OAuth.
+        if not payload.get("refresh_token"):
+            existing = _read_json(self._tokens_path()) or {}
+            existing_refresh = (
+                existing.get("refresh_token") if isinstance(existing, dict) else None
+            )
+            if existing_refresh:
+                payload["refresh_token"] = existing_refresh
         # Persist an absolute ``expires_at`` so a process restart can
         # reconstruct the correct remaining TTL. Without this the MCP SDK's
         # ``_initialize`` reloads a relative ``expires_in`` which has no
