@@ -756,6 +756,49 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_records_failed_prerun_script_metadata(self, tmp_path, monkeypatch):
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        script = scripts_dir / "fail.py"
+        script.write_text('import sys\nprint("partial")\nsys.exit(3)\n')
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        job = {
+            "id": "script-fail-job",
+            "name": "script-fail",
+            "prompt": "report",
+            "script": "fail.py",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "reported script failure"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "reported script failure"
+        assert "## Script Error" in output
+        assert "Script exited with code 3" in output
+        assert job["_last_script_success"] is False
+        assert "Script exited with code 3" in job["_last_script_error"]
+
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
         # agent was previously leaked — over days of ticks this accumulated

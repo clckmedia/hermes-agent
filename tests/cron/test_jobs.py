@@ -354,12 +354,44 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True, delivery_error="network timeout")
         updated = get_job(job["id"])
         assert updated["last_status"] == "delivery_error"
+        assert updated["last_delivery_status"] == "error"
         assert updated["last_delivery_error"] == "network timeout"
         # Next run delivers successfully
-        mark_job_run(job["id"], success=True, delivery_error=None)
+        mark_job_run(job["id"], success=True, delivery_error=None, delivery_attempted=True)
         updated = get_job(job["id"])
         assert updated["last_status"] == "ok"
+        assert updated["last_delivery_status"] == "ok"
         assert updated["last_delivery_error"] is None
+
+    def test_script_error_status_is_not_ok_when_agent_succeeds(self, tmp_cron_dir):
+        """Agent can succeed while the pre-run script failed; status must not be green."""
+        job = create_job(prompt="Report", schedule="every 1h", script="collector.py")
+
+        mark_job_run(
+            job["id"],
+            success=True,
+            script_success=False,
+            script_error="Script timed out after 120s: collector.py",
+        )
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "script_error"
+        assert updated["last_agent_status"] == "ok"
+        assert updated["last_script_status"] == "error"
+        assert updated["last_script_error"] == "Script timed out after 120s: collector.py"
+        assert updated["last_delivery_status"] == "skipped"
+        assert updated["last_error"] is None
+        assert updated["last_delivery_error"] is None
+
+    def test_script_error_cleared_on_later_script_success(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h", script="collector.py")
+        mark_job_run(job["id"], success=True, script_success=False, script_error="boom")
+        mark_job_run(job["id"], success=True, script_success=True)
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert updated["last_script_status"] == "ok"
+        assert updated["last_script_error"] is None
 
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""

@@ -853,10 +853,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the whole agent run. We pass the result into _build_job_prompt so
     # the script is only executed once.
     prerun_script = None
+    job["_last_script_success"] = None
+    job["_last_script_error"] = None
     script_path = job.get("script")
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        job["_last_script_success"] = _ran_ok
+        job["_last_script_error"] = None if _ran_ok else _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -1356,8 +1360,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     should_deliver = False
 
                 delivery_error = None
+                delivery_attempted = False
                 if should_deliver:
                     try:
+                        delivery_attempted = bool(_resolve_delivery_targets(job))
                         delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                     except Exception as de:
                         delivery_error = str(de)
@@ -1370,12 +1376,28 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                script_success = job.get("_last_script_success")
+                script_error = job.get("_last_script_error")
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                    script_success=script_success,
+                    script_error=script_error,
+                    delivery_attempted=delivery_attempted,
+                )
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                mark_job_run(
+                    job["id"],
+                    False,
+                    str(e),
+                    script_success=job.get("_last_script_success"),
+                    script_error=job.get("_last_script_error"),
+                )
                 return False
 
         # Partition due jobs: those with a per-job workdir mutate

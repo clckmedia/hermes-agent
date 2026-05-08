@@ -527,6 +527,10 @@ def create_job(
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
+        "last_agent_status": None,
+        "last_script_status": None,
+        "last_script_error": None,
+        "last_delivery_status": None,
         "last_delivery_error": None,
         # Delivery configuration
         "deliver": deliver,
@@ -668,7 +672,10 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 script_success: Optional[bool] = None,
+                 script_error: Optional[str] = None,
+                 delivery_attempted: Optional[bool] = None):
     """
     Mark a job as having been run.
     
@@ -677,6 +684,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``script_success`` tracks the pre-run script health separately so a
+    successful agent response cannot hide a failed/timed-out script.
     """
     with _jobs_file_lock:
         jobs = load_jobs()
@@ -684,10 +693,34 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                if success and delivery_error:
-                    job["last_status"] = "delivery_error"
+
+                agent_status = "ok" if success else "error"
+                if script_success is True:
+                    script_status = "ok"
+                elif script_success is False:
+                    script_status = "error"
                 else:
-                    job["last_status"] = "ok" if success else "error"
+                    script_status = "skipped"
+                if delivery_error:
+                    delivery_status = "error"
+                elif delivery_attempted:
+                    delivery_status = "ok"
+                else:
+                    delivery_status = "skipped"
+
+                if not success:
+                    job["last_status"] = "error"
+                elif delivery_error:
+                    job["last_status"] = "delivery_error"
+                elif script_success is False:
+                    job["last_status"] = "script_error"
+                else:
+                    job["last_status"] = "ok"
+
+                job["last_agent_status"] = agent_status
+                job["last_script_status"] = script_status
+                job["last_script_error"] = script_error if script_success is False else None
+                job["last_delivery_status"] = delivery_status
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
