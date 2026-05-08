@@ -632,6 +632,15 @@ class TestPlatformToolsetConsistency:
                 f"which is not defined in toolsets.py"
             )
 
+    def test_zulip_platform_tools_resolve(self):
+        """Regression: Zulip gateway sessions must not crash resolving tools."""
+        from hermes_cli.tools_config import PLATFORMS, _get_platform_tools
+
+        assert PLATFORMS["zulip"]["default_toolset"] == "hermes-zulip"
+        enabled = _get_platform_tools({}, "zulip")
+        assert "web" in enabled
+        assert "file" in enabled
+
     def test_gateway_toolset_includes_all_messaging_platforms(self):
         """hermes-gateway includes list should cover all messaging platforms."""
         from hermes_cli.tools_config import PLATFORMS

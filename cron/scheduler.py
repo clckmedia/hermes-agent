@@ -148,6 +148,7 @@ _HOME_TARGET_ENV_VARS = {
     "weixin": "WEIXIN_HOME_CHANNEL",
     "bluebubbles": "BLUEBUBBLES_HOME_CHANNEL",
     "qqbot": "QQBOT_HOME_CHANNEL",
+    "zulip": "ZULIP_HOME_CHANNEL",
 }
 
 # Legacy env var names kept for back-compat.  Each entry is the current
@@ -393,6 +394,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "bluebubbles": Platform.BLUEBUBBLES,
         "qqbot": Platform.QQBOT,
         "yuanbao": Platform.YUANBAO,
+        "zulip": Platform.ZULIP,
     }
 
     # Optionally wrap the content with a header/footer so the user knows this

@@ -77,6 +77,7 @@ class TestResolveDeliveryTarget:
             ("wecom", "WECOM_HOME_CHANNEL", "wecom-home"),
             ("weixin", "WEIXIN_HOME_CHANNEL", "wxid_home"),
             ("qqbot", "QQ_HOME_CHANNEL", "group-openid-home"),
+            ("zulip", "ZULIP_HOME_CHANNEL", "dm:user@example.com"),
         ],
     )
     def test_origin_delivery_without_origin_falls_back_to_supported_home_channels(
@@ -98,6 +99,7 @@ class TestResolveDeliveryTarget:
             "WECOM_HOME_CHANNEL",
             "WEIXIN_HOME_CHANNEL",
             "QQ_HOME_CHANNEL",
+            "ZULIP_HOME_CHANNEL",
         ):
             monkeypatch.delenv(fallback_env, raising=False)
         monkeypatch.setenv(env_var, chat_id)

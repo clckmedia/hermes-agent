@@ -336,6 +336,11 @@ PLATFORM_HINTS = {
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be uploaded as attachments."
     ),
+    "zulip": (
+        "You are in a Zulip workspace communicating with your user. "
+        "Zulip uses streams/channels and topics. Keep replies concise and thread/topic-scoped. "
+        "Basic markdown renders in Zulip; avoid tables unless they are genuinely useful."
+    ),
     "signal": (
         "You are on a text messaging communication platform, Signal. "
         "Please do not use markdown as it does not render. "

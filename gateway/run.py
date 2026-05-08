@@ -3310,6 +3310,13 @@ class GatewayRunner:
                 return None
             return SlackAdapter(config)
 
+        elif platform == Platform.ZULIP:
+            from gateway.platforms.zulip import ZulipAdapter, check_zulip_requirements
+            if not check_zulip_requirements():
+                logger.warning("Zulip: aiohttp not installed or ZULIP_SITE/BOT credentials not configured")
+                return None
+            return ZulipAdapter(config)
+
         elif platform == Platform.SIGNAL:
             from gateway.platforms.signal import SignalAdapter, check_signal_requirements
             if not check_signal_requirements():
@@ -3469,6 +3476,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.ZULIP: "ZULIP_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -3486,6 +3494,7 @@ class GatewayRunner:
             Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
+            Platform.ZULIP: "ZULIP_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
             Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
@@ -3494,9 +3503,18 @@ class GatewayRunner:
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
         }
 
-        # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
+        platform_cfg_extra = {}
+        if getattr(self, "config", None) and source.platform in getattr(self.config, "platforms", {}):
+            platform_cfg_extra = getattr(self.config.platforms[source.platform], "extra", {}) or {}
+
+        # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true).
+        # Zulip may load this from ~/.hermes/secrets/zulip.env into platform
+        # config rather than exporting it as a process environment variable.
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
+        platform_allow_all_value = os.getenv(platform_allow_all_var, "") if platform_allow_all_var else ""
+        if not platform_allow_all_value:
+            platform_allow_all_value = str(platform_cfg_extra.get("allow_all_users", ""))
+        if platform_allow_all_value.lower() in ("true", "1", "yes"):
             return True
 
         # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
@@ -3528,6 +3546,8 @@ class GatewayRunner:
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
+        if not platform_allowlist:
+            platform_allowlist = str(platform_cfg_extra.get("allowed_users", "")).strip()
         group_allowlist = ""
         if source.chat_type in {"group", "forum"}:
             group_allowlist = os.getenv(platform_group_env_map.get(source.platform, ""), "").strip()
@@ -3623,8 +3643,12 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.ZULIP:    "ZULIP_ALLOWED_USERS",
             }
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
+                return "ignore"
+            platform_cfg = config.platforms.get(platform) if config and hasattr(config, "platforms") else None
+            if platform_cfg and str(getattr(platform_cfg, "extra", {}).get("allowed_users", "")).strip():
                 return "ignore"
 
         if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():

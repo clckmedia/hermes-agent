@@ -128,7 +128,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'zulip:dm:user@example.com', 'zulip:stream:99/ops', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -224,6 +224,7 @@ def _handle_send(args):
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
         "yuanbao": Platform.YUANBAO,
+        "zulip": Platform.ZULIP,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -343,6 +344,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    if platform_name == "zulip":
+        if target_ref.startswith("dm:") or target_ref.startswith("stream:"):
+            return target_ref, None, True
+        if "@" in target_ref:
+            return f"dm:{target_ref.strip()}", None, True
     if platform_name == "yuanbao":
         match = _YUANBAO_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -579,6 +585,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.ZULIP:
+            result = await _send_zulip(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.EMAIL:
             result = await _send_email(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SMS:
@@ -1580,3 +1588,21 @@ registry.register(
     check_fn=_check_send_message,
     emoji="📨",
 )
+
+
+async def _send_zulip(pconfig, chat_id, message, thread_id=None):
+    """Send a single Zulip message using bot credentials."""
+    try:
+        from gateway.platforms.zulip import ZulipAdapter
+        adapter = ZulipAdapter(pconfig)
+        result = await adapter.send(chat_id, message, metadata={"thread_id": thread_id} if thread_id else None)
+        if not result.success:
+            return {"error": result.error or "Zulip send failed"}
+        return {
+            "success": True,
+            "platform": "zulip",
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+        }
+    except Exception as e:
+        return _error(f"Zulip send failed: {e}")

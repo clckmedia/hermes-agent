@@ -68,6 +68,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    ZULIP = "zulip"
 
 
 @dataclass
@@ -329,6 +330,9 @@ class GatewayConfig:
                 connected.append(platform)
             # Yuanbao uses extra dict for app credentials
             elif platform == Platform.YUANBAO and config.extra.get("app_id") and config.extra.get("app_secret"):
+                connected.append(platform)
+            # Zulip uses bot email + API key + site in extra/api_key
+            elif platform == Platform.ZULIP and config.extra.get("site") and config.extra.get("bot_email") and config.api_key:
                 connected.append(platform)
             # DingTalk uses client_id/client_secret from config.extra or env vars
             elif platform == Platform.DINGTALK and (
@@ -844,6 +848,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.ZULIP: "ZULIP_BOT_API_KEY",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -882,6 +887,30 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
                 )
                 pconfig.enabled = False
 
+
+
+def _load_zulip_secret_env() -> Dict[str, str]:
+    """Load ~/.hermes/secrets/zulip.env without logging or exporting secrets."""
+    path = get_hermes_home() / "secrets" / "zulip.env"
+    values: Dict[str, str] = {}
+    try:
+        if not path.exists():
+            return values
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key.startswith("ZULIP_"):
+                values[key] = value
+    except Exception as e:
+        logger.warning("Failed to load Zulip secret env file: %s", e)
+    return values
+
+def _zulip_env(name: str, secrets: Dict[str, str]) -> str:
+    return (os.getenv(name) or secrets.get(name) or "").strip()
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
@@ -974,6 +1003,43 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
         )
     
+
+    # Zulip (Events API long-polling)
+    zulip_secrets = _load_zulip_secret_env()
+    zulip_site = _zulip_env("ZULIP_SITE", zulip_secrets).rstrip("/")
+    zulip_bot_email = _zulip_env("ZULIP_BOT_EMAIL", zulip_secrets)
+    zulip_bot_key = _zulip_env("ZULIP_BOT_API_KEY", zulip_secrets)
+    if zulip_site and zulip_bot_email and zulip_bot_key:
+        if Platform.ZULIP not in config.platforms:
+            config.platforms[Platform.ZULIP] = PlatformConfig()
+        zcfg = config.platforms[Platform.ZULIP]
+        zcfg.enabled = True
+        zcfg.api_key = zulip_bot_key
+        zcfg.extra.update({
+            "site": zulip_site,
+            "bot_email": zulip_bot_email,
+            "admin_email": _zulip_env("ZULIP_ADMIN_EMAIL", zulip_secrets),
+            "admin_api_key": _zulip_env("ZULIP_ADMIN_API_KEY", zulip_secrets),
+            "dm_only": _zulip_env("ZULIP_DM_ONLY", zulip_secrets).lower() not in ("false", "0", "no", "off"),
+            "all_public_streams": _zulip_env("ZULIP_ALL_PUBLIC_STREAMS", zulip_secrets).lower() in ("true", "1", "yes", "on"),
+            # Keep Zulip's local secret file self-contained. Gateway auth normally
+            # reads process env allowlists; Zulip credentials/safety defaults are
+            # intentionally loaded from ~/.hermes/secrets/zulip.env without
+            # exporting them into the service environment.
+            "allowed_users": _zulip_env("ZULIP_ALLOWED_USERS", zulip_secrets),
+            "allow_all_users": _zulip_env("ZULIP_ALLOW_ALL_USERS", zulip_secrets),
+        })
+        allowed_streams = _zulip_env("ZULIP_ALLOWED_STREAMS", zulip_secrets)
+        if allowed_streams:
+            zcfg.extra["allowed_streams"] = [v.strip() for v in allowed_streams.split(",") if v.strip()]
+    zulip_home = _zulip_env("ZULIP_HOME_CHANNEL", zulip_secrets) if 'zulip_secrets' in locals() else os.getenv("ZULIP_HOME_CHANNEL")
+    if zulip_home and Platform.ZULIP in config.platforms:
+        config.platforms[Platform.ZULIP].home_channel = HomeChannel(
+            platform=Platform.ZULIP,
+            chat_id=zulip_home,
+            name=_zulip_env("ZULIP_HOME_CHANNEL_NAME", zulip_secrets) or "Zulip Home",
+        )
+
     # Signal
     signal_url = os.getenv("SIGNAL_HTTP_URL")
     signal_account = os.getenv("SIGNAL_ACCOUNT")
