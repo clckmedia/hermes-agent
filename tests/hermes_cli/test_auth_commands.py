@@ -264,6 +264,86 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert entry["base_url"] == "https://chatgpt.com/backend-api/codex"
 
 
+def test_resolve_codex_runtime_credentials_uses_pool_only_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-1",
+                        "label": "codex-account",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "pool-access-token",
+                        "refresh_token": "pool-refresh-token",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "last_refresh": "2026-05-04T05:01:59Z",
+                    }
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert creds["api_key"] == "pool-access-token"
+    assert creds["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert creds["source"] == "hermes-auth-store"
+
+
+def test_forced_codex_refresh_updates_pool_only_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-1",
+                        "label": "codex-account",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "old-access-token",
+                        "refresh_token": "old-refresh-token",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda access_token, refresh_token, *, timeout_seconds=20.0: {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+        },
+    )
+
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert creds["api_key"] == "new-access-token"
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    pool_entry = payload["credential_pool"]["openai-codex"][0]
+    assert pool_entry["access_token"] == "new-access-token"
+    assert pool_entry["refresh_token"] == "new-refresh-token"
+    assert payload["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "new-access-token",
+        "refresh_token": "new-refresh-token",
+    }
+
+
 def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent pool auto-seeding from host env vars and file-backed sources

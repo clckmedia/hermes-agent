@@ -2163,7 +2163,7 @@ def _is_remote_session() -> bool:
 
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
+
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
@@ -2172,22 +2172,46 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
+
     state = _load_provider_state(auth_store, "openai-codex")
-    if not state:
-        raise AuthError(
-            "No Codex credentials stored. Run `hermes auth` to authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing",
-            relogin_required=True,
-        )
-    tokens = state.get("tokens")
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+
+    # New auth writes Codex device-code credentials to credential_pool only.
+    # Runtime refresh/compression paths still call this singleton resolver, so
+    # fall back to the first pooled OAuth entry instead of reporting a false
+    # "No Codex credentials stored" error.
     if not isinstance(tokens, dict):
+        pool_entries = auth_store.get("credential_pool", {}).get("openai-codex")
+        if isinstance(pool_entries, list):
+            for entry in sorted(
+                (item for item in pool_entries if isinstance(item, dict)),
+                key=lambda item: int(item.get("priority") or 0),
+            ):
+                access_token = entry.get("access_token")
+                refresh_token = entry.get("refresh_token")
+                if isinstance(access_token, str) and access_token.strip() and isinstance(refresh_token, str) and refresh_token.strip():
+                    return {
+                        "tokens": {
+                            "access_token": access_token,
+                            "refresh_token": refresh_token,
+                        },
+                        "last_refresh": entry.get("last_refresh"),
+                        "base_url": entry.get("base_url"),
+                    }
+        if not state:
+            raise AuthError(
+                "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
         raise AuthError(
             "Codex auth state is missing tokens. Run `hermes auth` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_invalid_shape",
             relogin_required=True,
         )
+
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not access_token.strip():
@@ -2206,7 +2230,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
         )
     return {
         "tokens": tokens,
-        "last_refresh": state.get("last_refresh"),
+        "last_refresh": state.get("last_refresh") if isinstance(state, dict) else None,
     }
 
 
@@ -2221,6 +2245,55 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
         _save_provider_state(auth_store, "openai-codex", state)
+
+        pool = auth_store.setdefault("credential_pool", {})
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+        entries = pool.setdefault("openai-codex", [])
+        if not isinstance(entries, list):
+            entries = []
+            pool["openai-codex"] = entries
+
+        def _is_codex_device_code(entry: Any) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            source = str(entry.get("source") or "").strip().lower()
+            return source == "device_code" or source.endswith(":device_code")
+
+        target = None
+        for entry in entries:
+            if _is_codex_device_code(entry):
+                target = entry
+                break
+        if target is None:
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("auth_type") == "oauth":
+                    target = entry
+                    break
+        if target is None:
+            target = {
+                "id": uuid.uuid4().hex[:6],
+                "label": label_from_token(tokens.get("access_token", ""), "device_code"),
+                "auth_type": "oauth",
+                "priority": len(entries),
+                "source": "device_code",
+                "base_url": DEFAULT_CODEX_BASE_URL,
+            }
+            entries.append(target)
+
+        target["access_token"] = tokens.get("access_token", "")
+        if tokens.get("refresh_token"):
+            target["refresh_token"] = tokens.get("refresh_token")
+        target["last_refresh"] = last_refresh
+        target.setdefault("auth_type", "oauth")
+        target.setdefault("base_url", DEFAULT_CODEX_BASE_URL)
+        target["last_status"] = None
+        target["last_status_at"] = None
+        target["last_error_code"] = None
+        target["last_error_reason"] = None
+        target["last_error_message"] = None
+        target["last_error_reset_at"] = None
         _save_auth_store(auth_store)
 
 

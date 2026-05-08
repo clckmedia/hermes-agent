@@ -59,6 +59,53 @@ def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypat
     assert pool.current().id == "cred-2"
 
 
+def test_codex_manual_device_code_entry_syncs_from_auth_store_when_exhausted(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "fresh-access-token",
+                        "refresh_token": "fresh-refresh-token",
+                    },
+                    "last_refresh": "2026-05-04T05:01:59Z",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-1",
+                        "label": "codex-account",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "stale-access-token",
+                        "refresh_token": "stale-refresh-token",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 401,
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.id == "codex-1"
+    assert entry.access_token == "fresh-access-token"
+    assert entry.refresh_token == "fresh-refresh-token"
+    assert entry.last_status is None
+
+
 def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(

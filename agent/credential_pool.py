@@ -187,6 +187,19 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
+def _is_device_code_source(source: str) -> bool:
+    normalized = (source or "").strip().lower()
+    return normalized == "device_code" or normalized.endswith(":device_code")
+
+
+def _sources_match(provider: str, existing_source: str, incoming_source: str) -> bool:
+    if existing_source == incoming_source:
+        return True
+    if provider == "openai-codex" and _is_device_code_source(existing_source) and _is_device_code_source(incoming_source):
+        return True
+    return False
+
+
 def _exhausted_ttl(error_code: Optional[int]) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion."""
     if error_code == 429:
@@ -472,7 +485,7 @@ class CredentialPool:
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex" or not _is_device_code_source(entry.source):
             return entry
         try:
             with _auth_store_lock():
@@ -586,7 +599,7 @@ class CredentialPool:
         Applies to any OAuth provider whose singleton lives in auth.json
         (currently Nous and OpenAI Codex).
         """
-        if entry.source != "device_code":
+        if not _is_device_code_source(entry.source):
             return
         try:
             with _auth_store_lock():
@@ -615,17 +628,17 @@ class CredentialPool:
                     _save_provider_state(auth_store, "nous", state)
 
                 elif self.provider == "openai-codex":
-                    state = _load_provider_state(auth_store, "openai-codex")
-                    if not isinstance(state, dict):
-                        return
+                    state = _load_provider_state(auth_store, "openai-codex") or {}
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
-                        return
+                        tokens = {}
+                        state["tokens"] = tokens
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    state["auth_mode"] = "chatgpt"
                     _save_provider_state(auth_store, "openai-codex", state)
 
                 else:
@@ -857,7 +870,7 @@ class CredentialPool:
             # frozen behind last_error_reset_at (can be hours in the
             # future for ChatGPT weekly windows).
             if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
+                    and _is_device_code_source(entry.source)
                     and entry.last_status == STATUS_EXHAUSTED):
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
@@ -1078,7 +1091,7 @@ class CredentialPool:
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
     existing_idx = None
     for idx, entry in enumerate(entries):
-        if entry.source == source:
+        if _sources_match(provider, entry.source, source):
             existing_idx = idx
             break
 
@@ -1105,6 +1118,17 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
             if existing.extra.get(key) != value:
                 extra_updates[key] = value
     if field_updates or extra_updates:
+        if provider == "openai-codex" and _is_device_code_source(source) and (
+            "access_token" in field_updates or "refresh_token" in field_updates
+        ):
+            field_updates.update({
+                "last_status": None,
+                "last_status_at": None,
+                "last_error_code": None,
+                "last_error_reason": None,
+                "last_error_message": None,
+                "last_error_reset_at": None,
+            })
         if extra_updates:
             field_updates["extra"] = {**existing.extra, **extra_updates}
         entries[existing_idx] = replace(existing, **field_updates)
