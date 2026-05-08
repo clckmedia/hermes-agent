@@ -27,13 +27,16 @@ Security:
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import logging
 import re
 import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -58,6 +61,8 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_SUPPORT_REASONING_SCRIPT = Path.home() / ".hermes" / "scripts" / "clck_support_triage_reasoning.py"
+_SUPPORT_REASONING_TIMEOUT_SECONDS = 5.0
 
 
 def check_webhook_requirements() -> bool:
@@ -436,6 +441,79 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         self._seen_deliveries[delivery_id] = now
 
+        # ── CLCK HubSpot support triage ─────────────────────────
+        # Deterministic internal card path for ActivePieces support-intake
+        # events.  This intentionally bypasses the agent so the MVP cannot
+        # send email, post to client Slack, or write to HubSpot while still
+        # replying in the supplied internal Slack thread.
+        if event_type == "hubspot_support_triage":
+            payload = await self._enrich_hubspot_support_triage_payload(payload, route_config)
+            if self._hubspot_support_triage_should_suppress(payload):
+                logger.info(
+                    "[webhook] support-triage suppressed as deterministic noise route=%s delivery_id=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {
+                        "status": "suppressed",
+                        "route": route_name,
+                        "event": event_type,
+                        "delivery_id": delivery_id,
+                        "handler": "hubspot_support_triage",
+                    },
+                    status=202,
+                )
+            delivery = {
+                "deliver": route_config.get("deliver", "slack"),
+                "deliver_extra": self._render_delivery_extra(
+                    route_config.get("deliver_extra", {}), payload
+                ),
+                "payload": payload,
+            }
+            content = self._format_hubspot_support_triage_card(payload)
+            logger.info(
+                "[webhook] support-triage event route=%s target=%s msg_len=%d delivery=%s",
+                route_name,
+                delivery["deliver"],
+                len(content),
+                delivery_id,
+            )
+            try:
+                result = await self._direct_deliver(content, delivery)
+            except Exception:
+                logger.exception(
+                    "[webhook] support-triage delivery failed route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
+                    status=502,
+                )
+
+            if result.success:
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "route": route_name,
+                        "event": event_type,
+                        "delivery_id": delivery_id,
+                        "handler": "hubspot_support_triage",
+                    },
+                    status=202,
+                )
+            logger.warning(
+                "[webhook] support-triage target rejected route=%s target=%s error=%s",
+                route_name,
+                delivery["deliver"],
+                result.error,
+            )
+            return web.json_response(
+                {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
+                status=502,
+            )
+
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
         # deliver.  Use case: external services (Supabase, monitoring,
@@ -642,6 +720,451 @@ class WebhookAdapter(BasePlatformAdapter):
             else:
                 rendered[key] = value
         return rendered
+
+    async def _enrich_hubspot_support_triage_payload(
+        self, payload: dict, route_config: Optional[dict] = None
+    ) -> dict:
+        """Attach local read-only support reasoning to CLCK support triage payloads.
+
+        This is fail-open by design: if the local worker is missing, times out,
+        has no credentials, or errors, the deterministic base card still renders
+        with a safe unavailable marker.  The worker is a local helper and must
+        not deliver messages or write to HubSpot.
+        """
+        if payload.get("event_type") != "hubspot_support_triage":
+            return payload
+        if "support_reasoning" in payload:
+            return payload
+
+        enriched = dict(payload)
+        route_config = route_config or {}
+        try:
+            timeout = float(
+                route_config.get(
+                    "support_reasoning_timeout_seconds",
+                    _SUPPORT_REASONING_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            timeout = _SUPPORT_REASONING_TIMEOUT_SECONDS
+        timeout = max(0.5, min(timeout, 10.0))
+
+        try:
+            reasoning = await self._run_support_reasoning_worker(payload, timeout=timeout)
+            if not isinstance(reasoning, dict):
+                raise ValueError("support reasoning worker returned non-object JSON")
+            enriched["support_reasoning"] = reasoning
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[webhook] support-triage reasoning unavailable: timeout after %.1fs",
+                timeout,
+            )
+            enriched["support_reasoning"] = self._support_reasoning_unavailable("timeout")
+        except Exception as exc:
+            logger.warning(
+                "[webhook] support-triage reasoning unavailable: %s",
+                type(exc).__name__,
+            )
+            enriched["support_reasoning"] = self._support_reasoning_unavailable("error")
+        return enriched
+
+    async def _run_support_reasoning_worker(self, payload: dict, *, timeout: float) -> dict:
+        """Run the local support reasoning helper and return its JSON object."""
+        if not _SUPPORT_REASONING_SCRIPT.exists():
+            raise FileNotFoundError("support reasoning worker not found")
+
+        raw_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(_SUPPORT_REASONING_SCRIPT),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(raw_payload),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            with contextlib.suppress(Exception):
+                await process.communicate()
+            raise
+
+        if process.returncode != 0:
+            # Do not log stderr content: helper/library errors can include local paths
+            # or credential context.  The card only needs a safe unavailable status.
+            raise RuntimeError(f"support reasoning worker exited {process.returncode}")
+        if stderr:
+            logger.debug("[webhook] support-triage reasoning worker wrote stderr")
+        decoded = stdout.decode("utf-8").strip()
+        return json.loads(decoded)
+
+    def _support_reasoning_unavailable(self, reason: str) -> dict:
+        return {
+            "status": "enrichment_unavailable",
+            "evidence_status": reason,
+            "evidence_supported": False,
+            "read_only_findings": [
+                "Support reasoning enrichment unavailable; deterministic base triage card rendered fail-open."
+            ],
+            "recommended_internal_action": (
+                "Use the base triage card for now; rerun local read-only support reasoning before relying on evidence-backed findings."
+            ),
+            "clarification_question": "Local support reasoning enrichment did not complete for this intake.",
+        }
+
+    def _hubspot_support_triage_should_suppress(self, payload: dict) -> bool:
+        """Return True when support reasoning marked the intake as no-Slack noise."""
+        reasoning = payload.get("support_reasoning") if isinstance(payload.get("support_reasoning"), dict) else None
+        if reasoning is None:
+            support = payload.get("support") if isinstance(payload.get("support"), dict) else {}
+            reasoning = support.get("reasoning") if isinstance(support.get("reasoning"), dict) else None
+        if reasoning is None:
+            reasoning = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else None
+        if not reasoning:
+            return False
+        status = str(reasoning.get("status") or reasoning.get("evidence_status") or "").strip().lower()
+        action = str(
+            reasoning.get("recommended_internal_action")
+            or reasoning.get("recommended_next_action")
+            or ""
+        ).strip().lower()
+        return status == "support_noise" or ("suppress" in action and "no slack" in action)
+
+    def _format_hubspot_support_triage_card(self, payload: dict) -> str:
+        """Build the deterministic CLCK internal support-triage card.
+
+        This formatter is deliberately side-effect free.  It only uses the
+        webhook payload supplied by ActivePieces/matcher and always states the
+        MVP safety boundary: no email sent, no HubSpot write, no client Slack
+        post.
+        """
+        def _nested(data: Any, *keys: str) -> Any:
+            value = data
+            for key in keys:
+                if not isinstance(value, dict):
+                    return None
+                value = value.get(key)
+            return value
+
+        def _text(value: Any, default: str = "unknown") -> str:
+            if value is None:
+                return default
+            if isinstance(value, (dict, list)):
+                rendered = json.dumps(value, ensure_ascii=False)
+            else:
+                rendered = str(value)
+            rendered = " ".join(rendered.split())
+            return rendered if rendered else default
+
+        def _truthy(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        gmail = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
+        support = payload.get("support") if isinstance(payload.get("support"), dict) else {}
+        matcher = payload.get("matcher") if isinstance(payload.get("matcher"), dict) else None
+        if matcher is None:
+            matcher = payload.get("match") if isinstance(payload.get("match"), dict) else None
+        teable_match = _nested(payload, "teable", "client_match")
+        if matcher is None and isinstance(teable_match, dict):
+            matcher = teable_match
+        matcher = matcher or {}
+
+        sender = _text(
+            gmail.get("from")
+            or gmail.get("sender_email")
+            or gmail.get("original_sender_email")
+            or payload.get("sender_email")
+        )
+        source_mailbox = _text(
+            gmail.get("source_mailbox") or gmail.get("to") or payload.get("source_mailbox")
+        )
+        subject = _text(gmail.get("subject") or payload.get("subject"))
+        summary = _text(
+            matcher.get("request_summary_cleaned")
+            or support.get("request_summary_cleaned")
+            or payload.get("request_summary_cleaned")
+            or support.get("summary")
+            or payload.get("summary")
+            or gmail.get("snippet")
+            or gmail.get("body_preview"),
+            "No summary supplied.",
+        )
+
+        decision = _text(matcher.get("decision") or matcher.get("match_result"), "fallback")
+        reason = _text(matcher.get("reason") or matcher.get("match_reason"), "no_safe_match")
+        client_name = matcher.get("client_name") or _nested(matcher, "client", "name")
+        matched = decision == "route_client" and bool(client_name)
+        if matched:
+            match_line = f"matched client: {_text(client_name)} ({reason})"
+        else:
+            match_line = f"fallback/{reason}"
+        processing_hint_line = ""
+        explicit_hint_used = _truthy(matcher.get("explicit_client_hint_trusted")) and matcher.get("explicit_client_hint_matched_client")
+        if explicit_hint_used:
+            hint_client_name = (
+                _nested(matcher, "explicit_client_hint_matched_client", "client_name")
+                or matcher.get("client_name")
+                or client_name
+            )
+            processing_hint_line = f"Processing hint: CLCK-forwarded as {_text(hint_client_name)}"
+
+        portal_id = (
+            matcher.get("portal_id")
+            or matcher.get("hubspot_portal_id")
+            or _nested(payload, "hubspot", "portal_id")
+        )
+        hubspot_access_status = _text(
+            matcher.get("hubspot_access_status") or _nested(payload, "hubspot", "access_status"),
+            "",
+        ).lower()
+        hubspot_access_needed = _truthy(matcher.get("hubspot_access_needed")) or _truthy(
+            _nested(payload, "hubspot", "access_needed")
+        )
+        token_found = bool(
+            matcher.get("hubspot_token_reference")
+            or matcher.get("token_reference")
+            or _truthy(matcher.get("hubspot_token_reference_present"))
+            or _truthy(_nested(payload, "hubspot", "token_found"))
+        )
+        if hubspot_access_status == "connected" or (portal_id and token_found):
+            hubspot_status = "portal/token found; read-only inspection skipped; no writes in MVP."
+        elif hubspot_access_status == "access_needed" or hubspot_access_needed:
+            hubspot_status = "support-active route; HubSpot access needed before inspection or implementation; no writes in MVP."
+        elif hubspot_access_status == "not_applicable":
+            hubspot_status = "not applicable for HubSpot support action; read-only inspection skipped; no writes in MVP."
+        elif portal_id:
+            hubspot_status = "portal found; token not found; read-only inspection skipped; no writes in MVP."
+        else:
+            hubspot_status = "portal/token not found; read-only inspection skipped; no writes in MVP."
+
+        raw_request_text = " ".join(
+            [
+                _text(support.get("requested_action"), ""),
+                _text(support.get("action"), ""),
+                summary,
+                subject,
+            ]
+        )
+        requested_action = raw_request_text.lower()
+        requested_emails = re.findall(
+            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", raw_request_text, flags=re.I
+        )
+        requested_email = requested_emails[0].lower() if requested_emails else "the supplied email address"
+        requires_hubspot = _truthy(support.get("requires_hubspot_access")) or _truthy(
+            payload.get("requires_hubspot_access")
+        )
+        hubspot_change_terms = (
+            "hubspot_change",
+            "change hubspot",
+            "update hubspot",
+            "hubspot update",
+            "edit hubspot",
+            "create deal",
+            "delete",
+            "pipeline stage",
+            "property",
+            "workflow",
+        )
+        scope_terms = ("scope", "commercial", "pricing", "quote", "proposal", "contract")
+        ticket_routing_terms = (
+            "service board",
+            "2nd service board",
+            "second service board",
+            "new service board",
+            "create a ticket",
+            "create ticket",
+            "email-to-ticket",
+            "email to ticket",
+            "team email",
+            "connected inbox",
+            "help desk",
+            "conversations inbox",
+        )
+        hubspot_change = any(term in requested_action for term in hubspot_change_terms)
+        scope_decision = any(term in requested_action for term in scope_terms)
+        ticket_routing_question = any(term in requested_action for term in ticket_routing_terms)
+
+        issue_type = "general support triage"
+        client_ask = summary
+        likely_system_area = "Client support context / owner review"
+        if ticket_routing_question:
+            issue_type = "ticket intake routing / email-to-ticket"
+            client_ask = (
+                f"Confirm whether emails sent to {requested_email} can create tickets "
+                "in the requested service board."
+            )
+            likely_system_area = (
+                "HubSpot Help Desk or Conversations Inbox team email channel, plus ticket "
+                "pipeline/stage defaults and ticket-source automation."
+            )
+        elif hubspot_change:
+            issue_type = "HubSpot configuration change request"
+            client_ask = summary
+            likely_system_area = "HubSpot CRM configuration"
+        elif scope_decision:
+            issue_type = "scope/commercial question"
+            client_ask = summary
+            likely_system_area = "CLCK commercial/scope decision"
+        elif requires_hubspot:
+            issue_type = "HubSpot read-only support check"
+            client_ask = summary
+            likely_system_area = "HubSpot portal inspection"
+
+        def _compact_findings(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, list):
+                rendered_items = [_text(item, "") for item in value]
+                rendered = "; ".join(item for item in rendered_items if item)
+            elif isinstance(value, dict):
+                rendered_items = [f"{_text(key, '')}: {_text(val, '')}" for key, val in value.items()]
+                rendered = "; ".join(item for item in rendered_items if item.strip(": "))
+            else:
+                rendered = _text(value, "")
+            return rendered[:1200]
+
+        reasoning = payload.get("support_reasoning") if isinstance(payload.get("support_reasoning"), dict) else None
+        if reasoning is None and isinstance(support.get("reasoning"), dict):
+            reasoning = support.get("reasoning")
+        if reasoning is None and isinstance(payload.get("reasoning"), dict):
+            reasoning = payload.get("reasoning")
+        reasoning = reasoning or {}
+        read_only_findings = _compact_findings(reasoning.get("read_only_findings") or reasoning.get("findings"))
+        clarification_question = _text(
+            reasoning.get("clarification_question") or reasoning.get("question_for_client"), ""
+        )
+
+        if reasoning:
+            issue_type = _text(reasoning.get("issue_type"), issue_type)
+            client_ask = _text(reasoning.get("client_ask"), client_ask)
+            likely_system_area = _text(reasoning.get("likely_system_area"), likely_system_area)
+
+        raw_owner = matcher.get("assignee_hint") or matcher.get("owner_primary") or payload.get("owner")
+        if hubspot_change:
+            owner_hint = "Benson"
+            risk_level = "HubSpot change requested; approval required"
+            if hubspot_access_needed:
+                next_action = (
+                    "Request/grant HubSpot portal access before Benson inspects or proposes the exact change; "
+                    "Damien approves before any HubSpot write."
+                )
+            else:
+                next_action = (
+                    "Benson to inspect read-only and propose the exact change; "
+                    "Damien approves before any HubSpot write."
+                )
+            draft_reply = (
+                "Thanks for this. I’m going to check the right HubSpot setup and confirm "
+                "the change before anything is updated. I’ll come back to you shortly."
+            )
+        elif scope_decision:
+            owner_hint = "Damien"
+            risk_level = "scope/commercial decision required"
+            next_action = "Damien to review the commercial/scope question before a client reply is sent."
+            draft_reply = (
+                "Thanks for sending this through. I’ll check this properly on our side "
+                "and come back with the next step."
+            )
+        elif not matched:
+            owner_hint = "unknown/manual review"
+            risk_level = "approval required"
+            next_action = "Manually confirm the client/route before replying."
+            draft_reply = (
+                "Thanks for this. I’m checking where this should sit on our side and "
+                "will come back to you shortly."
+            )
+        elif ticket_routing_question:
+            owner_hint = _text(raw_owner, "unknown/manual review")
+            risk_level = "HubSpot routing/configuration question; read-only check before reply"
+            if hubspot_access_needed:
+                next_action = (
+                    "Request/grant HubSpot portal access, then check whether "
+                    f"{requested_email} is connected/forwarded as a HubSpot team email or help desk channel "
+                    "and which ticket pipeline/stage it creates into."
+                )
+                draft_reply = (
+                    "Draft intentionally withheld: HubSpot access is needed before confirming whether this "
+                    "email address can feed the requested service board."
+                )
+            else:
+                next_action = (
+                    "Inspect HubSpot read-only: Help Desk/Conversations channel accounts for "
+                    f"{requested_email}, then Tickets > Pipelines/Automate for the target service-board "
+                    "pipeline and default stage. If the channel is absent, propose connecting/forwarding the "
+                    "address before Damien approves any setup change."
+                )
+                draft_reply = (
+                    "Draft intentionally withheld: first confirm whether the email address is already "
+                    "connected and which ticket pipeline/stage it feeds, so we don’t promise a route that may need setup."
+                )
+        elif requires_hubspot:
+            owner_hint = _text(raw_owner, "unknown/manual review")
+            risk_level = "HubSpot read-only inspection needed"
+            if hubspot_access_needed:
+                next_action = "Request/grant HubSpot portal access before inspection; keep triage and reply drafting internal."
+            else:
+                next_action = "Inspect HubSpot read-only, then post findings and a draft for approval."
+            draft_reply = (
+                "Thanks for this. I’ll take a look in HubSpot and come back with the "
+                "next step shortly."
+            )
+        else:
+            owner_hint = _text(raw_owner, "unknown/manual review")
+            risk_level = "safe question/draft only"
+            next_action = "Owner to review the draft and approve the reply before anything is sent."
+            draft_reply = "Thanks for this. I’ll take a look and come back with the next step shortly."
+
+        if reasoning:
+            next_action = _text(
+                reasoning.get("recommended_internal_action") or reasoning.get("recommended_next_action"),
+                next_action,
+            )
+            reasoning_status = _text(reasoning.get("status") or reasoning.get("evidence_status"), "").lower()
+            evidence_supported = _truthy(reasoning.get("evidence_supported")) or reasoning_status in {
+                "supported",
+                "evidence_supported",
+                "complete",
+                "ok",
+            }
+            reasoning_draft = _text(
+                reasoning.get("draft_client_reply") or reasoning.get("draft_reply"), ""
+            )
+            if evidence_supported and reasoning_draft:
+                draft_reply = reasoning_draft
+            elif clarification_question:
+                draft_reply = f"Draft intentionally withheld: {clarification_question}"
+
+        lines = [
+            "**CLCK HubSpot support triage**",
+            f"- Request summary: {summary}",
+            f"- Issue type: {issue_type}",
+            f"- Client ask: {client_ask}",
+            f"- Likely system area: {likely_system_area}",
+            f"- Sender/source/subject: {sender} / {source_mailbox} / {subject}",
+            f"- Client match: {match_line}",
+            f"- Owner/assignee hint: {owner_hint}",
+            f"- Risk/action level: {risk_level}",
+            f"- HubSpot status: {hubspot_status}",
+        ]
+        if read_only_findings:
+            lines.append(f"- Read-only findings: {read_only_findings}")
+        if processing_hint_line:
+            lines.append(f"- {processing_hint_line}")
+        if clarification_question:
+            lines.append(f"- Clarification question: {clarification_question}")
+        lines.extend([
+            f"- Recommended internal next action: {next_action}",
+            f"- Draft client reply: {draft_reply}",
+            "- Safety: no email sent; no HubSpot write; no client Slack post.",
+        ])
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Response delivery

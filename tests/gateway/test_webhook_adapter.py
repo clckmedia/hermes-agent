@@ -695,6 +695,505 @@ class TestRawTemplateToken:
 
 
 # ===================================================================
+# CLCK HubSpot support triage
+# ===================================================================
+
+
+class TestHubSpotSupportTriage:
+    """Tests for the CLCK support triage webhook card path."""
+
+    def _support_triage_routes(self):
+        return {
+            "hubspot-support-triage": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["hubspot_support_triage"],
+                "prompt": "generic fallback prompt should not be used",
+                "deliver": "slack",
+                "deliver_extra": {
+                    "chat_id": "{slack.channel_id}",
+                    "thread_id": "{slack.thread_ts}",
+                },
+            }
+        }
+
+    def _attach_slack_runner(self, adapter):
+        slack_adapter = AsyncMock()
+        slack_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner = MagicMock()
+        runner.adapters = {Platform.SLACK: slack_adapter}
+        runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = runner
+        return slack_adapter
+
+    def test_unknown_sender_formats_fallback_manual_review_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Unknown Person <unknown@example.invalid>",
+                    "to": "support@clck.com.au",
+                    "subject": "Can you help?",
+                },
+                "support": {"summary": "Unknown sender needs HubSpot help."},
+                "matcher": {
+                    "decision": "fallback",
+                    "reason": "no_safe_match",
+                    "client_name": None,
+                    "assignee_hint": "internal_review",
+                },
+            }
+        )
+
+        assert "Request summary: Unknown sender needs HubSpot help." in card
+        assert "Sender/source/subject: Unknown Person <unknown@example.invalid> / support@clck.com.au / Can you help?" in card
+        assert "Client match: fallback/no_safe_match" in card
+        assert "Owner/assignee hint: unknown/manual review" in card
+        assert "Recommended internal next action: Manually confirm the client/route before replying." in card
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_explicit_client_hint_line_renders_and_directive_is_not_summary(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Damien <damien@clck.com.au>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: 2ND SERVICE BOARD",
+                },
+                "support": {
+                    "summary": "Process as: Off Track RV\n\nCan anything sent to pdmelb@offtrackrv.com create a ticket?",
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Off Track RV",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                    "explicit_client_hint": "Off Track RV",
+                    "explicit_client_hint_type": "client_name",
+                    "explicit_client_hint_source": "damien@clck.com.au",
+                    "explicit_client_hint_trusted": True,
+                    "explicit_client_hint_matched_client": {"client_name": "Off Track RV"},
+                    "request_summary_cleaned": "Can anything sent to pdmelb@offtrackrv.com create a ticket?",
+                },
+            }
+        )
+
+        assert "Request summary: Can anything sent to pdmelb@offtrackrv.com create a ticket?" in card
+        assert "Processing hint: CLCK-forwarded as Off Track RV" in card
+        assert "Process as:" not in card
+
+    def test_matched_safe_question_formats_draft_only_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Jane <jane@vacationer.example>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Where do I find the import?",
+                },
+                "support": {
+                    "summary": "Client asks where to find the HubSpot import view.",
+                    "priority": "normal",
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Vacationer Caravans",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "123456",
+                    "hubspot_token_reference": {"type": "env", "token_env": "HUBSPOT_X"},
+                },
+            }
+        )
+
+        assert "Client match: matched client: Vacationer Caravans" in card
+        assert "Owner/assignee hint: Damien" in card
+        assert "Risk/action level: safe question/draft only" in card
+        assert "HubSpot status: portal/token found; read-only inspection skipped; no writes in MVP." in card
+        assert "Draft client reply:" in card
+        assert "Thanks for this. I’ll take a look and come back with the next step shortly." in card
+
+    def test_off_track_service_board_question_gives_specific_internal_check(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Justin Borg <justin@offtrackrv.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "2ND SERVICE BOARD",
+                    "snippet": (
+                        "Hi mate, With the second service board, can I get anything sent to "
+                        "this email address pdmelb@offtrackrv.com to create a ticket in the new service board?"
+                    ),
+                },
+                "support": {
+                    "summary": (
+                        "Justin asks whether anything sent to pdmelb@offtrackrv.com can "
+                        "create a ticket in the new service board."
+                    ),
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Off Track RV",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "441989220",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+            }
+        )
+
+        assert "Client match: matched client: Off Track RV (safe_match)" in card
+        assert "Issue type: ticket intake routing / email-to-ticket" in card
+        assert "Client ask: Confirm whether emails sent to pdmelb@offtrackrv.com can create tickets in the requested service board." in card
+        assert "Likely system area: HubSpot Help Desk or Conversations Inbox team email channel" in card
+        assert "Recommended internal next action: Inspect HubSpot read-only: Help Desk/Conversations channel accounts for pdmelb@offtrackrv.com" in card
+        assert "Tickets > Pipelines/Automate" in card
+        assert "Draft client reply: Draft intentionally withheld:" in card
+        assert "I’ll take a look and come back with the next step shortly" not in card
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_off_track_enriched_reasoning_renders_evidence_backed_answer(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Justin Borg <justin@offtrackrv.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "2ND SERVICE BOARD",
+                    "snippet": (
+                        "Can anything sent to pdmelb@offtrackrv.com create a ticket "
+                        "in the new service board?"
+                    ),
+                },
+                "support": {
+                    "summary": (
+                        "Justin asks whether anything sent to pdmelb@offtrackrv.com can "
+                        "create a ticket in the new service board."
+                    ),
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Off Track RV",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "441989220",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "status": "evidence_supported",
+                    "issue_type": "ticket intake routing / email-to-ticket",
+                    "client_ask": (
+                        "Confirm whether pdmelb@offtrackrv.com can create tickets in "
+                        "the new service board."
+                    ),
+                    "likely_system_area": "HubSpot Help Desk email channel and ticket pipeline defaults.",
+                    "read_only_findings": [
+                        "pdmelb@offtrackrv.com is not currently connected as a HubSpot Help Desk/Conversations email channel",
+                        "Pre-Delivery Pipeline exists and has a New stage",
+                        "support@offtrackrv.com currently lands in Warranty Pipeline",
+                    ],
+                    "recommended_internal_action": (
+                        "Confirm mailbox vs alias/group, then connect/configure pdmelb@offtrackrv.com "
+                        "as a Help Desk team email channel with default ticket settings "
+                        "Pre-Delivery Pipeline > New."
+                    ),
+                    "draft_client_reply": (
+                        "At the moment pdmelb@offtrackrv.com isn’t connected to HubSpot for ticket creation. "
+                        "Can you confirm whether that address is a real mailbox we can connect, or an alias/group "
+                        "that needs forwarding? Once confirmed, we can set it to create tickets in "
+                        "Pre-Delivery Pipeline > New."
+                    ),
+                },
+            }
+        )
+
+        assert "Read-only findings: pdmelb@offtrackrv.com is not currently connected" in card
+        assert "Pre-Delivery Pipeline exists and has a New stage" in card
+        assert "support@offtrackrv.com currently lands in Warranty Pipeline" in card
+        assert "Recommended internal next action: Confirm mailbox vs alias/group" in card
+        assert "Draft client reply: At the moment pdmelb@offtrackrv.com isn’t connected" in card
+        assert "I’ll take a look and come back with the next step shortly" not in card
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_access_needed_client_routes_but_blocks_hubspot_inspection(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Matt <matt@playconnectgroup.com.au>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Can you check HubSpot?",
+                },
+                "support": {
+                    "summary": "Client asks for a read-only HubSpot check.",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Playconnect Group",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "442443150",
+                    "hubspot_access_status": "access_needed",
+                    "hubspot_access_needed": True,
+                    "hubspot_token_reference_present": False,
+                },
+            }
+        )
+
+        assert "Client match: matched client: Playconnect Group" in card
+        assert "HubSpot status: support-active route; HubSpot access needed before inspection or implementation; no writes in MVP." in card
+        assert "Recommended internal next action: Request/grant HubSpot portal access before inspection; keep triage and reply drafting internal." in card
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_requested_hubspot_change_formats_approval_benson_no_write_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Ops <ops@client.example>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Please update our pipeline stage",
+                },
+                "support": {
+                    "summary": "Client asks CLCK to change a HubSpot pipeline stage.",
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Client",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "456789",
+                    "hubspot_token_reference": {"type": "env", "token_env": "HUBSPOT_Y"},
+                },
+            }
+        )
+
+        assert "Owner/assignee hint: Benson" in card
+        assert "Risk/action level: HubSpot change requested; approval required" in card
+        assert "Recommended internal next action: Benson to inspect read-only and propose the exact change; Damien approves before any HubSpot write." in card
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    @pytest.mark.asyncio
+    async def test_existing_support_reasoning_is_not_enriched_again(self):
+        adapter = _make_adapter()
+
+        worker = AsyncMock(return_value={"status": "should_not_run"})
+        adapter._run_support_reasoning_worker = worker
+        payload = {
+            "event_type": "hubspot_support_triage",
+            "support_reasoning": {"status": "provided"},
+        }
+
+        enriched = await adapter._enrich_hubspot_support_triage_payload(payload)
+
+        assert enriched is payload
+        worker.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_support_triage_worker_failure_adds_unavailable_reasoning(self):
+        adapter = _make_adapter()
+        adapter._run_support_reasoning_worker = AsyncMock(side_effect=RuntimeError("boom"))
+        payload = {"event_type": "hubspot_support_triage"}
+
+        enriched = await adapter._enrich_hubspot_support_triage_payload(payload)
+
+        assert enriched is not payload
+        assert enriched["support_reasoning"]["status"] == "enrichment_unavailable"
+        assert enriched["support_reasoning"]["evidence_supported"] is False
+        assert "support_reasoning" not in payload
+
+    @pytest.mark.asyncio
+    async def test_support_triage_worker_success_renders_enriched_fields(self):
+        adapter = _make_adapter(routes=self._support_triage_routes())
+        adapter.handle_message = AsyncMock()
+        slack_adapter = self._attach_slack_runner(adapter)
+        adapter._run_support_reasoning_worker = AsyncMock(
+            return_value={
+                "status": "evidence_supported",
+                "evidence_supported": True,
+                "issue_type": "ticket intake routing / email-to-ticket",
+                "client_ask": "Confirm whether pdmelb@offtrackrv.com can create tickets.",
+                "read_only_findings": ["pdmelb@offtrackrv.com is not connected as a HubSpot email channel"],
+                "recommended_internal_action": "Confirm mailbox ownership, then connect the Help Desk channel after approval.",
+                "draft_client_reply": "pdmelb@offtrackrv.com is not connected yet; we need to connect it before ticket creation.",
+            }
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/hubspot-support-triage",
+                json={
+                    "event_type": "hubspot_support_triage",
+                    "gmail": {
+                        "from": "Justin <justin@offtrackrv.com>",
+                        "source_mailbox": "support@clck.com.au",
+                        "subject": "2ND SERVICE BOARD",
+                        "snippet": "Can pdmelb@offtrackrv.com create a ticket?",
+                    },
+                    "support": {"summary": "Client asks about email-to-ticket routing."},
+                    "matcher": {"decision": "route_client", "reason": "safe_match", "client_name": "Off Track RV"},
+                    "slack": {"channel_id": "C0ASKKH52RK", "thread_ts": ""},
+                },
+                headers={"X-Request-ID": "support-triage-reasoning-success"},
+            )
+            assert resp.status == 202
+
+        adapter.handle_message.assert_not_called()
+        slack_adapter.send.assert_awaited_once()
+        content = slack_adapter.send.await_args.args[1]
+        assert "Read-only findings: pdmelb@offtrackrv.com is not connected" in content
+        assert "Recommended internal next action: Confirm mailbox ownership" in content
+        assert "Draft client reply: pdmelb@offtrackrv.com is not connected yet" in content
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in content
+
+    @pytest.mark.asyncio
+    async def test_support_triage_noise_reasoning_suppresses_slack_delivery(self):
+        adapter = _make_adapter(routes=self._support_triage_routes())
+        adapter.handle_message = AsyncMock()
+        slack_adapter = self._attach_slack_runner(adapter)
+        adapter._run_support_reasoning_worker = AsyncMock(
+            return_value={
+                "status": "support_noise",
+                "evidence_status": "suppressed_noise",
+                "issue_type": "support_noise",
+                "recommended_internal_action": "Suppress/no Slack card; do not draft, route, or inspect HubSpot.",
+            }
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/hubspot-support-triage",
+                json={
+                    "event_type": "hubspot_support_triage",
+                    "gmail": {
+                        "from": "Caitlin <caitlin@pandadoc.com>",
+                        "source_mailbox": "support@clck.com.au",
+                        "subject": "CLCK, ready to get started?",
+                    },
+                    "matcher": {"decision": "fallback", "reason": "no_safe_match"},
+                    "slack": {"channel_id": "C0ASKKH52RK", "thread_ts": ""},
+                },
+                headers={"X-Request-ID": "support-triage-noise-suppressed"},
+            )
+            assert resp.status == 202
+            data = await resp.json()
+
+        assert data["status"] == "suppressed"
+        adapter.handle_message.assert_not_called()
+        slack_adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_support_triage_worker_timeout_fails_open_to_base_card(self):
+        adapter = _make_adapter(routes=self._support_triage_routes())
+        adapter.handle_message = AsyncMock()
+        slack_adapter = self._attach_slack_runner(adapter)
+        adapter._run_support_reasoning_worker = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/hubspot-support-triage",
+                json={
+                    "event_type": "hubspot_support_triage",
+                    "gmail": {
+                        "from": "Unknown <unknown@example.invalid>",
+                        "source_mailbox": "support@clck.com.au",
+                        "subject": "TEST support triage",
+                    },
+                    "support": {"summary": "Fake internal test payload."},
+                    "matcher": {"decision": "fallback", "reason": "no_safe_match"},
+                    "slack": {"channel_id": "C0ASKKH52RK", "thread_ts": ""},
+                },
+                headers={"X-Request-ID": "support-triage-reasoning-timeout"},
+            )
+            assert resp.status == 202
+
+        adapter.handle_message.assert_not_called()
+        slack_adapter.send.assert_awaited_once()
+        content = slack_adapter.send.await_args.args[1]
+        assert "Request summary: Fake internal test payload." in content
+        assert "Client match: fallback/no_safe_match" in content
+        assert "Support reasoning enrichment unavailable" in content
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in content
+
+    @pytest.mark.asyncio
+    async def test_support_triage_event_delivers_card_to_slack_thread_without_agent(self):
+        routes = {
+            "hubspot-support-triage": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["hubspot_support_triage"],
+                "prompt": "generic fallback prompt should not be used",
+                "deliver": "slack",
+                "deliver_extra": {
+                    "chat_id": "{slack.channel_id}",
+                    "thread_id": "{slack.thread_ts}",
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._run_support_reasoning_worker = AsyncMock(side_effect=RuntimeError("worker disabled in test"))
+        slack_adapter = AsyncMock()
+        slack_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner = MagicMock()
+        runner.adapters = {Platform.SLACK: slack_adapter}
+        runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = runner
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/hubspot-support-triage",
+                json={
+                    "event_type": "hubspot_support_triage",
+                    "gmail": {
+                        "from": "Unknown <unknown@example.invalid>",
+                        "source_mailbox": "support@clck.com.au",
+                        "subject": "TEST support triage",
+                    },
+                    "support": {"summary": "Fake internal test payload."},
+                    "matcher": {"decision": "fallback", "reason": "no_safe_match"},
+                    "slack": {"channel_id": "C0ASKKH52RK", "thread_ts": "1777784852.911829"},
+                },
+                headers={"X-Request-ID": "support-triage-test-1"},
+            )
+            assert resp.status == 202
+            data = await resp.json()
+
+        assert data["status"] == "accepted"
+        adapter.handle_message.assert_not_called()
+        slack_adapter.send.assert_awaited_once()
+        chat_id, content = slack_adapter.send.await_args.args[:2]
+        assert chat_id == "C0ASKKH52RK"
+        assert "Request summary: Fake internal test payload." in content
+        assert "Client match: fallback/no_safe_match" in content
+        assert slack_adapter.send.await_args.kwargs["metadata"] == {"thread_id": "1777784852.911829"}
+
+
+# ===================================================================
 # Cross-platform delivery thread_id passthrough
 # ===================================================================
 
