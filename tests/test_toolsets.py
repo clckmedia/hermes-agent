@@ -109,6 +109,20 @@ class TestValidateToolset:
         assert validate_toolset("web") is True
         assert validate_toolset("terminal") is True
 
+    def test_hermes_slack_exposes_read_only_retrieval_tools(self):
+        expected = {
+            "slack_list_conversations",
+            "slack_get_history",
+            "slack_get_thread",
+            "slack_search_recent",
+            "slack_get_permalink",
+        }
+
+        assert validate_toolset("slack") is True
+        assert expected.issubset(set(resolve_toolset("slack")))
+        assert expected.issubset(set(resolve_toolset("hermes-slack")))
+        assert "send_message" not in set(resolve_toolset("slack"))
+
     def test_instantly_readonly_toolset_exposes_only_watcher_read_tools(self):
         expected = {
             "mcp_instantly_get_account",

@@ -62,6 +62,14 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
 
+_SLACK_READ_TOOLS = [
+    "slack_list_conversations",
+    "slack_get_history",
+    "slack_get_thread",
+    "slack_search_recent",
+    "slack_get_permalink",
+]
+
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
@@ -205,6 +213,12 @@ TOOLSETS = {
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],
+        "includes": [],
+    },
+
+    "slack": {
+        "description": "Read-only Slack retrieval tools for visible conversations, history, threads, and bounded recent search",
+        "tools": _SLACK_READ_TOOLS,
         "includes": [],
     },
 
@@ -379,8 +393,8 @@ TOOLSETS = {
     },
     
     "hermes-slack": {
-        "description": "Slack bot toolset - full access for workspace use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "description": "Slack bot toolset - full access for workspace use (terminal has safety checks) plus read-only Slack retrieval tools",
+        "tools": _HERMES_CORE_TOOLS + _SLACK_READ_TOOLS,
         "includes": []
     },
     
