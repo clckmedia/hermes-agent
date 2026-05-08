@@ -77,9 +77,11 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
     # Platforms that don't support direct channel enumeration get session-based
-    # discovery automatically.  Skip infrastructure entries that aren't messaging
-    # platforms — everything else falls through to _build_from_sessions().
-    _SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook"})
+    # discovery automatically.  Skip infrastructure entries and inactive Discord
+    # history: Discord is fully enumerated above when an adapter is actually
+    # connected, but old Discord sessions should not keep a platform directory
+    # alive after a workspace migration.
+    _SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook", "discord"})
     for plat in Platform:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
