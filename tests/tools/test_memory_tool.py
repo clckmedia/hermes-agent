@@ -26,6 +26,12 @@ class TestMemorySchema:
         assert "temporary task state" in description
         assert ">80%" not in description
 
+    def test_discourages_client_project_details_in_baseline_memory(self):
+        description = MEMORY_SCHEMA["description"]
+        assert "client/project details" in description
+        assert "docs" in description
+        assert "always-on baseline" in description
+
 
 # =========================================================================
 # Security scanning

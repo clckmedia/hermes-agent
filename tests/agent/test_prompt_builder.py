@@ -46,6 +46,11 @@ class TestGuidanceConstants:
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
 
+    def test_memory_guidance_keeps_project_detail_out_of_baseline(self):
+        assert "client/project details" in MEMORY_GUIDANCE
+        assert "docs" in MEMORY_GUIDANCE
+        assert "baseline" in MEMORY_GUIDANCE
+
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
