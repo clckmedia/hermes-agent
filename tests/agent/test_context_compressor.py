@@ -3,7 +3,11 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import (
+    ContextCompressor,
+    SUMMARY_PREFIX,
+    _SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS,
+)
 
 
 @pytest.fixture()
@@ -191,6 +195,36 @@ class TestNonStringContent:
         kwargs = mock_call.call_args.kwargs
         assert "temperature" not in kwargs
 
+    def test_summary_prompt_preserves_parent_controller_delegation_mode(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "This Discord thread is the parent strategy/session controller. "
+                    "Keep it lean. Use Child Tasks for repo-heavy execution, previews, "
+                    "deploys, proof research, and QA. Parent writes a tight child prompt. "
+                    "Damien pastes it into a fresh Child Tasks thread."
+                ),
+            },
+            {"role": "assistant", "content": "Next child prompt: build the preview page."},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        normalised_prompt = " ".join(prompt.split())
+        assert "parent/controller" in prompt
+        assert "manual child" in prompt
+        assert "not as permission for parent execution" in normalised_prompt
+
     def test_summary_call_passes_live_main_runtime(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -240,6 +274,63 @@ class TestSummaryFailureCooldown:
         assert first is None
         assert second is None
         assert mock_call.call_count == 1
+
+    def test_transient_chunked_read_retries_and_succeeds_without_error_state(self):
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary after retry"
+        err = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with (
+            patch("agent.context_compressor.call_llm", side_effect=[err, mock_ok]) as mock_call,
+            patch("agent.context_compressor.time.sleep") as mock_sleep,
+        ):
+            result = c._generate_summary(messages)
+
+        assert mock_call.call_count == 2
+        mock_sleep.assert_called_once_with(_SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS[0])
+        assert result is not None
+        assert "summary after retry" in result
+        assert c._last_summary_error is None
+
+    def test_transient_chunked_read_exhausts_retry_then_enters_cooldown(self):
+        err = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with (
+            patch("agent.context_compressor.call_llm", side_effect=err) as mock_call,
+            patch("agent.context_compressor.time.sleep") as mock_sleep,
+        ):
+            first = c._generate_summary(messages)
+            second = c._generate_summary(messages)
+
+        assert first is None
+        assert second is None
+        assert mock_call.call_count == 2
+        mock_sleep.assert_called_once_with(_SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS[0])
+        assert c._last_summary_error is not None
+        assert "incomplete chunked read" in c._last_summary_error
 
 
 class TestSummaryFallbackToMainModel:
@@ -330,8 +421,9 @@ class TestSummaryFallbackToMainModel:
 
     def test_no_fallback_when_summary_model_equals_main_model(self):
         """If the aux model IS the main model, there's nowhere to fall back
-        to — go straight to cooldown, don't loop retrying the same call."""
-        err = Exception("500 internal error")
+        to — non-transient failures go straight to cooldown, don't loop retrying
+        the same broken request."""
+        err = Exception("400 validation error")
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
@@ -356,7 +448,7 @@ class TestSummaryFallbackToMainModel:
         """If the retry-on-main ALSO fails, don't loop forever — enter
         cooldown like the normal failure path."""
         err1 = Exception("400 aux model rejected")
-        err2 = Exception("500 main model also exploded")
+        err2 = Exception("400 main model also exploded")
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(

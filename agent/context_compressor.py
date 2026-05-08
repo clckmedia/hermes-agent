@@ -72,6 +72,7 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS = (2.0,)
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
@@ -633,6 +634,81 @@ class ContextCompressor(ContextEngine):
     # Summarization
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_transient_summary_error(exc: BaseException) -> bool:
+        """Return True for summary-call failures worth retrying immediately.
+
+        Auxiliary compression is often routed through streaming providers.  A
+        stream can fail after the provider has accepted the request (for example
+        ``peer closed connection ... incomplete chunked read``).  Retrying these
+        once is much safer than dropping the middle turns and inserting a
+        fallback marker.  Configuration/validation failures should not be
+        retried because the same request will fail again and delay the turn.
+        """
+        status = getattr(exc, "status_code", None) or getattr(
+            getattr(exc, "response", None), "status_code", None
+        )
+        if status in {408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524}:
+            return True
+
+        err_text = str(exc).lower()
+        transient_markers = (
+            "peer closed connection",
+            "incomplete chunked read",
+            "chunked read",
+            "server disconnected",
+            "stream interrupted",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+            "read timeout",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "try again",
+            "rate limit",
+            "overloaded",
+            "network",
+        )
+        return any(marker in err_text for marker in transient_markers)
+
+    def _call_summary_llm_with_retries(self, call_kwargs: Dict[str, Any]):
+        """Call the summary LLM, retrying transient streaming/network errors.
+
+        Raises the final exception to the existing fallback/cooldown logic if
+        every attempt fails.  RuntimeError keeps the old behaviour because this
+        path historically means no auxiliary provider is configured.
+        """
+        max_attempts = 1 + len(_SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return call_llm(**call_kwargs)
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                can_retry = (
+                    attempt < max_attempts
+                    and self._is_transient_summary_error(exc)
+                )
+                if not can_retry:
+                    raise
+                delay = _SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS[attempt - 1]
+                err_text = str(exc).strip() or exc.__class__.__name__
+                if len(err_text) > 220:
+                    err_text = err_text[:217].rstrip() + "..."
+                logger.info(
+                    "Context summary attempt %d/%d failed with transient error; "
+                    "retrying in %.1fs: %s",
+                    attempt,
+                    max_attempts,
+                    delay,
+                    err_text,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+
     def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
         """Scale summary token budget with the amount of content being compressed.
 
@@ -760,7 +836,13 @@ class ContextCompressor(ContextEngine):
 [THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
 task assignment verbatim — the exact words they used. If multiple tasks
 were requested and only some are done, list only the ones NOT yet completed.
-The next assistant must pick up exactly here. Example:
+The next assistant must pick up exactly here. If the conversation says the
+current thread/session is a parent/controller, strategy lane, or manual child
+workflow, preserve that routing explicitly. For Child Tasks/child-topic/manual
+child workflows, frame heavy work as the parent deciding/writing the next
+manual child prompt or interpreting a returned child summary — not as permission
+for parent execution. Do not collapse instructions like "Use Child Tasks" into
+an active parent task such as build/deploy/audit/QA. Example:
 "User asked: 'Now refactor the auth module to use JWT instead of sessions'"
 If no outstanding task exists, write "None."]
 
@@ -867,7 +949,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
-            response = call_llm(**call_kwargs)
+            response = self._call_summary_llm_with_retries(call_kwargs)
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):

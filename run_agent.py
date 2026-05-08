@@ -8850,7 +8850,8 @@ class AIAgent:
             compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
-        if summary_error:
+        summary_fallback_used = bool(getattr(self.context_compressor, "_last_summary_fallback_used", False))
+        if summary_error and summary_fallback_used:
             if getattr(self, "_last_compression_summary_warning", None) != summary_error:
                 self._last_compression_summary_warning = summary_error
                 self._emit_warning(
@@ -8858,9 +8859,10 @@ class AIAgent:
                     "Inserted a fallback context marker."
                 )
         else:
-            # No hard failure — but did the configured aux model error out
-            # and get recovered by retrying on main?  Surface that so users
-            # know their auxiliary.compression.model setting is broken even
+            # No final fallback marker — either summary generation succeeded,
+            # or a custom context engine recorded a non-fatal diagnostic. Did
+            # the configured aux model error out and get recovered by retrying
+            # on main? Surface that so users know their config is broken even
             # though compression succeeded.
             _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
             _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
