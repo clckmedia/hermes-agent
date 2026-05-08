@@ -51,6 +51,24 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
+def _log_slack_slash_metadata(stage: str, command: dict[str, Any]) -> None:
+    """Log slash-command delivery metadata without user text or Slack secrets."""
+    slash = str(command.get("command") or "")
+    text = str(command.get("text") or "")
+    logger.info(
+        "[Slack] Slack slash command %s: command=%s team=%s channel=%s "
+        "user=%s text_len=%d trigger_id_present=%s response_url_present=%s",
+        stage,
+        slash or "<missing>",
+        command.get("team_id") or "",
+        command.get("channel_id") or "",
+        command.get("user_id") or "",
+        len(text),
+        bool(command.get("trigger_id")),
+        bool(command.get("response_url")),
+    )
+
+
 @dataclass
 class _ThreadContextCache:
     """Cache entry for fetched thread context."""
@@ -443,6 +461,19 @@ class SlackAdapter(BasePlatformAdapter):
                     bot_name, team_name, team_id,
                 )
 
+            # Log slash command envelopes before listener matching. This is
+            # deliberately metadata-only so operators can prove Socket Mode
+            # delivery without leaking command text, response_url, trigger_id,
+            # or tokens into gateway.log.
+            async def log_slash_command_envelope(body, next):
+                if isinstance(body, dict) and body.get("command"):
+                    _log_slack_slash_metadata("received", body)
+                await next()
+
+            middleware = getattr(self._app, "middleware", None)
+            if callable(middleware):
+                middleware(log_slash_command_envelope)
+
             # Register message event handler
             @self._app.event("message")
             async def handle_message_event(event, say):
@@ -501,6 +532,11 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             else:  # pragma: no cover - registry always non-empty
                 _slash_pattern = _re.compile(r"^/hermes$")
+            logger.info(
+                "[Slack] Registered %d native slash command matcher(s) via Socket Mode: %s",
+                len(_slash_names),
+                ", ".join(f"/{name}" for name in _slash_names),
+            )
 
             @self._app.command(_slash_pattern)
             async def handle_hermes_command(ack, command):
@@ -1592,9 +1628,16 @@ class SlackAdapter(BasePlatformAdapter):
             elif not is_mentioned:
                 return
 
-        if is_mentioned:
-            # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+        slack_command_text = ""
+        if is_mentioned and bot_uid:
+            # Strip the bot mention from the enriched text for normal agent
+            # turns, but keep a clean copy from Slack's plain text field for
+            # mention-prefixed slash controls. Slack message events often carry
+            # rich_text blocks; command args must not inherit serialized block
+            # payloads, attachment notices, or fetched thread context.
+            mention_token = f"<@{bot_uid}>"
+            slack_command_text = (original_text or "").replace(mention_token, "").strip()
+            text = text.replace(mention_token, "").strip()
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -1605,13 +1648,25 @@ class SlackAdapter(BasePlatformAdapter):
                     to_remove = list(self._mentioned_threads)[:self._MENTIONED_THREADS_MAX // 2]
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
+        else:
+            slack_command_text = (original_text or "").strip()
+
+        is_slack_gateway_command = slack_command_text.startswith("/")
+        if is_slack_gateway_command:
+            text = slack_command_text
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
-            channel_id=channel_id,
-            thread_ts=event_thread_ts,
-            user_id=user_id,
+        # Gateway slash controls are handled by the runner and must preserve
+        # their exact command/args, so never prefix them with thread context.
+        if (
+            is_thread_reply
+            and not is_slack_gateway_command
+            and not self._has_active_session_for_thread(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                user_id=user_id,
+            )
         ):
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
@@ -1624,7 +1679,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Determine message type
         msg_type = MessageType.TEXT
-        if (original_text or "").startswith("/"):
+        if is_slack_gateway_command:
             msg_type = MessageType.COMMAND
 
         # Handle file attachments
@@ -2209,6 +2264,8 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+
+        _log_slack_slash_metadata("matched", command)
 
         # Track which workspace owns this channel
         if team_id and channel_id:

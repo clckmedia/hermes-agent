@@ -8365,6 +8365,14 @@ For more help on a command:
         help="Bot description shown in Slack's app directory.",
     )
     slack_manifest.add_argument(
+        "--request-url",
+        dest="request_url",
+        default=None,
+        help="HTTPS slash-command request URL to put in the manifest. "
+             "Hermes normally uses Socket Mode, so omit this unless you "
+             "have deployed an HTTP receiver.",
+    )
+    slack_manifest.add_argument(
         "--slashes-only",
         action="store_true",
         help="Emit only the features.slash_commands array (for merging "

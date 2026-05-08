@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 
-def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
+def _build_full_manifest(bot_name: str, bot_description: str, request_url: str | None = None) -> dict:
     """Build a full Slack manifest merging display info + our slash list.
 
     The slash-command list is always generated from ``COMMAND_REGISTRY`` so
@@ -33,7 +33,7 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
     """
     from hermes_cli.commands import slack_app_manifest
 
-    partial = slack_app_manifest()
+    partial = slack_app_manifest(request_url=request_url)
     slashes = partial["features"]["slash_commands"]
 
     return {
@@ -109,13 +109,14 @@ def slack_manifest_command(args) -> int:
     """
     name = getattr(args, "name", None) or "Hermes"
     description = getattr(args, "description", None) or "Your Hermes agent on Slack"
+    request_url = getattr(args, "request_url", None) or None
 
     if getattr(args, "slashes_only", False):
         from hermes_cli.commands import slack_app_manifest
 
-        manifest = slack_app_manifest()["features"]["slash_commands"]
+        manifest = slack_app_manifest(request_url=request_url)["features"]["slash_commands"]
     else:
-        manifest = _build_full_manifest(name, description)
+        manifest = _build_full_manifest(name, description, request_url=request_url)
 
     payload = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 

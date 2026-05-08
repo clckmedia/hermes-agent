@@ -827,6 +827,7 @@ def discord_skill_commands_by_category(
 _SLACK_MAX_SLASH_COMMANDS = 25
 _SLACK_NAME_LIMIT = 32
 _SLACK_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
+_SLACK_SOCKET_MODE_REQUEST_URL = "https://slack.com/slash-command-placeholder"
 
 # Slack built-ins/reserved names fail manifest validation or collide with
 # Slack UX. Keep these available through /hermes <subcommand> instead.
@@ -862,7 +863,7 @@ _SLACK_RESERVED_COMMAND_NAMES = {
 # command picker. Everything else remains accessible through /hermes.
 _SLACK_PRIORITY_COMMAND_NAMES = [
     "hermes",
-    "new",
+    "reset",
     "retry",
     "undo",
     "title",
@@ -964,12 +965,34 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     return entries
 
 
-def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/commands") -> dict[str, Any]:
+def _resolve_slack_slash_request_url(request_url: str | None = None) -> str:
+    """Resolve the manifest slash-command URL without defaulting to .local.
+
+    Hermes Slack uses Socket Mode, so Slack delivers slash command envelopes
+    over the app-level WebSocket and does not need an HTTP receiver. Slack's
+    manifest schema still requires a public HTTPS URL string for each slash;
+    use an explicit env/CLI override when deploying an HTTP receiver, otherwise
+    emit a harmless public HTTPS placeholder instead of a fake local endpoint.
+    """
+    explicit = (request_url or "").strip()
+    if explicit:
+        return explicit
+    for key in ("HERMES_SLACK_SLASH_REQUEST_URL", "SLACK_SLASH_REQUEST_URL"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return _SLACK_SOCKET_MODE_REQUEST_URL
+
+
+def slack_app_manifest(request_url: str | None = None) -> dict[str, Any]:
     """Generate a Slack app manifest with all gateway commands as slashes.
 
     ``request_url`` is required by Slack's manifest schema for every slash
-    command, but in Socket Mode (which we use) Slack ignores it and routes
-    the command event through the WebSocket. A placeholder URL is fine.
+    command. Hermes uses Socket Mode, so Slack routes the command envelope
+    through the WebSocket; no HTTP ``/slack/commands`` receiver is required in
+    the normal gateway. The URL is kept configurable for deployments that add
+    an HTTPS receiver, but defaults to a public placeholder rather than a fake
+    ``hermes-agent.local`` endpoint.
 
     The returned dict is the ``features.slash_commands`` portion only —
     callers compose it into a full manifest (or merge into an existing
@@ -977,6 +1000,7 @@ def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/comm
     schema (display_information, oauth_config, settings, etc.) which users
     set up once in the Slack UI and rarely change.
     """
+    request_url = _resolve_slack_slash_request_url(request_url)
     slashes = []
     for name, desc, usage in slack_native_slashes():
         entry = {

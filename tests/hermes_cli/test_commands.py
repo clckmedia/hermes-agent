@@ -301,8 +301,9 @@ class TestSlackNativeSlashes:
 
     def test_includes_curated_commands(self):
         names = {n for n, _d, _h in slack_native_slashes()}
-        for expected in ("hermes", "new", "stop", "btw", "background", "model", "commands"):
+        for expected in ("hermes", "reset", "stop", "btw", "background", "model", "commands"):
             assert expected in names, f"missing curated /{expected}"
+        assert "new" not in names, "/new is omitted so high-use alias /reset fits Slack's 25-command cap"
 
     def test_excludes_reserved_slack_builtins(self):
         names = {n for n, _d, _h in slack_native_slashes()}
@@ -350,10 +351,21 @@ class TestSlackAppManifest:
         commands = [c["command"] for c in m["features"]["slash_commands"]]
         assert "/btw" in commands
 
+    def test_default_request_url_is_public_https_placeholder(self):
+        m = slack_app_manifest()
+        urls = {entry["url"] for entry in m["features"]["slash_commands"]}
+        assert urls == {"https://slack.com/slash-command-placeholder"}
+
     def test_custom_request_url(self):
         m = slack_app_manifest(request_url="https://example.com/slack")
         for entry in m["features"]["slash_commands"]:
             assert entry["url"] == "https://example.com/slack"
+
+    def test_env_request_url(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SLACK_SLASH_REQUEST_URL", "https://example.com/env-slack")
+        m = slack_app_manifest()
+        for entry in m["features"]["slash_commands"]:
+            assert entry["url"] == "https://example.com/env-slack"
 
 
 # ---------------------------------------------------------------------------

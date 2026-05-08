@@ -149,19 +149,21 @@ class TestAppMentionHandler:
         assert "assistant_thread_started" in registered_events
         assert "assistant_thread_context_changed" in registered_events
         # Slack slash commands are registered via a single regex matcher
-        # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
-        # /model, ...) so users get native-slash parity with Discord and
-        # Telegram. Verify the regex matches the key expected slashes.
+        # covering the curated 25-command native set (e.g. /hermes, /btw,
+        # /stop, /model). Reserved/built-in Slack names such as /help stay
+        # available through /hermes help, but are not native commands.
         assert len(registered_commands) == 1, (
             f"expected 1 combined slash matcher, got {registered_commands!r}"
         )
         slash_matcher = registered_commands[0]
         import re as _re
         assert isinstance(slash_matcher, _re.Pattern)
-        for expected in ("/hermes", "/btw", "/stop", "/model", "/help"):
+        for expected in ("/hermes", "/reset", "/btw", "/stop", "/model", "/commands"):
             assert slash_matcher.match(expected), (
                 f"Slack slash regex does not match {expected}"
             )
+        assert not slash_matcher.match("/new")
+        assert not slash_matcher.match("/help")
 
 
 class TestSlackConnectCleanup:
@@ -2081,6 +2083,35 @@ class TestSlashCommands:
         assert msg.text == "/btw fix the failing test"
 
     @pytest.mark.asyncio
+    async def test_slash_command_logs_safe_metadata_only(self, adapter, caplog):
+        """Slash diagnostics should help prove delivery without leaking payload secrets."""
+        command = {
+            "command": "/btw",
+            "text": "contains private instructions",
+            "user_id": "U1",
+            "channel_id": "C1",
+            "team_id": "T1",
+            "trigger_id": "123.456.secret",
+            "response_url": "https://hooks.slack.com/commands/T1/secret",
+        }
+
+        import logging
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.slack"):
+            await adapter._handle_slash_command(command)
+
+        assert "Slack slash command matched" in caplog.text
+        assert "command=/btw" in caplog.text
+        assert "team=T1" in caplog.text
+        assert "channel=C1" in caplog.text
+        assert "user=U1" in caplog.text
+        assert "text_len=29" in caplog.text
+        assert "trigger_id_present=True" in caplog.text
+        assert "response_url_present=True" in caplog.text
+        assert "contains private instructions" not in caplog.text
+        assert "123.456.secret" not in caplog.text
+        assert "hooks.slack.com" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_native_stop_slash_no_args(self, adapter):
         command = {
             "command": "/stop",
@@ -2134,6 +2165,109 @@ class TestSlashCommands:
         await adapter._handle_slash_command(command)
         msg = adapter.handle_message.call_args[0][0]
         assert msg.text == "what's the weather today?"
+
+
+# ---------------------------------------------------------------------------
+# Mention-prefixed slash controls in Slack threads
+# ---------------------------------------------------------------------------
+
+
+class TestMentionPrefixedSlashControls:
+    """Bot mention + slash text must arrive at the gateway as a command."""
+
+    async def _dispatch_thread_message(
+        self,
+        adapter,
+        text: str,
+        *,
+        thread_context: str = "",
+        blocks: list | None = None,
+    ) -> MessageEvent:
+        adapter._resolve_user_name = AsyncMock(return_value="Damien")
+        adapter._fetch_thread_context = AsyncMock(return_value=thread_context)
+        adapter._fetch_thread_parent_text = AsyncMock(return_value="")
+        adapter._team_bot_user_ids["T_TEAM"] = "U_BOT"
+
+        payload = {
+            "text": text,
+            "user": "U_USER",
+            "channel": "C_THREAD",
+            "channel_type": "channel",
+            "thread_ts": "171.000",
+            "ts": "171.111",
+            "team": "T_TEAM",
+        }
+        if blocks is not None:
+            payload["blocks"] = blocks
+
+        await adapter._handle_slack_message(payload)
+
+        return adapter.handle_message.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw_text,expected_text,expected_command,expected_args",
+        [
+            ("<@U_BOT> /reset", "/reset", "reset", ""),
+            ("<@U_BOT> /new", "/new", "new", ""),
+            ("<@U_BOT> /status", "/status", "status", ""),
+            ("<@U_BOT> /usage", "/usage", "usage", ""),
+            ("<@U_BOT> /title CLCK ops", "/title CLCK ops", "title", "CLCK ops"),
+            ("<@U_BOT> /reasoning", "/reasoning", "reasoning", ""),
+            ("<@U_BOT> /reasoning high", "/reasoning high", "reasoning", "high"),
+            ("<@U_BOT> /reasoning xhigh", "/reasoning xhigh", "reasoning", "xhigh"),
+        ],
+    )
+    async def test_bot_mention_prefixed_slash_text_becomes_gateway_command(
+        self,
+        adapter,
+        raw_text,
+        expected_text,
+        expected_command,
+        expected_args,
+    ):
+        msg = await self._dispatch_thread_message(
+            adapter,
+            raw_text,
+            thread_context="[Thread context should not prefix commands]\n",
+            blocks=[
+                {
+                    "type": "rich_text",
+                    "elements": [
+                        {
+                            "type": "rich_text_section",
+                            "elements": [{"type": "text", "text": "ignored block payload"}],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        assert msg.text == expected_text
+        adapter._fetch_thread_context.assert_not_called()
+        assert msg.message_type is MessageType.COMMAND
+        assert msg.get_command() == expected_command
+        assert msg.get_command_args() == expected_args
+        assert msg.source.platform is Platform.SLACK
+        assert msg.source.chat_type == "group"
+        assert msg.source.thread_id == "171.000"
+        assert msg.reply_to_message_id == "171.000"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw_text,expected_text",
+        [
+            ("<@U_BOT> reset yourself", "reset yourself"),
+            ("<@U_BOT> reset this thread", "reset this thread"),
+            ("<@U_BOT> please /reset this conversation", "please /reset this conversation"),
+        ],
+    )
+    async def test_bot_mention_prose_is_not_rewritten(self, adapter, raw_text, expected_text):
+        msg = await self._dispatch_thread_message(adapter, raw_text)
+
+        assert msg.text == expected_text
+        assert msg.message_type is MessageType.TEXT
+        assert msg.get_command() is None
 
 
 # ---------------------------------------------------------------------------
