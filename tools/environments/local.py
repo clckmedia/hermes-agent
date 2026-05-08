@@ -1,5 +1,6 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
+import logging
 import os
 import platform
 import shutil
@@ -10,6 +11,24 @@ import tempfile
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 
 _IS_WINDOWS = platform.system() == "Windows"
+logger = logging.getLogger(__name__)
+
+
+def _valid_local_cwd(path: str | None) -> bool:
+    return bool(path) and os.path.isabs(path) and os.path.isdir(path)
+
+
+def _safe_local_cwd(path: str | None, *, fallback: str | None = None) -> str:
+    if path:
+        expanded = os.path.abspath(os.path.expanduser(path))
+        if _valid_local_cwd(expanded):
+            return expanded
+        logger.warning("Invalid local terminal cwd %r; falling back", path)
+    fallback_path = fallback or os.getcwd()
+    expanded_fallback = os.path.abspath(os.path.expanduser(fallback_path))
+    if _valid_local_cwd(expanded_fallback):
+        return expanded_fallback
+    return "/"
 
 
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
@@ -305,9 +324,7 @@ class LocalEnvironment(BaseEnvironment):
     """
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
-        if cwd:
-            cwd = os.path.expanduser(cwd)
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        super().__init__(cwd=_safe_local_cwd(cwd), timeout=timeout, env=env)
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -338,7 +355,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None,
+                  popen_cwd: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
@@ -353,6 +371,8 @@ class LocalEnvironment(BaseEnvironment):
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
+        spawn_cwd = _safe_local_cwd(popen_cwd or self.cwd)
+
         proc = subprocess.Popen(
             args,
             text=True,
@@ -363,7 +383,7 @@ class LocalEnvironment(BaseEnvironment):
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=self.cwd,
+            cwd=spawn_cwd,
         )
 
         if stdin_data is not None:
@@ -391,15 +411,23 @@ class LocalEnvironment(BaseEnvironment):
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed)."""
+        previous_cwd = self.cwd
         try:
             cwd_path = open(self._cwd_file).read().strip()
             if cwd_path:
-                self.cwd = cwd_path
+                if _valid_local_cwd(cwd_path):
+                    self.cwd = cwd_path
+                else:
+                    logger.warning("Ignoring invalid local cwd update: %r", cwd_path)
         except (OSError, FileNotFoundError):
             pass
 
-        # Still strip the marker from output so it's not visible
+        # Still strip the marker from output so it's not visible. The base
+        # parser may update self.cwd from stdout; guard that local state too.
         self._extract_cwd_from_output(result)
+        if not _valid_local_cwd(self.cwd):
+            logger.warning("Ignoring invalid local cwd marker: %r", self.cwd)
+            self.cwd = previous_cwd if _valid_local_cwd(previous_cwd) else _safe_local_cwd(None)
 
     def cleanup(self):
         """Clean up temp files."""

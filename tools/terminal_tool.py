@@ -1737,6 +1737,14 @@ def terminal_tool(
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
         # Validate workdir against shell injection
+        if workdir is not None and not isinstance(workdir, str):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": f"Invalid workdir: expected string, got {type(workdir).__name__}",
+                "status": "error",
+            }, ensure_ascii=False)
+
         if workdir:
             workdir_error = _validate_workdir(workdir)
             if workdir_error:

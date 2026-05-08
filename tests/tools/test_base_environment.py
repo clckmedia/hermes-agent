@@ -16,7 +16,7 @@ class _TestableEnv(BaseEnvironment):
     def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
 
-    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None, popen_cwd=None):
         raise NotImplementedError("Use mock")
 
     def cleanup(self):
@@ -163,20 +163,17 @@ class TestInitSessionFailure:
         env._snapshot_ready = False
 
         calls = []
-        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
-            calls.append({"login": login})
-            # Return a mock process handle
-            mock = MagicMock()
-            mock.poll.return_value = 0
-            mock.returncode = 0
-            mock.stdout = iter([])
-            return mock
+        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None, popen_cwd=None):
+            calls.append({"login": login, "popen_cwd": popen_cwd})
+            return MagicMock()
 
         env._run_bash = mock_run_bash
+        env._wait_for_process = lambda proc, timeout=120: {"output": "", "returncode": 0}
         env.execute("echo test")
 
         assert len(calls) == 1
         assert calls[0]["login"] is True
+        assert calls[0]["popen_cwd"] == "/tmp"
 
 
 class TestCwdMarker:

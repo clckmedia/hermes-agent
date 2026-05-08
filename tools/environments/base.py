@@ -310,6 +310,7 @@ class BaseEnvironment(ABC):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        popen_cwd: str | None = None,
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*.
 
@@ -351,7 +352,12 @@ class BaseEnvironment(ABC):
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
         try:
-            proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
+            proc = self._run_bash(
+                bootstrap,
+                login=True,
+                timeout=self._snapshot_timeout,
+                popen_cwd=self.cwd,
+            )
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
             self._snapshot_ready = True
             self._update_cwd(result)
@@ -756,7 +762,11 @@ class BaseEnvironment(ABC):
         login = not self._snapshot_ready
 
         proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+            wrapped,
+            login=login,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
+            popen_cwd=effective_cwd,
         )
         result = self._wait_for_process(proc, timeout=effective_timeout)
         self._update_cwd(result)
