@@ -962,7 +962,7 @@ class TestHubSpotSupportTriage:
         assert "Recommended internal next action: Request/grant HubSpot portal access before inspection; keep triage and reply drafting internal." in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
 
-    def test_requested_hubspot_change_formats_approval_benson_no_write_card(self):
+    def test_requested_hubspot_change_formats_owner_scope_no_write_card(self):
         adapter = _make_adapter()
         card = adapter._format_hubspot_support_triage_card(
             {
@@ -989,10 +989,208 @@ class TestHubSpotSupportTriage:
             }
         )
 
-        assert "Owner/assignee hint: Benson" in card
-        assert "Risk/action level: HubSpot change requested; approval required" in card
-        assert "Recommended internal next action: Benson to inspect read-only and propose the exact change; Damien approves before any HubSpot write." in card
+        assert "Owner/assignee hint: Damien" in card
+        assert "Risk/action level: HubSpot change requested; scope check required before implementation" in card
+        assert "Recommended internal next action: Damien to action the in-scope HubSpot support tasks" in card
+        assert "approval before write" not in card.lower()
+        assert "Thanks Lynne" not in card
+        assert "Draft client reply: Thanks for sending this through." in card
+        assert "Damien approves before any HubSpot write" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_meta_pixel_forward_is_compact_and_does_not_unfurl_or_split_context(self):
+        adapter = _make_adapter()
+        forwarded = (
+            "---------- Forwarded message --------- From: Consultant <consultant@example.com> Date: Mon, 11 May 2026 at 13:04 "
+            "Subject: Re: Adding correct meta pixel to hubspot To: Owner <owner@example-client.com> "
+            "Hi Team Just following up on this one - can you help us get the correct meta pixel sorted in Hubspot? Cheers Consultant "
+            "M: 0400 000 000 E: consultant@example.com W: exampleagency.com.au https://www.exampleagency.com.au/ "
+            "On Thu, May 7, 2026 at 6:54 PM Consultant <consultant@example.com> wrote: Hi Team I just noticed the client meta account is connected to hubspot, "
+            "however the meta pixel is incorrect and im not able to add the correct one which is - Pixel - 372314372061830 Can you help me get this fixed?"
+        )
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Owner <owner@example-client.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: Adding correct meta pixel to hubspot",
+                },
+                "support": {"summary": forwarded, "requires_hubspot_access": True},
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Client",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "123456",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "read_only_findings": [
+                        "Matched client: Example Client.",
+                        "The request is clear enough to inspect read-only, but this support layer does not yet have a dedicated inspector for this HubSpot settings area.",
+                    ],
+                    "recommended_internal_action": "Open the matched HubSpot portal read-only and inspect the relevant settings area; get approval before any change.",
+                },
+            }
+        )
+
+        assert "Request summary: Client asked CLCK to help get the correct Meta pixel sorted in HubSpot" in card
+        assert "Pixel ID: 372314372061830" in card
+        assert "Client ask: Client asked CLCK" in card
+        assert "Recommended internal next action: Open the matched HubSpot portal read-only" in card
+        assert "Forwarded message" not in card
+        assert "Vacationer" not in card
+        assert "Three Peaks" not in card
+        assert "exampleagency.com.au" not in card
+        assert "https://" not in card
+        assert "On Thu, May 7" not in card
+        assert len(card) < 2200
+
+    def test_forwarded_hubspot_feedback_is_summarised_without_damien_approval_boilerplate(self):
+        adapter = _make_adapter()
+        forwarded = (
+            "---------- Forwarded message --------- From: Project Lead <lead@example.org> Date: Mon, 11 May 2026 at 13:46 "
+            "Subject: Re: HubSpot next steps from our call To: Account Manager <am@example.com> "
+            "Cc: Owner <owner@example-client.com> Hello Team Thanks for your patience. I have some feedback and may have more later in the week. "
+            "1. Regions have been assigned, can you please add a Goldfields region. "
+            "2. Please review/hide sidebar and contact-view fields including Sales, Service, preferred channels, favourite content topics, and legacy data. "
+            "3. Please add association labels School, ATSI, and CALD. "
+            "4. Can we add more form fields later, including medical information for selected contacts only? "
+            "5. Is it better to integrate Humanitix or HubSpot event landing pages for attendance tracking? Thanks "
+            "------------------------------ From: Account Manager <am@example.com> Sent: 06 May 2026"
+        )
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Owner <owner@example-client.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: HubSpot next steps from our call",
+                },
+                "support": {
+                    "summary": forwarded,
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Association",
+                    "assignee_hint": "Benson",
+                    "portal_id": "442702262",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "clarification_question": "What exact HubSpot change is being requested, and has Damien approved implementation?",
+                    "recommended_internal_action": "Inspect read-only first, then get Damien approval before any HubSpot write.",
+                },
+            }
+        )
+
+        assert "Request summary: Hello Team Thanks for your patience" in card
+        assert "add a Goldfields region" in card
+        assert "association labels School, ATSI, and CALD" in card
+        assert "Humanitix or HubSpot event landing pages" in card
+        assert "Clarification question:" not in card
+        assert "has Damien approved" not in card
+        assert "Damien approval" not in card
+        assert "Forwarded message" not in card
+        assert "From: Account Manager" not in card
+        assert "Owner/assignee hint: Benson" in card
+        assert "Risk/action level: HubSpot change requested; scope check required before implementation" in card
+        assert "approval before write" not in card.lower()
+
+    @pytest.mark.parametrize("event_platform", ["Humanitix", "Humantix"])
+    def test_forwarded_hubspot_feedback_tolerates_event_platform_spelling_variants(self, event_platform):
+        adapter = _make_adapter()
+        summary = (
+            "Hello Team Can we add association labels School, ATSI, and CALD, "
+            f"and decide whether {event_platform} or HubSpot event landing pages are better for attendance tracking?"
+        )
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {"source_mailbox": "support@clck.com.au", "subject": "HubSpot feedback"},
+                "support": {
+                    "summary": summary,
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Association",
+                    "assignee_hint": "Benson",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+            }
+        )
+
+        assert f"{event_platform} or HubSpot event landing pages" in card
+        assert "Forwarded message" not in card
+
+    def test_evidence_supported_reasoning_client_ask_is_preserved_for_hubspot_change(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {"source_mailbox": "support@clck.com.au", "subject": "HubSpot change"},
+                "support": {
+                    "summary": "Client asks CLCK to update HubSpot properties after a forwarded email.",
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Client",
+                    "assignee_hint": "Benson",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "status": "evidence_supported",
+                    "evidence_supported": True,
+                    "client_ask": "Specific ask from reasoning: review lifecycle stage property visibility before replying.",
+                },
+            }
+        )
+
+        assert "Client ask: Specific ask from reasoning: review lifecycle stage property visibility before replying." in card
+        assert "Client ask: Client asks CLCK to update HubSpot properties" not in card
+
+    def test_vague_hubspot_change_retains_clarification_question(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {"source_mailbox": "support@clck.com.au", "subject": "HubSpot change"},
+                "support": {
+                    "summary": "Please update HubSpot.",
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Client",
+                    "assignee_hint": "Benson",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "clarification_question": "What exact HubSpot change is being requested?",
+                },
+            }
+        )
+
+        assert "Clarification question: What exact HubSpot change is being requested?" in card
+        assert "Draft intentionally withheld: What exact HubSpot change is being requested?" in card
 
     @pytest.mark.asyncio
     async def test_existing_support_reasoning_is_not_enriched_again(self):

@@ -867,6 +867,66 @@ class WebhookAdapter(BasePlatformAdapter):
                 return False
             return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+        def _collapse_whitespace(value: str) -> str:
+            return " ".join(str(value or "").split()).strip()
+
+        def _trim_forwarded_request(value: str) -> str:
+            text = str(value or "")
+            text = text.replace("\r", "\n")
+            # Remove common forwarded-email transport headers so cards start with the ask.
+            marker = re.search(
+                r"\b(?:Hello|Hi|Hey)\s+(?:[A-Za-z][A-Za-z'-]+|team|there|all)\b",
+                text,
+                flags=re.I,
+            )
+            if marker:
+                text = text[marker.start():]
+            else:
+                text = re.sub(r"^-+\s*Forwarded message\s*-+\s*", "", text, flags=re.I)
+            # Keep the newest client reply, not the whole historical thread.
+            text = re.split(
+                r"\s[-—]{5,}\s*From\s*:|\s+On\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|\d{1,2})\b.+?\bwrote\s*:",
+                text,
+                maxsplit=1,
+                flags=re.I,
+            )[0]
+            return _collapse_whitespace(text)
+
+        def _strip_contact_noise(value: str) -> str:
+            text = str(value or "")
+            # Strip obvious signature/link noise so Slack does not create detached link unfurls.
+            text = re.sub(r"\bhttps?://\S+", "", text, flags=re.I)
+            text = re.sub(r"\bwww\.\S+", "", text, flags=re.I)
+            text = re.sub(
+                r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+                "",
+                text,
+                flags=re.I,
+            )
+            text = re.sub(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", "", text)
+            return _collapse_whitespace(text)
+
+        def _compact_support_summary(value: str, limit: int = 700) -> str:
+            text = _strip_contact_noise(_trim_forwarded_request(value))
+            return text[:limit] if text else str(value or "")
+
+        def _summarise_hubspot_change_request(value: str) -> str:
+            return _compact_support_summary(value)
+
+        def _summarise_support_request(value: str) -> str:
+            raw = str(value or "")
+            text = _compact_support_summary(raw)
+            lower = text.lower()
+            if "meta pixel" in lower and "hubspot" in lower:
+                pixel_match = re.search(r"\bpixel\s*[-:–—]?\s*(\d{8,})\b", raw, flags=re.I)
+                pixel_suffix = f" Pixel ID: {pixel_match.group(1)}." if pixel_match else ""
+                return (
+                    "Client asked CLCK to help get the correct Meta pixel sorted in HubSpot; "
+                    "the current Meta account appears connected but the pixel is wrong or cannot be added."
+                    f"{pixel_suffix}"
+                )
+            return text[:700] if text else raw
+
         gmail = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
         support = payload.get("support") if isinstance(payload.get("support"), dict) else {}
         matcher = payload.get("matcher") if isinstance(payload.get("matcher"), dict) else None
@@ -1007,7 +1067,8 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         elif hubspot_change:
             issue_type = "HubSpot configuration change request"
-            client_ask = summary
+            client_ask = _summarise_hubspot_change_request(summary)
+            summary = client_ask
             likely_system_area = "HubSpot CRM configuration"
         elif scope_decision:
             issue_type = "scope/commercial question"
@@ -1015,7 +1076,8 @@ class WebhookAdapter(BasePlatformAdapter):
             likely_system_area = "CLCK commercial/scope decision"
         elif requires_hubspot:
             issue_type = "HubSpot read-only support check"
-            client_ask = summary
+            client_ask = _summarise_support_request(summary)
+            summary = client_ask
             likely_system_area = "HubSpot portal inspection"
 
         def _compact_findings(value: Any) -> str:
@@ -1044,26 +1106,69 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if reasoning:
             issue_type = _text(reasoning.get("issue_type"), issue_type)
-            client_ask = _text(reasoning.get("client_ask"), client_ask)
+            reasoning_client_ask = _text(reasoning.get("client_ask"), "")
+            if reasoning_client_ask:
+                client_ask = reasoning_client_ask
             likely_system_area = _text(reasoning.get("likely_system_area"), likely_system_area)
+            reasoning_issue_type = issue_type.lower()
+            if "hubspot change" in reasoning_issue_type or "hubspot configuration" in reasoning_issue_type:
+                hubspot_change = True
+                scope_decision = False
+
+        def _hubspot_change_has_actionable_detail(value: str) -> bool:
+            text = _summarise_hubspot_change_request(value).lower()
+            words = re.findall(r"[a-z0-9]+", text)
+            if len(words) < 12:
+                return False
+            action_terms = (
+                "add ",
+                "remove",
+                "hide",
+                "restrict",
+                "field",
+                "form",
+                "notification",
+                "association",
+                "label",
+                "permission",
+                "commerce",
+                "pipeline",
+                "property",
+                "workflow",
+                "deal",
+                "ticket",
+                "pixel",
+                "event landing",
+                "humanitix",
+                "humantix",
+            )
+            return any(term in text for term in action_terms)
+
+        generic_change_clarification = bool(
+            clarification_question
+            and matched
+            and hubspot_change
+            and _hubspot_change_has_actionable_detail(summary or client_ask)
+            and re.search(r"what exact hubspot change|has damien approved|exact hubspot change", clarification_question, re.I)
+        )
+        if generic_change_clarification:
+            clarification_question = ""
 
         raw_owner = matcher.get("assignee_hint") or matcher.get("owner_primary") or payload.get("owner")
         if hubspot_change:
-            owner_hint = "Benson"
-            risk_level = "HubSpot change requested; approval required"
+            owner_hint = _text(raw_owner, "unknown/manual review")
+            risk_level = "HubSpot change requested; scope check required before implementation"
             if hubspot_access_needed:
                 next_action = (
-                    "Request/grant HubSpot portal access before Benson inspects or proposes the exact change; "
-                    "Damien approves before any HubSpot write."
+                    "Request/grant HubSpot portal access, then scope the requested HubSpot changes against the client service record before assigning implementation tasks."
                 )
             else:
                 next_action = (
-                    "Benson to inspect read-only and propose the exact change; "
-                    "Damien approves before any HubSpot write."
+                    f"{owner_hint} to action the in-scope HubSpot support tasks and flag only specific scope/input risks from the scoped findings."
                 )
             draft_reply = (
-                "Thanks for this. I’m going to check the right HubSpot setup and confirm "
-                "the change before anything is updated. I’ll come back to you shortly."
+                "Thanks for sending this through. I’ll check it against the HubSpot support scope, turn the in-scope items into tasks, "
+                "and flag any specific inputs or scope boundaries rather than waiting on a generic approval step."
             )
         elif scope_decision:
             owner_hint = "Damien"
@@ -1122,18 +1227,45 @@ class WebhookAdapter(BasePlatformAdapter):
             next_action = "Owner to review the draft and approve the reply before anything is sent."
             draft_reply = "Thanks for this. I’ll take a look and come back with the next step shortly."
 
-        if reasoning:
-            next_action = _text(
-                reasoning.get("recommended_internal_action") or reasoning.get("recommended_next_action"),
-                next_action,
+        def _is_unsafe_hubspot_change_boilerplate(value: str) -> bool:
+            text = str(value or "")
+            return bool(
+                re.search(
+                    r"damien\s+approv\w*|has damien approved|exact hubspot change|propose the exact change",
+                    text,
+                    re.I,
+                )
             )
+
+        if reasoning:
+            proposed_next_action = _text(
+                reasoning.get("recommended_internal_action") or reasoning.get("recommended_next_action"),
+                "",
+            )
+            if proposed_next_action and not (
+                hubspot_change
+                and matched
+                and _is_unsafe_hubspot_change_boilerplate(proposed_next_action)
+            ):
+                next_action = proposed_next_action
             reasoning_status = _text(reasoning.get("status") or reasoning.get("evidence_status"), "").lower()
             evidence_supported = _truthy(reasoning.get("evidence_supported")) or reasoning_status in {
                 "supported",
+                "scoped",
                 "evidence_supported",
                 "complete",
                 "ok",
             }
+            reasoning_risk = _text(reasoning.get("risk_action_level") or reasoning.get("risk_level"), "")
+            if reasoning_risk:
+                risk_level = reasoning_risk
+            if evidence_supported and read_only_findings:
+                if hubspot_change and reasoning_status == "scoped":
+                    hubspot_status = "portal/token found; support scope check completed; no writes in MVP."
+                else:
+                    hubspot_status = "portal/token found; read-only inspection completed; no writes in MVP."
+                if requires_hubspot and not hubspot_change and not ticket_routing_question:
+                    risk_level = "read-only findings available; approval required before HubSpot write"
             reasoning_draft = _text(
                 reasoning.get("draft_client_reply") or reasoning.get("draft_reply"), ""
             )
