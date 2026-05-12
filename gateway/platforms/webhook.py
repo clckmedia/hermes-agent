@@ -906,26 +906,33 @@ class WebhookAdapter(BasePlatformAdapter):
             text = re.sub(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", "", text)
             return _collapse_whitespace(text)
 
-        def _compact_support_summary(value: str, limit: int = 700) -> str:
+        def _clip(value: str, limit: int) -> str:
+            text = _collapse_whitespace(value)
+            if len(text) <= limit:
+                return text
+            return text[: max(0, limit - 1)].rstrip() + "…"
+
+        def _compact_support_summary(value: str, limit: int = 480) -> str:
             text = _strip_contact_noise(_trim_forwarded_request(value))
-            return text[:limit] if text else str(value or "")
+            return _clip(text, limit) if text else _clip(str(value or ""), limit)
 
         def _summarise_hubspot_change_request(value: str) -> str:
-            return _compact_support_summary(value)
+            return _compact_support_summary(value, limit=700)
 
         def _summarise_support_request(value: str) -> str:
             raw = str(value or "")
-            text = _compact_support_summary(raw)
+            text = _compact_support_summary(raw, limit=520)
             lower = text.lower()
             if "meta pixel" in lower and "hubspot" in lower:
                 pixel_match = re.search(r"\bpixel\s*[-:–—]?\s*(\d{8,})\b", raw, flags=re.I)
                 pixel_suffix = f" Pixel ID: {pixel_match.group(1)}." if pixel_match else ""
-                return (
+                return _clip(
                     "Client asked CLCK to help get the correct Meta pixel sorted in HubSpot; "
                     "the current Meta account appears connected but the pixel is wrong or cannot be added."
-                    f"{pixel_suffix}"
+                    f"{pixel_suffix}",
+                    520,
                 )
-            return text[:700] if text else raw
+            return _clip(text if text else raw, 520)
 
         gmail = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
         support = payload.get("support") if isinstance(payload.get("support"), dict) else {}
@@ -1276,25 +1283,25 @@ class WebhookAdapter(BasePlatformAdapter):
 
         lines = [
             "**CLCK HubSpot support triage**",
-            f"- Request summary: {summary}",
-            f"- Issue type: {issue_type}",
-            f"- Client ask: {client_ask}",
-            f"- Likely system area: {likely_system_area}",
-            f"- Sender/source/subject: {sender} / {source_mailbox} / {subject}",
-            f"- Client match: {match_line}",
-            f"- Owner/assignee hint: {owner_hint}",
-            f"- Risk/action level: {risk_level}",
-            f"- HubSpot status: {hubspot_status}",
+            f"- Request summary: {_clip(summary, 700)}",
+            f"- Issue type: {_clip(issue_type, 160)}",
+            f"- Client ask: {_clip(client_ask, 420)}",
+            f"- Likely system area: {_clip(likely_system_area, 240)}",
+            f"- Sender/source/subject: {_clip(sender, 120)} / {_clip(source_mailbox, 120)} / {_clip(subject, 180)}",
+            f"- Client match: {_clip(match_line, 180)}",
+            f"- Owner/assignee hint: {_clip(owner_hint, 120)}",
+            f"- Risk/action level: {_clip(risk_level, 260)}",
+            f"- HubSpot status: {_clip(hubspot_status, 260)}",
         ]
         if read_only_findings:
-            lines.append(f"- Read-only findings: {read_only_findings}")
+            lines.append(f"- Read-only findings: {_clip(read_only_findings, 760)}")
         if processing_hint_line:
-            lines.append(f"- {processing_hint_line}")
+            lines.append(f"- {_clip(processing_hint_line, 220)}")
         if clarification_question:
-            lines.append(f"- Clarification question: {clarification_question}")
+            lines.append(f"- Clarification question: {_clip(clarification_question, 360)}")
         lines.extend([
-            f"- Recommended internal next action: {next_action}",
-            f"- Draft client reply: {draft_reply}",
+            f"- Recommended internal next action: {_clip(next_action, 620)}",
+            f"- Draft client reply: {_clip(draft_reply, 500)}",
             "- Safety: no email sent; no HubSpot write; no client Slack post.",
         ])
         return "\n".join(lines)

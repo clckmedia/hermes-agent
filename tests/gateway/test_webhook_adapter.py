@@ -1049,6 +1049,66 @@ class TestHubSpotSupportTriage:
         assert "On Thu, May 7" not in card
         assert len(card) < 2200
 
+    def test_scoped_reasoning_renders_compact_single_card_without_unrelated_leak(self):
+        adapter = _make_adapter()
+        long_summary = (
+            "Hi team, could you review the HubSpot process I've been setting up for our Example Client onboarding, "
+            "specifically the agreement acceptance form and checkbox workflow. Here's a summary of what I've built so far. "
+            "I've created a HubSpot landing page that contains a form requiring clients to accept our terms before platform access is activated. "
+            "The process involves three custom contact properties: agreement checkbox, agreement date, and agreement version. " * 4
+        )
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Account Manager <am@example.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: HubSpot agreement form and checkbox process review",
+                },
+                "support": {
+                    "summary": long_summary,
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "matched_by": "trusted_text_alias",
+                    "client_name": "Example Client",
+                    "owner_primary": "Ops",
+                    "assignee_hint": "Ops",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "status": "scoped",
+                    "issue_type": "HubSpot change request",
+                    "client_ask": "Review the Example Client HubSpot agreement acceptance form, checkbox workflow, agreement-date/version properties, and activation handoff.",
+                    "likely_system_area": "HubSpot landing pages/forms, contact properties, workflows, and external platform activation handoff.",
+                    "read_only_findings": [
+                        "Matched client: Example Client.",
+                        "Scope basis: client route services = HubSpot; HubSpot support active = yes.",
+                        "In-scope HubSpot support/config tasks: Review the HubSpot agreement/terms acceptance process for correct consent capture and operational handoff before platform access is activated. | Check the custom contact properties, checkbox field type, required-field behaviour, and date/version capture against the requested process. | Review the workflow logic that stamps agreement date/version and gates or triggers the platform-access activation step.",
+                        "Client/input needed before specific build steps: Final approved agreement text, version label, and who owns approval of the wording. | Whether HubSpot or the external platform/tech team is source of truth for activating platform access.",
+                    ],
+                    "risk_action_level": "Scoped HubSpot support request; action in-scope config tasks and flag only listed scope/input risks.",
+                    "recommended_internal_action": "Create/assign the in-scope HubSpot support tasks now, using the scoped list above. Flag only the listed inputs/scope risks before committing those specific items; do not send a generic holding reply.",
+                    "draft_client_reply": "Thanks for sending this through. I’ve checked it against Example Client’s HubSpot support scope. The in-scope support tasks are the agreement acceptance process, the custom properties/checkbox/date/version capture, and the workflow activation handoff. The main items to confirm before build are final wording/version ownership and whether HubSpot or the external platform is source of truth for access activation.",
+                },
+            }
+        )
+
+        assert "Client match: matched client: Example Client" in card
+        assert "HubSpot status: portal/token found; support scope check completed; no writes in MVP." in card
+        assert "agreement/terms acceptance process" in card
+        assert "checkbox" in card
+        assert "platform access" in card
+        assert "Unrelated Client" not in card
+        assert "Legacy Region" not in card
+        assert "Previous Requester" not in card
+        assert "Event Platform" not in card
+        assert len(card) < 3600
+
     def test_forwarded_hubspot_feedback_is_summarised_without_damien_approval_boilerplate(self):
         adapter = _make_adapter()
         forwarded = (
