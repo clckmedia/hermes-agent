@@ -511,3 +511,42 @@ class TestFormBodyRedaction:
         text = "first=1\nsecond=2"
         # Should pass through (still subject to other redactors)
         assert "first=1" in redact_sensitive_text(text)
+
+
+class TestAccessLogAndEmbeddedParamRedaction:
+    def test_schemeless_http_request_target_query_redacted(self):
+        text = "POST /path?apiKey=syntheticSecret123&leadName=Jane HTTP/1.1"
+        result = redact_sensitive_text(text)
+        assert "syntheticSecret123" not in result
+        assert "apiKey=***" in result
+        assert "leadName=Jane" in result
+
+    def test_sensitive_alias_query_params_redacted(self):
+        text = (
+            "https://example.com/cb?"
+            "workspaceApiKey=sSynthetic&heyreachApiKey=valueWithsInside&authorization=syntheticAuth&ok=1"
+        )
+        result = redact_sensitive_text(text)
+        assert "sSynthetic" not in result
+        assert "valueWithsInside" not in result
+        assert "syntheticAuth" not in result
+        assert "workspaceApiKey=***" in result
+        assert "heyreachApiKey=***" in result
+        assert "authorization=***" in result
+        assert "ok=1" in result
+
+    def test_embedded_inbound_text_params_redacted(self):
+        text = "reply metadata key=syntheticSecret123 code=syntheticCode token=valueWithsInside note=safe"
+        result = redact_sensitive_text(text)
+        assert "syntheticSecret123" not in result
+        assert "syntheticCode" not in result
+        assert "valueWithsInside" not in result
+        assert "key=***" in result
+        assert "code=***" in result
+        assert "token=***" in result
+        assert "note=safe" in result
+
+    def test_substring_keys_still_do_not_trigger_embedded_redaction(self):
+        text = "token_count=42 session_id=abc key_name=public"
+        result = redact_sensitive_text(text)
+        assert result == text

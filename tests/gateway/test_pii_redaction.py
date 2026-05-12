@@ -145,3 +145,15 @@ class TestBuildSessionContextPromptRedaction:
         ctx = _make_context(user_id="U12345ABC", platform=Platform.SLACK)
         prompt = build_session_context_prompt(ctx, redact_pii=True)
         assert "U12345ABC" in prompt
+
+
+class TestGatewayInboundLogPreviewSecretRedaction:
+    def test_event_text_preview_is_redacted_before_clipping(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+        from gateway.run import _gateway_log_preview
+
+        text = "POST /classify-heyreach-reply?apiKey=syntheticSecret123&leadName=Jane HTTP/1.1"
+        preview = _gateway_log_preview(text, limit=200)
+        assert "syntheticSecret123" not in preview
+        assert "apiKey=***" in preview
+        assert "leadName=Jane" in preview

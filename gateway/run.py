@@ -121,6 +121,26 @@ def _auto_continue_freshness_window() -> float:
         return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
 
 
+def _redact_gateway_log_text(value: Any) -> str:
+    """Best-effort secret redaction for gateway log message fragments."""
+    text = "" if value is None else str(value)
+    if not text:
+        return text
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(text)
+        return "" if redacted is None else str(redacted)
+    except Exception:
+        return text
+
+
+def _gateway_log_preview(value: Any, limit: int = 80) -> str:
+    """Redact before clipping an inbound event.text preview for logs."""
+    redacted = _redact_gateway_log_text(value)
+    return redacted[:limit].replace("\n", " ")
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -4685,7 +4705,7 @@ class GatewayRunner:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = _gateway_log_preview(event.text, limit=80)
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r",
             _platform_name, source.user_name or source.user_id or "unknown",

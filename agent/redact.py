@@ -45,6 +45,10 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "workspaceapikey",
+    "workspace_api_key",
+    "heyreachapikey",
+    "heyreach_api_key",
     "client_secret",
     "password",
     "auth",
@@ -53,7 +57,25 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "private_key",
     "authorization",
     "key",
+    "code",
 })
+
+_SENSITIVE_KEY_ALIASES = frozenset(
+    re.sub(r"[^a-z0-9]", "", key.lower())
+    for key in (_SENSITIVE_QUERY_PARAMS | _SENSITIVE_BODY_KEYS)
+) | frozenset({
+    "apikey",
+    "workspaceapikey",
+    "heyreachapikey",
+    "accesstoken",
+    "refreshtoken",
+    "clientsecret",
+})
+
+
+def _is_sensitive_key_name(key: str) -> bool:
+    """Return True for exact sensitive key aliases, without substring matching."""
+    return re.sub(r"[^a-z0-9]", "", str(key or "").lower()) in _SENSITIVE_KEY_ALIASES
 
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
 # `export HERMES_REDACT_SECRETS=true`) cannot enable/disable redaction
@@ -108,8 +130,8 @@ _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+# JSON field patterns: "apiKey": "***", "token": "***", etc.
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|workspaceApiKey|workspace_api_key|heyreachApiKey|heyreach_api_key|token|secret|password|access_token|refresh_token|client_secret|auth(?:orization)?|code|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,
@@ -163,6 +185,19 @@ _URL_WITH_QUERY_RE = re.compile(
     r"([^\s?#]*)"                     # path
     r"\?([^\s#]+)"                    # query (required)
     r"(#\S*)?",                       # optional fragment
+)
+
+# HTTP access-log request targets can be schemeless, e.g.
+# `POST /path?apiKey=... HTTP/1.1`. URL regexes do not see these.
+_HTTP_REQUEST_TARGET_QUERY_RE = re.compile(
+    r"\b([A-Z]{3,10}\s+)(/[^\s?#]*)\?([^\s#]+)(\s+HTTP/\d(?:\.\d)?)",
+    re.IGNORECASE,
+)
+
+# Embedded text params from inbound payload previews, e.g.
+# `latest reply key=... code=...`. Exact key aliases only; no substring matches.
+_EMBEDDED_KV_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,64})(=)([^&#\s,;'\"<>)}\]]+)"
 )
 
 # URLs containing userinfo — `scheme://user:password@host` for ANY scheme
@@ -254,7 +289,7 @@ def _redact_query_string(query: str) -> str:
             parts.append(pair)
             continue
         key, _, value = pair.partition("=")
-        if key.lower() in _SENSITIVE_QUERY_PARAMS:
+        if _is_sensitive_key_name(key):
             parts.append(f"{key}=***")
         else:
             parts.append(pair)
@@ -265,7 +300,7 @@ def _redact_url_query_params(text: str) -> str:
     """Scan text for URLs with query strings and redact sensitive params.
 
     Catches opaque tokens that don't match vendor prefix regexes, e.g.
-    `https://example.com/cb?code=ABC123&state=xyz` → `...?code=***&state=xyz`.
+    `https://example.com/cb?code=***&state=xyz` → `...?code=***&state=xyz`.
     """
     def _sub(m: re.Match) -> str:
         scheme = m.group(1)
@@ -275,6 +310,28 @@ def _redact_url_query_params(text: str) -> str:
         fragment = m.group(5) or ""
         return f"{scheme}://{authority}{path}?{query}{fragment}"
     return _URL_WITH_QUERY_RE.sub(_sub, text)
+
+
+def _redact_schemeless_request_targets(text: str) -> str:
+    """Redact sensitive params in HTTP request targets without a URL scheme."""
+
+    def _sub(m: re.Match) -> str:
+        method, path, query, suffix = m.groups()
+        return f"{method}{path}?{_redact_query_string(query)}{suffix}"
+
+    return _HTTP_REQUEST_TARGET_QUERY_RE.sub(_sub, text)
+
+
+def _redact_embedded_sensitive_kv(text: str) -> str:
+    """Redact exact sensitive `key=value` aliases embedded in log text."""
+
+    def _sub(m: re.Match) -> str:
+        key, sep, value = m.groups()
+        if _is_sensitive_key_name(key):
+            return f"{key}{sep}***"
+        return m.group(0)
+
+    return _EMBEDDED_KV_RE.sub(_sub, text)
 
 
 def _redact_url_userinfo(text: str) -> str:
@@ -364,8 +421,14 @@ def redact_sensitive_text(text: str) -> str:
     # URL query params containing opaque tokens (?access_token=…&code=…)
     text = _redact_url_query_params(text)
 
+    # Schemeless HTTP request targets in access logs (`POST /path?apiKey=... HTTP/1.1`).
+    text = _redact_schemeless_request_targets(text)
+
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     text = _redact_form_body(text)
+
+    # Embedded inbound text params (`key=...`, `code=...`, etc.).
+    text = _redact_embedded_sensitive_kv(text)
 
     # Discord user/role mentions (<@snowflake_id>)
     text = _DISCORD_MENTION_RE.sub(lambda m: f"<@{'!' if '!' in m.group(0) else ''}***>", text)
