@@ -345,6 +345,183 @@ def test_get_scoped_platform_tools_supports_list_entries_for_channel_toolsets():
     assert "plusvibe" in enabled
 
 
+def test_get_scoped_platform_tools_exact_topic_override_wins_over_channel_override():
+    config = {
+        "platform_toolsets": {"zulip": ["web", "no_mcp"]},
+        "zulip": {
+            "channel_toolsets": {
+                "595300": ["file", "code_execution", "no_mcp"],
+            },
+            "topic_toolsets": [
+                {
+                    "ids": ["595300"],
+                    "topics": ["Tourism East"],
+                    "toolsets": ["terminal", "file", "no_mcp"],
+                },
+            ],
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595300",
+            parent_channel_id="595300",
+            thread_id="Tourism East",
+        )
+
+    assert enabled == {"terminal", "file"}
+
+
+def test_get_scoped_platform_tools_topic_prefix_override_wins_over_channel_override():
+    config = {
+        "platform_toolsets": {"zulip": ["web", "no_mcp"]},
+        "zulip": {
+            "channel_toolsets": {
+                "595300": ["file", "code_execution", "no_mcp"],
+            },
+            "topic_toolsets": [
+                {
+                    "ids": ["595300"],
+                    "topic_prefix": "-",
+                    "toolsets": ["terminal", "file", "code_execution", "no_mcp"],
+                },
+            ],
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595300",
+            parent_channel_id="595300",
+            thread_id="- Child 1 - Tourism East",
+        )
+
+    assert enabled == {"terminal", "file", "code_execution"}
+
+
+def test_get_scoped_platform_tools_non_matching_topic_falls_back_to_channel_override():
+    config = {
+        "platform_toolsets": {"zulip": ["web", "no_mcp"]},
+        "zulip": {
+            "channel_toolsets": {
+                "595300": ["file", "code_execution", "no_mcp"],
+            },
+            "topic_toolsets": [
+                {
+                    "ids": ["595300"],
+                    "topic_prefix": "-",
+                    "toolsets": ["terminal", "file", "code_execution", "no_mcp"],
+                },
+            ],
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595300",
+            parent_channel_id="595300",
+            thread_id="Tourism East",
+        )
+
+    assert enabled == {"file", "code_execution"}
+
+
+def test_get_scoped_platform_tools_non_matching_topic_falls_back_to_platform_default():
+    config = {
+        "platform_toolsets": {"zulip": ["web", "no_mcp"]},
+        "zulip": {
+            "topic_toolsets": [
+                {
+                    "ids": ["595300"],
+                    "topic_prefix": "-",
+                    "toolsets": ["terminal", "file", "code_execution", "no_mcp"],
+                },
+            ],
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595300",
+            parent_channel_id="595300",
+            thread_id="Tourism East",
+        )
+
+    assert enabled == {"web"}
+
+
+def test_get_scoped_platform_tools_topic_entry_without_channel_id_does_not_match_globally():
+    config = {
+        "platform_toolsets": {"zulip": ["web", "no_mcp"]},
+        "zulip": {
+            "topic_toolsets": [
+                {
+                    "topic_prefix": "-",
+                    "toolsets": ["terminal", "file", "code_execution", "no_mcp"],
+                },
+            ],
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595300",
+            parent_channel_id="595300",
+            thread_id="- Child 1 - Tourism East",
+        )
+
+    assert enabled == {"web"}
+
+
+def test_get_scoped_platform_tools_topic_entries_match_parent_and_stream_id_aliases():
+    config = {
+        "platform_toolsets": {"zulip": ["web", "no_mcp"]},
+        "zulip": {
+            "topic_toolsets": [
+                {
+                    "parent_channel_id": "595300",
+                    "topic": "Parent Alias",
+                    "toolsets": ["terminal", "file", "no_mcp"],
+                },
+                {
+                    "stream_id": "595301",
+                    "topic": "Stream Alias",
+                    "toolsets": ["file", "code_execution", "no_mcp"],
+                },
+            ],
+        },
+    }
+
+    with patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+        parent_enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595300",
+            parent_channel_id="595300",
+            thread_id="Parent Alias",
+        )
+        stream_enabled = _get_scoped_platform_tools(
+            config,
+            "zulip",
+            channel_id="stream:595301",
+            parent_channel_id="595301",
+            thread_id="Stream Alias",
+        )
+
+    assert parent_enabled == {"terminal", "file"}
+    assert stream_enabled == {"file", "code_execution"}
+
+
 def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "auth.json").write_text(

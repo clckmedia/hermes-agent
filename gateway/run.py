@@ -7301,6 +7301,7 @@ class GatewayRunner:
                     platform_key,
                     channel_id=source.chat_id,
                     parent_channel_id=channel_parent_id,
+                    thread_id=source.thread_id,
                     include_default_mcp_servers=False,
                 )
             )
@@ -10197,6 +10198,7 @@ class GatewayRunner:
                 platform_key,
                 channel_id=source.chat_id,
                 parent_channel_id=channel_parent_id,
+                thread_id=source.thread_id,
                 include_default_mcp_servers=False,
             )
         )
