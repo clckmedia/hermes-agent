@@ -82,6 +82,49 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+def _zulip_status_from_gateway_config() -> tuple[bool, str] | None:
+    """Return Zulip configured/home status from the effective gateway config.
+
+    Zulip can be loaded from ~/.hermes/secrets/zulip.env without exporting
+    ZULIP_BOT_API_KEY into the process environment. Use the same gateway config
+    loader as the live adapter instead of checking only os.environ.
+    """
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        gateway_config = load_gateway_config()
+        platform_config = gateway_config.platforms.get(Platform.ZULIP)
+    except Exception:
+        return None
+
+    if platform_config is None:
+        return None
+
+    credential = (platform_config.api_key or platform_config.token or "").strip()
+    home_channel = ""
+    if platform_config.home_channel is not None:
+        home_channel = str(getattr(platform_config.home_channel, "chat_id", "") or "")
+
+    return bool(credential), home_channel
+
+
+def _messaging_platform_status(name: str, token_var: str, home_var: str | None) -> tuple[bool, str]:
+    """Resolve messaging platform status for CLI display."""
+    if name == "Zulip":
+        zulip_status = _zulip_status_from_gateway_config()
+        if zulip_status is not None:
+            return zulip_status
+
+    token = os.getenv(token_var, "")
+    home_channel = ""
+    if home_var:
+        home_channel = os.getenv(home_var, "")
+    # Back-compat: QQBot home channel was renamed from QQ_HOME_CHANNEL to QQBOT_HOME_CHANNEL
+    if not home_channel and home_var == "QQBOT_HOME_CHANNEL":
+        home_channel = os.getenv("QQ_HOME_CHANNEL", "")
+    return bool(token), home_channel
+
+
 from hermes_constants import is_termux as _is_termux
 
 
@@ -352,15 +395,7 @@ def show_status(args):
     }
     
     for name, (token_var, home_var) in platforms.items():
-        token = os.getenv(token_var, "")
-        has_token = bool(token)
-        
-        home_channel = ""
-        if home_var:
-            home_channel = os.getenv(home_var, "")
-        # Back-compat: QQBot home channel was renamed from QQ_HOME_CHANNEL to QQBOT_HOME_CHANNEL
-        if not home_channel and home_var == "QQBOT_HOME_CHANNEL":
-            home_channel = os.getenv("QQ_HOME_CHANNEL", "")
+        has_token, home_channel = _messaging_platform_status(name, token_var, home_var)
         
         status = "configured" if has_token else "not configured"
         if home_channel:

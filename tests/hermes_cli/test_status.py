@@ -3,6 +3,24 @@ from types import SimpleNamespace
 from hermes_cli.status import show_status
 
 
+def _stub_status_dependencies(monkeypatch, tmp_path):
+    from hermes_cli import status as status_mod
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(status_mod, "get_env_path", lambda: tmp_path / ".env", raising=False)
+    monkeypatch.setattr(status_mod, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(status_mod, "load_config", lambda: {"model": "gpt-5.4"}, raising=False)
+    monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "openai-codex", raising=False)
+    monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "openai-codex", raising=False)
+    monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_qwen_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda exclude_pids=None: [], raising=False)
+    return status_mod
+
+
 def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-1234567890abcdef")
@@ -12,6 +30,37 @@ def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
     output = capsys.readouterr().out
     assert "Tavily" in output
     assert "tvly...cdef" in output
+
+
+def test_show_status_reports_zulip_configured_from_secret_env(monkeypatch, capsys, tmp_path):
+    _stub_status_dependencies(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("ZULIP_BOT_API_KEY", raising=False)
+    monkeypatch.delenv("ZULIP_HOME_CHANNEL", raising=False)
+
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    (secrets_dir / "zulip.env").write_text(
+        "\n".join(
+            [
+                "ZULIP_SITE=https://example.zulipchat.com",
+                "ZULIP_BOT_EMAIL=bot@example.zulipchat.com",
+                "ZULIP_BOT_API_KEY=dummy-zulip-key",
+                "ZULIP_HOME_CHANNEL=stream:123456/Test topic",
+                "ZULIP_HOME_CHANNEL_NAME=Test topic",
+                "ZULIP_DM_ONLY=false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "Zulip" in output
+    assert "Zulip         ✓ configured (home: stream:123456/Test topic)" in output
+    assert "Zulip         ✗ not configured" not in output
+
 
 
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):
