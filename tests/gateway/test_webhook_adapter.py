@@ -1098,6 +1098,13 @@ class TestHubSpotSupportTriage:
             }
         )
 
+        assert card.startswith("**CLCK HubSpot support triage**")
+        assert "`ST-" in card
+        assert "Reply in this thread with `@Arlo`" in card
+        assert "**1) Request**" in card
+        assert "**2) Routing / context**" in card
+        assert "**3) Findings**" in card
+        assert "**4) Recommended action**" in card
         assert "Client match: matched client: Example Client" in card
         assert "HubSpot status: portal/token found; support scope check completed; no writes in MVP." in card
         assert "agreement/terms acceptance process" in card

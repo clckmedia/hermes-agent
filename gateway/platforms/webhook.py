@@ -912,6 +912,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 return text
             return text[: max(0, limit - 1)].rstrip() + "…"
 
+        def _triage_ref(value: Any) -> str:
+            """Return a short stable reference for Slack thread follow-up."""
+            raw = _collapse_whitespace(value if value is not None else "")
+            if not raw:
+                return "ST-unknown"
+            digest = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:10].upper()
+            return f"ST-{digest}"
+
         def _compact_support_summary(value: str, limit: int = 480) -> str:
             text = _strip_contact_noise(_trim_forwarded_request(value))
             return _clip(text, limit) if text else _clip(str(value or ""), limit)
@@ -963,6 +971,15 @@ class WebhookAdapter(BasePlatformAdapter):
             or gmail.get("snippet")
             or gmail.get("body_preview"),
             "No summary supplied.",
+        )
+
+        triage_id = _triage_ref(
+            payload.get("event_key")
+            or payload.get("dedupe_key")
+            or gmail.get("message_id")
+            or gmail.get("id")
+            or gmail.get("rfc822_message_id")
+            or f"{sender}|{source_mailbox}|{subject}|{summary}"
         )
 
         decision = _text(matcher.get("decision") or matcher.get("match_result"), "fallback")
@@ -1283,23 +1300,41 @@ class WebhookAdapter(BasePlatformAdapter):
 
         lines = [
             "**CLCK HubSpot support triage**",
+            f"`{triage_id}` · Reply in this thread with `@Arlo` plus new facts/approval; this thread becomes the working session for this card.",
+            "",
+            "**1) Request**",
             f"- Request summary: {_clip(summary, 700)}",
-            f"- Issue type: {_clip(issue_type, 160)}",
             f"- Client ask: {_clip(client_ask, 420)}",
+            f"- Issue type: {_clip(issue_type, 160)}",
             f"- Likely system area: {_clip(likely_system_area, 240)}",
-            f"- Sender/source/subject: {_clip(sender, 120)} / {_clip(source_mailbox, 120)} / {_clip(subject, 180)}",
+            "",
+            "**2) Routing / context**",
             f"- Client match: {_clip(match_line, 180)}",
+            f"- HubSpot status: {_clip(hubspot_status, 260)}",
             f"- Owner/assignee hint: {_clip(owner_hint, 120)}",
             f"- Risk/action level: {_clip(risk_level, 260)}",
-            f"- HubSpot status: {_clip(hubspot_status, 260)}",
+            f"- Sender/source/subject: {_clip(sender, 120)} / {_clip(source_mailbox, 120)} / {_clip(subject, 180)}",
         ]
-        if read_only_findings:
-            lines.append(f"- Read-only findings: {_clip(read_only_findings, 760)}")
         if processing_hint_line:
             lines.append(f"- {_clip(processing_hint_line, 220)}")
+        section_number = 3
+        if read_only_findings:
+            lines.extend([
+                "",
+                f"**{section_number}) Findings**",
+                f"- Read-only findings: {_clip(read_only_findings, 760)}",
+            ])
+            section_number += 1
         if clarification_question:
-            lines.append(f"- Clarification question: {_clip(clarification_question, 360)}")
+            lines.extend([
+                "",
+                f"**{section_number}) Clarification needed**",
+                f"- Clarification question: {_clip(clarification_question, 360)}",
+            ])
+            section_number += 1
         lines.extend([
+            "",
+            f"**{section_number}) Recommended action**",
             f"- Recommended internal next action: {_clip(next_action, 620)}",
             f"- Draft client reply: {_clip(draft_reply, 500)}",
             "- Safety: no email sent; no HubSpot write; no client Slack post.",
