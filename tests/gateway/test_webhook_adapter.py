@@ -748,9 +748,56 @@ class TestHubSpotSupportTriage:
         assert "Request summary: Unknown sender needs HubSpot help." in card
         assert "Sender/source/subject: Unknown Person <unknown@example.invalid> / support@clck.com.au / Can you help?" in card
         assert "Client match: fallback/no_safe_match" in card
-        assert "Owner/assignee hint: unknown/manual review" in card
-        assert "Recommended internal next action: Manually confirm the client/route before replying." in card
+        assert "Owner/assignee hint: internal_review" in card
+        assert "Recommended internal next action: Scope this as a support@ work request in the fallback channel." in card
+        assert "Manually confirm the client/route" not in card
+        assert "Which support-active client" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_support_fallback_hubspot_request_ignores_stale_client_route_stall_reasoning(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Example Sender <sender@example.invalid>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: question and help",
+                },
+                "support": {
+                    "summary": (
+                        "Example Contact says HubSpot social media scheduling now only shows the example Instagram page, "
+                        "not the original example account, and asks how to get the original account to show in HubSpot."
+                    ),
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "fallback",
+                    "reason": "no_safe_match",
+                    "client_name": None,
+                    "assignee_hint": "internal_review",
+                },
+                "support_reasoning": {
+                    "issue_type": "HubSpot change request",
+                    "likely_system_area": "HubSpot CRM/configuration change path",
+                    "read_only_findings": ["Matcher did not produce a safe client route."],
+                    "recommended_internal_action": "Manually confirm the client and HubSpot portal before inspection or reply drafting.",
+                    "clarification_question": "Which support-active client should this request be routed to?",
+                    "evidence_status": "incomplete",
+                    "evidence_supported": False,
+                },
+            }
+        )
+
+        assert "Client match: fallback/no_safe_match" in card
+        assert "Issue type: HubSpot change request" in card
+        assert "Which support-active client" not in card
+        assert "Manually confirm the client" not in card
+        assert "Clarification needed" not in card
+        assert "Draft intentionally withheld" not in card
+        assert "Recommended internal next action: Scope this as a support@ work request in the fallback channel." in card
+        assert "internal_review to action the in-scope HubSpot support tasks" not in card
+        assert "Draft client reply: Thanks for sending this through. We’ll take a look at the HubSpot setup path" in card
 
     def test_explicit_client_hint_line_renders_and_directive_is_not_summary(self):
         adapter = _make_adapter()

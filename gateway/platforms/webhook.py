@@ -961,6 +961,9 @@ class WebhookAdapter(BasePlatformAdapter):
         source_mailbox = _text(
             gmail.get("source_mailbox") or gmail.get("to") or payload.get("source_mailbox")
         )
+        support_intake = "support@clck.com.au" in " ".join(
+            [source_mailbox.lower(), _text(gmail.get("to") or payload.get("to"), "").lower()]
+        )
         subject = _text(gmail.get("subject") or payload.get("subject"))
         summary = _text(
             matcher.get("request_summary_cleaned")
@@ -1128,6 +1131,18 @@ class WebhookAdapter(BasePlatformAdapter):
             reasoning.get("clarification_question") or reasoning.get("question_for_client"), ""
         )
 
+        def _is_client_route_stall(value: str) -> bool:
+            return bool(
+                re.search(
+                    r"which\s+(support-active\s+)?client|manually confirm the client|client/route|client and hubspot portal",
+                    str(value or ""),
+                    re.I,
+                )
+            )
+
+        if support_intake and not matched and _is_client_route_stall(clarification_question):
+            clarification_question = ""
+
         if reasoning:
             issue_type = _text(reasoning.get("issue_type"), issue_type)
             reasoning_client_ask = _text(reasoning.get("client_ask"), "")
@@ -1179,7 +1194,7 @@ class WebhookAdapter(BasePlatformAdapter):
             clarification_question = ""
 
         raw_owner = matcher.get("assignee_hint") or matcher.get("owner_primary") or payload.get("owner")
-        if hubspot_change:
+        if hubspot_change and not (support_intake and not matched):
             owner_hint = _text(raw_owner, "unknown/manual review")
             risk_level = "HubSpot change requested; scope check required before implementation"
             if hubspot_access_needed:
@@ -1203,13 +1218,22 @@ class WebhookAdapter(BasePlatformAdapter):
                 "and come back with the next step."
             )
         elif not matched:
-            owner_hint = "unknown/manual review"
-            risk_level = "approval required"
-            next_action = "Manually confirm the client/route before replying."
-            draft_reply = (
-                "Thanks for this. I’m checking where this should sit on our side and "
-                "will come back to you shortly."
-            )
+            owner_hint = "internal_review"
+            if support_intake:
+                risk_level = "internal support fallback; no client Slack route selected"
+                next_action = (
+                    "Scope this as a support@ work request in the fallback channel. Use the sender/contact/domain and request details to identify the relevant portal/account if needed; ask only for specific missing access, account-selection, or implementation approval details."
+                )
+                draft_reply = (
+                    "Thanks for sending this through. We’ll take a look at the HubSpot setup path and come back with the specific next step."
+                )
+            else:
+                risk_level = "approval required"
+                next_action = "Manually confirm the client/route before replying."
+                draft_reply = (
+                    "Thanks for this. I’m checking where this should sit on our side and "
+                    "will come back to you shortly."
+                )
         elif ticket_routing_question:
             owner_hint = _text(raw_owner, "unknown/manual review")
             risk_level = "HubSpot routing/configuration question; read-only check before reply"
@@ -1267,9 +1291,12 @@ class WebhookAdapter(BasePlatformAdapter):
                 "",
             )
             if proposed_next_action and not (
-                hubspot_change
-                and matched
-                and _is_unsafe_hubspot_change_boilerplate(proposed_next_action)
+                (
+                    hubspot_change
+                    and matched
+                    and _is_unsafe_hubspot_change_boilerplate(proposed_next_action)
+                )
+                or (support_intake and not matched and _is_client_route_stall(proposed_next_action))
             ):
                 next_action = proposed_next_action
             reasoning_status = _text(reasoning.get("status") or reasoning.get("evidence_status"), "").lower()
@@ -1295,7 +1322,7 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             if evidence_supported and reasoning_draft:
                 draft_reply = reasoning_draft
-            elif clarification_question:
+            elif clarification_question and not (support_intake and not matched and _is_client_route_stall(clarification_question)):
                 draft_reply = f"Draft intentionally withheld: {clarification_question}"
 
         lines = [
