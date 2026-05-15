@@ -4047,6 +4047,10 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
 
+            # /state is read-only metadata and should be queryable mid-turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "state":
+                return await self._handle_state_command(event)
+
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             # /btw is an alias of /background and resolves to the same canonical
@@ -4270,6 +4274,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "state":
+            return await self._handle_state_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -8109,6 +8116,40 @@ class GatewayRunner:
             f"Branch: `{new_session_id}`\n"
             f"Use `/resume` to switch back to the original."
         )
+
+    async def _handle_state_command(self, event: MessageEvent) -> str:
+        """Handle /state command -- read-only session/lane state report."""
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+        if agent is _AGENT_PENDING_SENTINEL:
+            agent = None
+
+        try:
+            from gateway.state_report import build_state_report, render_state_report
+
+            session_db = getattr(self, "_session_db", None) or getattr(
+                self.session_store, "_db", None
+            )
+            report = build_state_report(
+                source,
+                self.session_store,
+                session_db,
+                live_agent=agent,
+            )
+            return render_state_report(report)
+        except Exception as exc:
+            logger.warning("State report failed: %s", exc, exc_info=True)
+            return f"⚠️ State report unavailable: {exc}"
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
