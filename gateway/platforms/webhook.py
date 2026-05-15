@@ -1045,6 +1045,61 @@ class WebhookAdapter(BasePlatformAdapter):
             r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", raw_request_text, flags=re.I
         )
         requested_email = requested_emails[0].lower() if requested_emails else "the supplied email address"
+        activepieces_source = any(
+            term in requested_action
+            for term in (
+                "activepieces",
+                "noreply@activepieces.com",
+                "activepieces.com",
+            )
+        )
+        flow_issue_alert = bool(
+            re.search(
+                r'\bflow\s+(?:has\s+an\s+issue|["“][^"”]+["”]\s+has\s+an\s+issue)\b',
+                raw_request_text,
+                flags=re.I,
+            )
+        )
+        activepieces_resolution_prompt = (
+            "please review the issue, fix it, and mark it as resolved" in requested_action
+        )
+        automation_alert = activepieces_source or (flow_issue_alert and activepieces_resolution_prompt)
+        support_action_request = support_intake and any(
+            term in requested_action
+            for term in (
+                "please review",
+                "please fix",
+                "fix it",
+                "get this fixed",
+                "can you help",
+                "needs attention",
+                "has an issue",
+                "issue detected",
+                "error",
+                "failed",
+                "failure",
+                "alert",
+                "warning",
+                "not working",
+                "broken",
+            )
+        )
+        system_area_patterns = (
+            ("ActivePieces / automation flow", ("activepieces", "flow has an issue", "automation", "webhook", "zapier", "make.com")),
+            ("Cloudflare / DNS / domain or website hosting", ("cloudflare", "dns", "ssl", "certificate", "domain", "hosting", "website down", "site down")),
+            ("Google / SEO / Search Console", ("google search console", "gsc", "indexing", "crawl", "sitemap", "search console")),
+            ("email / deliverability / mailbox", ("gmail", "email", "mailbox", "deliverability", "bounce", "spf", "dkim", "dmarc")),
+            ("ads / tracking / analytics", ("meta pixel", "facebook pixel", "google ads", "analytics", "ga4", "tag manager", "gtm")),
+            ("HubSpot", ("hubspot", "crm", "deal", "ticket", "pipeline", "workflow", "form")),
+        )
+        inferred_system_area = next(
+            (area for area, terms in system_area_patterns if any(term in requested_action for term in terms)),
+            "best-fit source system from the forwarded request",
+        )
+        flow_name_match = re.search(r'flow\s+(?:has an issue\s+)?["“]([^"”]+)["”]', raw_request_text, flags=re.I)
+        automation_flow_name = flow_name_match.group(1).strip() if flow_name_match else "the named ActivePieces flow"
+        if automation_alert:
+            hubspot_status = "not applicable for ActivePieces automation repair; no HubSpot write in MVP."
         requires_hubspot = _truthy(support.get("requires_hubspot_access")) or _truthy(
             payload.get("requires_hubspot_access")
         )
@@ -1082,7 +1137,11 @@ class WebhookAdapter(BasePlatformAdapter):
         issue_type = "general support triage"
         client_ask = summary
         likely_system_area = "Client support context / owner review"
-        if ticket_routing_question:
+        if automation_alert:
+            issue_type = "ActivePieces automation failure"
+            client_ask = f"Fix the ActivePieces flow issue for {automation_flow_name}."
+            likely_system_area = "ActivePieces automation / CLCK operations flow"
+        elif ticket_routing_question:
             issue_type = "ticket intake routing / email-to-ticket"
             client_ask = (
                 f"Confirm whether emails sent to {requested_email} can create tickets "
@@ -1106,6 +1165,10 @@ class WebhookAdapter(BasePlatformAdapter):
             client_ask = _summarise_support_request(summary)
             summary = client_ask
             likely_system_area = "HubSpot portal inspection"
+        elif support_action_request:
+            issue_type = "inferred internal support task"
+            client_ask = "Review and fix the reported issue from the forwarded support request."
+            likely_system_area = inferred_system_area
 
         def _compact_findings(value: Any) -> str:
             if value is None:
@@ -1153,6 +1216,17 @@ class WebhookAdapter(BasePlatformAdapter):
             if "hubspot change" in reasoning_issue_type or "hubspot configuration" in reasoning_issue_type:
                 hubspot_change = True
                 scope_decision = False
+            if "activepieces" in reasoning_issue_type or "automation failure" in reasoning_issue_type:
+                automation_alert = True
+                hubspot_change = False
+                scope_decision = False
+                hubspot_status = "not applicable for ActivePieces automation repair; no HubSpot write in MVP."
+            if "inferred internal support task" in reasoning_issue_type:
+                support_action_request = True
+                hubspot_change = False
+                scope_decision = False
+                if not requires_hubspot:
+                    hubspot_status = "not applicable unless first inspection finds HubSpot is the affected system; no writes in MVP."
 
         def _hubspot_change_has_actionable_detail(value: str) -> bool:
             text = _summarise_hubspot_change_request(value).lower()
@@ -1209,6 +1283,22 @@ class WebhookAdapter(BasePlatformAdapter):
                 "Thanks for sending this through. I’ll check it against the HubSpot support scope, turn the in-scope items into tasks, "
                 "and flag any specific inputs or scope boundaries rather than waiting on a generic approval step."
             )
+        elif automation_alert:
+            owner_hint = "internal_review"
+            risk_level = "internal automation failure; repair task required"
+            next_action = (
+                f"Inspect the latest ActivePieces run(s) for {automation_flow_name}, identify the failed step/error, "
+                "apply a bounded fix if safe, validate the flow, and avoid triggering downstream emails/Slack/client actions unless explicitly approved."
+            )
+            draft_reply = "No client reply needed; internal automation repair task."
+        elif support_action_request:
+            owner_hint = "internal_review"
+            risk_level = "internal support task; inspect first, then act within safety rails"
+            next_action = (
+                f"Inspect the likely source system ({inferred_system_area}), identify the root cause from the supplied alert/request details, "
+                "fix bounded low-risk internal configuration/code where safe, and ask only for specific missing access or approval before external writes, sends, client Slack posts, or risky changes."
+            )
+            draft_reply = "No client reply drafted yet; first inspect and report the concrete finding/action."
         elif scope_decision:
             owner_hint = "Damien"
             risk_level = "scope/commercial decision required"
@@ -1324,6 +1414,25 @@ class WebhookAdapter(BasePlatformAdapter):
                 draft_reply = reasoning_draft
             elif clarification_question and not (support_intake and not matched and _is_client_route_stall(clarification_question)):
                 draft_reply = f"Draft intentionally withheld: {clarification_question}"
+
+        if automation_alert:
+            clarification_question = ""
+            if draft_reply.lower().startswith("draft intentionally withheld"):
+                draft_reply = "No client reply needed; internal automation repair task."
+            if not read_only_findings:
+                read_only_findings = (
+                    f"Forwarded ActivePieces alert detected for {automation_flow_name}; "
+                    "treat it as an internal automation repair request, not a HubSpot/client-match question."
+                )
+        elif support_action_request:
+            clarification_question = ""
+            if not requires_hubspot:
+                hubspot_status = "not applicable unless first inspection finds HubSpot is the affected system; no writes in MVP."
+            if not read_only_findings:
+                read_only_findings = (
+                    "Forwarded support@ item looks like an instruction to investigate and fix; "
+                    f"likely first system to inspect: {inferred_system_area}."
+                )
 
         lines = [
             "**CLCK HubSpot support triage**",
