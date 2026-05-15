@@ -725,7 +725,7 @@ class TestHubSpotSupportTriage:
         adapter.gateway_runner = runner
         return slack_adapter
 
-    def test_unknown_sender_formats_fallback_manual_review_card(self):
+    def test_unknown_sender_formats_fallback_actionable_working_session_card(self):
         adapter = _make_adapter()
         card = adapter._format_hubspot_support_triage_card(
             {
@@ -749,10 +749,114 @@ class TestHubSpotSupportTriage:
         assert "Sender/source/subject: Unknown Person <unknown@example.invalid> / support@clck.com.au / Can you help?" in card
         assert "Client match: fallback/no_safe_match" in card
         assert "Owner/assignee hint: internal_review" in card
-        assert "Recommended internal next action: Scope this as a support@ work request in the fallback channel." in card
+        assert "Issue type: inferred internal support task" in card
+        assert "Likely system area: HubSpot" in card
+        assert "Recommended internal next action: Inspect the likely source system" in card
+        assert "first inspect and report the concrete finding/action" in card
         assert "Manually confirm the client/route" not in card
         assert "Which support-active client" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_forwarded_platform_alert_formats_inferred_working_session_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Damien <damien@clck.com.au>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: Cloudflare alert for domain SSL",
+                },
+                "support": {
+                    "summary": (
+                        "Forwarded alert from Cloudflare: SSL certificate issue detected for a client domain. "
+                        "Please review the alert and fix it."
+                    )
+                },
+                "matcher": {
+                    "decision": "fallback",
+                    "reason": "no_safe_match",
+                    "client_name": None,
+                    "assignee_hint": "internal_review",
+                },
+            }
+        )
+
+        assert "Issue type: inferred internal support task" in card
+        assert "Client ask: Review and fix the reported issue from the forwarded support request." in card
+        assert "Likely system area: Cloudflare / DNS / domain or website hosting" in card
+        assert "Recommended internal next action: Inspect the likely source system" in card
+        assert "Which support-active client" not in card
+        assert "Manually confirm the client" not in card
+        assert "HubSpot setup path" not in card
+        assert "Inspect HubSpot read-only" not in card
+
+    def test_forwarded_activepieces_alert_formats_automation_repair_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Damien <damien@clck.com.au>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": 'Fwd: Flow has an issue "Reporting" ⚠️',
+                },
+                "support": {
+                    "summary": (
+                        'Forwarded message from Activepieces noreply@activepieces.com. Your flow "Reporting" has an issue. '
+                        "Please review the issue, fix it, and mark it as resolved. View Issue."
+                    )
+                },
+                "matcher": {
+                    "decision": "fallback",
+                    "reason": "no_safe_match",
+                    "client_name": None,
+                    "assignee_hint": "internal_review",
+                },
+            }
+        )
+
+        assert "Issue type: ActivePieces automation failure" in card
+        assert "Likely system area: ActivePieces automation / CLCK operations flow" in card
+        assert "Client ask: Fix the ActivePieces flow issue for Reporting." in card
+        assert "HubSpot status: not applicable for ActivePieces automation repair; no HubSpot write in MVP." in card
+        assert "Risk/action level: internal automation failure; repair task required" in card
+        assert "Recommended internal next action: Inspect the latest ActivePieces run(s) for Reporting" in card
+        assert "Draft client reply: No client reply needed; internal automation repair task." in card
+        assert "Which support-active client" not in card
+        assert "Inspect HubSpot read-only" not in card
+        assert "HubSpot portal read-only inspection" not in card
+
+    def test_generic_flow_issue_words_do_not_trigger_activepieces_repair_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Example Sender <sender@example.invalid>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "View issue in your flow",
+                },
+                "support": {
+                    "summary": (
+                        "Please view issue details in your flow dashboard. "
+                        "The onboarding flow is not working and needs attention."
+                    )
+                },
+                "matcher": {
+                    "decision": "fallback",
+                    "reason": "no_safe_match",
+                    "client_name": None,
+                    "assignee_hint": "internal_review",
+                },
+            }
+        )
+
+        assert "Issue type: ActivePieces automation failure" not in card
+        assert "No client reply needed; internal automation repair task" not in card
+        assert "Inspect the latest ActivePieces run(s)" not in card
+        assert "Issue type: inferred internal support task" in card
+        assert "Recommended internal next action: Inspect the likely source system" in card
 
     def test_support_fallback_hubspot_request_ignores_stale_client_route_stall_reasoning(self):
         adapter = _make_adapter()
