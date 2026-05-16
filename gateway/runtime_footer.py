@@ -1,15 +1,15 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+Renders a compact footer showing runtime state (model, context %, context action,
+cwd) and appends it to the FINAL message of an agent turn when enabled.  Off by
+default to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
+        fields: [model, context_pct, context_action, cwd]   # order shown; drop any to hide
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -52,6 +52,27 @@ def _model_short(model: Optional[str]) -> str:
     if not model:
         return ""
     return model.rsplit("/", 1)[-1]
+
+
+def _context_percentage(context_tokens: int, context_length: Optional[int]) -> int | None:
+    """Return rounded context pressure percentage, or ``None`` if unknown."""
+    if context_length and context_length > 0 and context_tokens >= 0:
+        return max(0, min(100, round((context_tokens / context_length) * 100)))
+    return None
+
+
+def _context_action(context_tokens: int, context_length: Optional[int]) -> str:
+    """Return a compact parent-lane action from context pressure bands."""
+    pct = _context_percentage(context_tokens, context_length)
+    if pct is None:
+        return ""
+    if pct >= 72:
+        return "handover now"
+    if pct >= 65:
+        return "prep handover"
+    if pct >= 50:
+        return "keep lean"
+    return "continue"
 
 
 def resolve_footer_config(
@@ -109,9 +130,13 @@ def format_runtime_footer(
             if m:
                 parts.append(m)
         elif field == "context_pct":
-            if context_length and context_length > 0 and context_tokens >= 0:
-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
+            pct = _context_percentage(context_tokens, context_length)
+            if pct is not None:
                 parts.append(f"{pct}%")
+        elif field == "context_action":
+            action = _context_action(context_tokens, context_length)
+            if action:
+                parts.append(action)
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
