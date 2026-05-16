@@ -307,6 +307,62 @@ def test_context_action_footer_uses_handover_bands():
     )
 
 
+
+
+def test_compression_status_footer_marks_compacted_context_from_lineage():
+    rendered = format_runtime_footer(
+        model="openai/gpt-5.5",
+        context_tokens=44_316,
+        context_length=272_000,
+        session_compression_depth=2,
+        fields=["context_pct", "compression_status", "context_action"],
+    )
+
+    assert rendered == "16% · compacted · continue"
+
+
+def test_compression_status_footer_omits_for_fresh_context():
+    rendered = format_runtime_footer(
+        model="openai/gpt-5.5",
+        context_tokens=44_316,
+        context_length=272_000,
+        session_compression_depth=0,
+        fields=["context_pct", "compression_status", "context_action"],
+    )
+
+    assert rendered == "16% · continue"
+
+
+def test_platform_runtime_footer_config_can_enable_compression_status():
+    cfg = {
+        "display": {
+            "runtime_footer": {"enabled": False, "fields": ["model", "context_pct"]},
+            "platforms": {
+                "zulip": {
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": [
+                            "context_pct",
+                            "compression_status",
+                            "context_action",
+                        ],
+                    }
+                }
+            },
+        }
+    }
+
+    rendered = build_footer_line(
+        user_config=cfg,
+        platform_key="zulip",
+        model="openai/gpt-5.5",
+        context_tokens=44_316,
+        context_length=272_000,
+        session_compression_depth=2,
+    )
+
+    assert rendered == "16% · compacted · continue"
+
 def test_platform_runtime_footer_config_can_enable_context_action_without_model():
     cfg = {
         "display": {

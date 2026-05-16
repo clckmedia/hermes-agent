@@ -159,6 +159,36 @@ def _auto_continue_freshness_window() -> float:
         return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
 
 
+def _compression_chain_depth_from_session_db(session_db: Any, session_id: str | None) -> int:
+    """Count contiguous compression ancestors for a session without reading messages."""
+    if not session_db or not session_id or not hasattr(session_db, "get_session"):
+        return 0
+
+    depth = 0
+    current = session_id
+    seen = {session_id}
+    for _ in range(32):
+        try:
+            row = session_db.get_session(current)
+        except Exception:
+            break
+        if not isinstance(row, dict):
+            break
+        parent_id = row.get("parent_session_id")
+        if not parent_id or parent_id in seen:
+            break
+        seen.add(parent_id)
+        try:
+            parent = session_db.get_session(parent_id)
+        except Exception:
+            break
+        if not isinstance(parent, dict) or parent.get("end_reason") != "compression":
+            break
+        depth += 1
+        current = parent_id
+    return depth
+
+
 def _redact_gateway_log_text(value: Any) -> str:
     """Best-effort secret redaction for gateway log message fragments."""
     text = "" if value is None else str(value)
@@ -7902,6 +7932,9 @@ class GatewayRunner:
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    compression_count=agent_result.get("compression_count"),
+                    session_compression_depth=agent_result.get("session_compression_depth"),
+                    session_was_split=bool(agent_result.get("session_was_split")),
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:
@@ -15784,13 +15817,20 @@ class GatewayRunner:
             _input_toks = 0
             _output_toks = 0
             _context_length = 0
+            _compression_count = 0
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _compression_count = getattr(_agent.context_compressor, "compression_count", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _effective_session_for_lineage = getattr(_agent, "session_id", session_id) if _agent else session_id
+            _session_compression_depth = _compression_chain_depth_from_session_db(
+                self._session_db,
+                _effective_session_for_lineage,
+            )
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -15812,6 +15852,9 @@ class GatewayRunner:
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "compression_count": _compression_count,
+                    "session_compression_depth": _session_compression_depth,
+                    "session_was_split": False,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -15931,6 +15974,9 @@ class GatewayRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "compression_count": _compression_count,
+                "session_compression_depth": _session_compression_depth,
+                "session_was_split": _session_was_split,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
             }
