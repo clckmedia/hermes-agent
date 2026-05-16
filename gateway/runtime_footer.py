@@ -1,15 +1,15 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, context action,
-cwd) and appends it to the FINAL message of an agent turn when enabled.  Off by
-default to keep replies minimal.
+Renders a compact footer showing runtime state (model, context %, compression
+status, context action, cwd) and appends it to the FINAL message of an agent
+turn when enabled.  Off by default to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, context_action, cwd]   # order shown; drop any to hide
+        fields: [model, context_pct, compression_status, context_action, cwd]
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -75,6 +75,25 @@ def _context_action(context_tokens: int, context_length: Optional[int]) -> str:
     return "continue"
 
 
+def _has_positive(value: int | None) -> bool:
+    try:
+        return value is not None and int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _compression_status(
+    *,
+    compression_count: int | None = None,
+    session_compression_depth: int | None = None,
+    session_was_split: bool = False,
+) -> str:
+    """Return a compact marker when the current context is post-compaction."""
+    if session_was_split or _has_positive(compression_count) or _has_positive(session_compression_depth):
+        return "compacted"
+    return ""
+
+
 def resolve_footer_config(
     user_config: dict[str, Any] | None,
     platform_key: str | None = None,
@@ -115,6 +134,9 @@ def format_runtime_footer(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    compression_count: int | None = None,
+    session_compression_depth: int | None = None,
+    session_was_split: bool = False,
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
@@ -137,6 +159,14 @@ def format_runtime_footer(
             action = _context_action(context_tokens, context_length)
             if action:
                 parts.append(action)
+        elif field == "compression_status":
+            status = _compression_status(
+                compression_count=compression_count,
+                session_compression_depth=session_compression_depth,
+                session_was_split=session_was_split,
+            )
+            if status:
+                parts.append(status)
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -155,6 +185,9 @@ def build_footer_line(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    compression_count: int | None = None,
+    session_compression_depth: int | None = None,
+    session_was_split: bool = False,
     cwd: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
@@ -170,6 +203,9 @@ def build_footer_line(
         model=model,
         context_tokens=context_tokens,
         context_length=context_length,
+        compression_count=compression_count,
+        session_compression_depth=session_compression_depth,
+        session_was_split=session_was_split,
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
