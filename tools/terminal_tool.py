@@ -2,16 +2,19 @@
 """
 Terminal Tool Module
 
-A terminal tool that executes commands in local, Docker, Modal, SSH, Singularity, and Daytona environments.
-Supports local execution, containerized backends, and Modal cloud sandboxes, including managed gateway mode.
+A terminal tool that executes commands in local, Docker, Modal, SSH,
+Singularity, Daytona, and Vercel Sandbox environments. Supports local
+execution, containerized backends, and cloud sandboxes, including managed
+Modal mode.
 
 Environment Selection (via TERMINAL_ENV environment variable):
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
+- "vercel_sandbox": Execute in Vercel Sandbox cloud sandboxes
 
 Features:
-- Multiple execution backends (local, docker, modal)
+- Multiple execution backends (local, docker, modal, vercel_sandbox)
 - Background task support
 - VM/container lifecycle management
 - Automatic cleanup after inactivity
@@ -114,6 +117,68 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     float,
     "number",
 )
+_VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
+_SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
+
+
+def _is_supported_vercel_runtime(runtime: str) -> bool:
+    return not runtime or runtime in _SUPPORTED_VERCEL_RUNTIMES
+
+
+def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
+    """Validate Vercel Sandbox terminal backend requirements."""
+    runtime = (config.get("vercel_runtime") or "").strip()
+    if not _is_supported_vercel_runtime(runtime):
+        supported = ", ".join(_SUPPORTED_VERCEL_RUNTIMES)
+        logger.error(
+            "Vercel Sandbox runtime %r is not supported. "
+            "Set TERMINAL_VERCEL_RUNTIME to one of: %s.",
+            runtime,
+            supported,
+        )
+        return False
+
+    disk = config.get("container_disk", 51200)
+    if disk not in {0, 51200}:
+        logger.error(
+            "Vercel Sandbox does not support custom TERMINAL_CONTAINER_DISK=%s. "
+            "Use the default shared setting (51200 MB).",
+            disk,
+        )
+        return False
+
+    if importlib.util.find_spec("vercel") is None:
+        logger.error(
+            "vercel is required for the Vercel Sandbox terminal backend: pip install vercel"
+        )
+        return False
+
+    has_oidc = bool(os.getenv("VERCEL_OIDC_TOKEN"))
+    has_token = bool(os.getenv("VERCEL_TOKEN"))
+    has_project = bool(os.getenv("VERCEL_PROJECT_ID"))
+    has_team = bool(os.getenv("VERCEL_TEAM_ID"))
+
+    if has_oidc:
+        return True
+
+    if has_token or has_project or has_team:
+        if has_token and has_project and has_team:
+            return True
+        logger.error(
+            "Vercel Sandbox backend selected with token auth, but "
+            "VERCEL_TOKEN, VERCEL_PROJECT_ID, and VERCEL_TEAM_ID must all "
+            "be set together. VERCEL_OIDC_TOKEN is supported for one-off "
+            "local development only."
+        )
+        return False
+
+    logger.error(
+        "Vercel Sandbox backend selected but no supported auth configuration "
+        "was found. Set VERCEL_TOKEN, VERCEL_PROJECT_ID, and VERCEL_TEAM_ID "
+        "for normal use. VERCEL_OIDC_TOKEN is supported for one-off local "
+        "development only."
+    )
+    return False
 
 
 def _check_disk_usage_warning():
@@ -351,7 +416,7 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
                 chars = []
                 while True:
                     c = msvcrt.getwch()
-                    if c in ("\r", "\n"):
+                    if c in {"\r", "\n"}:
                         break
                     if c == "\x03":
                         raise KeyboardInterrupt
@@ -367,7 +432,7 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
                 chars = []
                 while True:
                     b = os.read(tty_fd, 1)
-                    if not b or b in (b"\n", b"\r"):
+                    if not b or b in {b"\n", b"\r"}:
                         break
                     chars.append(b)
                 result["password"] = b"".join(chars).decode("utf-8", errors="replace")
@@ -555,6 +620,32 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
     return "".join(out), found
 
 
+def _sudo_nopasswd_works() -> bool:
+    """Return True when local sudo currently works without prompting.
+
+    Only probes for the `local` terminal backend; Docker/SSH/Modal/etc. must
+    not inherit the host's sudo state. Re-probes every call (no process-level
+    cache) so an expired sudo timestamp cannot make a later command silently
+    block waiting for a password.
+    """
+    terminal_env = os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
+    if terminal_env != "local":
+        return False
+
+    try:
+        probe = subprocess.run(
+            ["sudo", "-n", "true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        return probe.returncode == 0
+    except Exception:
+        return False
+
+
 def _rewrite_compound_background(command: str) -> str:
     """Wrap `A && B &` (or `A || B &`) to `A && { B & }` at depth 0.
 
@@ -616,7 +707,7 @@ def _rewrite_compound_background(command: str) -> str:
             continue
 
         # Quoted tokens — consume whole string via the shared tokenizer.
-        if ch in ("'", '"'):
+        if ch in {"'", '"'}:
             _, next_i = _read_shell_token(command, i)
             i = max(next_i, i + 1)
             continue
@@ -744,9 +835,10 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona) must embed the
-    password in the command string themselves; see their execute() methods for
-    how they handle the non-None sudo_stdin case.
+    Callers that cannot pipe subprocess stdin (modal, daytona,
+    vercel_sandbox) must embed the password in the command string
+    themselves; see their execute() methods for how they handle the
+    non-None sudo_stdin case.
 
     If SUDO_PASSWORD is not set and in interactive mode (HERMES_INTERACTIVE=1):
       Prompts user for password with 45s timeout, caches for session.
@@ -766,6 +858,15 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
         if has_configured_password
         else _get_cached_sudo_password()
     )
+
+    # Local hosts with sudoers NOPASSWD should not be forced through the
+    # interactive Hermes password prompt or the sudo -S password-pipe path.
+    # Scoped to the local terminal backend so Docker/SSH/Modal/etc. can't
+    # inherit host sudo state. Re-probes every call (no process-lifetime
+    # cache) so an expired sudo timestamp doesn't make a later command block
+    # silently without Hermes prompting.
+    if not has_configured_password and not sudo_password and _sudo_nopasswd_works():
+        return command, None
 
     if not has_configured_password and not sudo_password and os.getenv("HERMES_INTERACTIVE"):
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
@@ -787,6 +888,7 @@ from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
+import sys
 
 
 # Tool description for LLM
@@ -908,15 +1010,17 @@ def _get_env_config() -> Dict[str, Any]:
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     env_type = os.getenv("TERMINAL_ENV", "local")
     
-    mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in ("true", "1", "yes")
+    mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
 
-    # Default cwd: local uses the host's current directory, everything
-    # else starts in the user's home (~ resolves to whatever account
-    # is running inside the container/remote).
+    # Default cwd: local uses the host's current directory, ssh uses the
+    # remote home, Vercel uses its documented workspace root, and everything
+    # else starts in the backend's default root-like cwd.
     if env_type == "local":
         default_cwd = os.getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "vercel_sandbox":
+        default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
     else:
         default_cwd = "/root"
 
@@ -938,7 +1042,7 @@ def _get_env_config() -> Dict[str, Any]:
         ):
             host_cwd = candidate
             cwd = "/workspace"
-    elif env_type in ("modal", "docker", "singularity", "daytona") and cwd:
+    elif env_type in {"modal", "docker", "singularity", "daytona", "vercel_sandbox"} and cwd:
         # Host paths and relative paths that won't work inside containers
         is_host_path = any(cwd.startswith(p) for p in host_prefixes)
         is_relative = not os.path.isabs(cwd)  # e.g. "." or "src/"
@@ -956,6 +1060,7 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -972,15 +1077,18 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_persistent": os.getenv(
             "TERMINAL_SSH_PERSISTENT",
             os.getenv("TERMINAL_PERSISTENT_SHELL", "true"),
-        ).lower() in ("true", "1", "yes"),
-        "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in ("true", "1", "yes"),
-        # Container resource config (applies to docker, singularity, modal, daytona -- ignored for local/ssh)
+        ).lower() in {"true", "1", "yes"},
+        "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
+        # Container resource config (applies to docker, singularity, modal,
+        # daytona, and vercel_sandbox -- ignored for local/ssh)
         "container_cpu": _parse_env_var("TERMINAL_CONTAINER_CPU", "1", float, "number"),
         "container_memory": _parse_env_var("TERMINAL_CONTAINER_MEMORY", "5120"),     # MB (default 5GB)
         "container_disk": _parse_env_var("TERMINAL_CONTAINER_DISK", "51200"),        # MB (default 50GB)
-        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in ("true", "1", "yes"),
+        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         "docker_volumes": _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON"),
-        "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in ("true", "1", "yes"),
+        "docker_env": _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON"),
+        "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_extra_args": _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON"),
     }
 
 
@@ -1002,8 +1110,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     Create an execution environment for sandboxed command execution.
     
     Args:
-        env_type: One of "local", "docker", "singularity", "modal", "daytona", "ssh"
-        image: Docker/Singularity/Modal image name (ignored for local/ssh)
+        env_type: One of "local", "docker", "singularity", "modal",
+            "daytona", "vercel_sandbox", "ssh"
+        image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
         cwd: Working directory
         timeout: Default command timeout
         ssh_config: SSH connection config (for env_type="ssh")
@@ -1022,6 +1131,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     volumes = cc.get("docker_volumes", [])
     docker_forward_env = cc.get("docker_forward_env", [])
     docker_env = cc.get("docker_env", {})
+    docker_extra_args = cc.get("docker_extra_args", [])
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1037,6 +1147,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
+            extra_args=docker_extra_args,
         )
     
     elif env_type == "singularity":
@@ -1107,6 +1218,21 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
+    elif env_type == "vercel_sandbox":
+        from tools.environments.vercel_sandbox import (
+            VercelSandboxEnvironment as _VercelSandboxEnvironment,
+        )
+        return _VercelSandboxEnvironment(
+            runtime=cc.get("vercel_runtime") or None,
+            cwd=cwd,
+            timeout=timeout,
+            cpu=cpu,
+            memory=memory,
+            disk=disk,
+            persistent_filesystem=persistent,
+            task_id=task_id,
+        )
+
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1120,7 +1246,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
 
     else:
-        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', 'daytona', or 'ssh'")
+        raise ValueError(
+            f"Unknown environment type: {env_type}. Use 'local', 'docker', "
+            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+        )
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
@@ -1415,9 +1544,29 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     )
 
 
-_SHELL_LEVEL_BACKGROUND_RE = re.compile(r"\b(?:nohup|disown|setsid)\b", re.IGNORECASE)
+_SHELL_LEVEL_BACKGROUND_RE = re.compile(
+    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)(?:nohup|disown|setsid)\b", re.IGNORECASE | re.MULTILINE
+)
 _INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
 _TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
+
+
+def _strip_quotes(command: str) -> str:
+    """Remove single- and double-quoted content so regex checks don't match inside strings.
+
+    This prevents false positives when keywords like 'nohup' or 'setsid' appear
+    in commit messages, Python -c code, echo arguments, or PR body text.
+    Also strips backtick-quoted content and heredoc-style inline text.
+    """
+    # Remove single-quoted strings (no escaping inside single quotes in shell)
+    result = re.sub(r"'[^']*'", "''", command)
+    # Remove double-quoted strings (handle escaped quotes)
+    result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
+    # Remove backtick-quoted strings
+    result = re.sub(r"`[^`]*`", "``", result)
+    return result
+
+
 _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
     re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE),
@@ -1450,21 +1599,25 @@ def _foreground_background_guidance(command: str) -> str | None:
     if _looks_like_help_or_version_command(command):
         return None
 
-    if _SHELL_LEVEL_BACKGROUND_RE.search(command):
+    # Strip quoted content so keywords inside strings/arguments don't trigger
+    # false positives (e.g., git commit -m "... setsid ...", python3 -c "os.setsid").
+    unquoted = _strip_quotes(command)
+
+    if _SHELL_LEVEL_BACKGROUND_RE.search(unquoted):
         return (
             "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
             "Use terminal(background=true) so Hermes can track the process, then run "
             "readiness checks and tests in separate commands."
         )
 
-    if _INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command):
+    if _INLINE_BACKGROUND_AMP_RE.search(unquoted) or _TRAILING_BACKGROUND_AMP_RE.search(unquoted):
         return (
             "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
             "processes, then run health checks and tests in follow-up terminal calls."
         )
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
-        if pattern.search(command):
+        if pattern.search(unquoted):
             return (
                 "This foreground command appears to start a long-lived server/watch process. "
                 "Run it with background=true, verify readiness (health endpoint/log signal), "
@@ -1654,18 +1807,20 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in ("docker", "singularity", "modal", "daytona"):
+                        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
                                 "modal_mode": config.get("modal_mode", "auto"),
+                                "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                                "docker_extra_args": config.get("docker_extra_args", []),
                             }
 
                         local_config = None
@@ -1884,9 +2039,10 @@ def terminal_tool(
             
             while retry_count <= max_retries:
                 try:
-                    execute_kwargs = {"timeout": effective_timeout}
-                    if workdir:
-                        execute_kwargs["cwd"] = workdir
+                    execute_kwargs = {
+                        "timeout": effective_timeout,
+                        "cwd": workdir or cwd,
+                    }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
@@ -1998,10 +2154,10 @@ def terminal_tool(
 
 def check_terminal_requirements() -> bool:
     """Check if all requirements for the terminal tool are met."""
-    config = _get_env_config()
-    env_type = config["env_type"]
-
     try:
+        config = _get_env_config()
+        env_type = config["env_type"]
+
         if env_type == "local":
             return True
 
@@ -2085,6 +2241,9 @@ def check_terminal_requirements() -> bool:
 
             return True
 
+        elif env_type == "vercel_sandbox":
+            return _check_vercel_sandbox_requirements(config)
+
         elif env_type == "daytona":
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
@@ -2092,7 +2251,7 @@ def check_terminal_requirements() -> bool:
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, vercel_sandbox, ssh.",
                 env_type,
             )
             return False
@@ -2117,7 +2276,7 @@ if __name__ == "__main__":
 
     if not check_terminal_requirements():
         print("\n❌ Requirements not met. Please check the messages above.")
-        exit(1)
+        sys.exit(1)
 
     print("\n✅ All requirements met!")
     print("\nAvailable Tool:")
@@ -2132,7 +2291,11 @@ if __name__ == "__main__":
 
     print("\nEnvironment Variables:")
     default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
-    print(f"  TERMINAL_ENV: {os.getenv('TERMINAL_ENV', 'local')} (local/docker/singularity/modal/daytona/ssh)")
+    print(
+        "  TERMINAL_ENV: "
+        f"{os.getenv('TERMINAL_ENV', 'local')} "
+        "(local/docker/singularity/modal/daytona/vercel_sandbox/ssh)"
+    )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")

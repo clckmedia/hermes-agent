@@ -1,5 +1,14 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { BarChart3, Brain, Cpu, RefreshCw, TrendingUp } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  BarChart3,
+  Brain,
+  Cpu,
+  RefreshCw,
+  TrendingUp,
+} from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   AnalyticsResponse,
@@ -8,9 +17,11 @@ import type {
   AnalyticsSkillEntry,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { Button, Spinner, Stats } from "@nous-research/ui";
+import { Button } from "@nous-research/ui/ui/components/button";
+import { Spinner } from "@nous-research/ui/ui/components/spinner";
+import { Stats } from "@nous-research/ui/ui/components/stats";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@nous-research/ui";
+import { Badge } from "@nous-research/ui/ui/components/badge";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { PluginSlot } from "@/plugins";
@@ -37,6 +48,85 @@ function formatDate(day: string): string {
     return day;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Sorting
+// ---------------------------------------------------------------------------
+
+function useTableSort<T>(
+  data: T[],
+  defaultKey: keyof T & string,
+  defaultDir: "asc" | "desc" = "desc",
+) {
+  const [sortKey, setSortKey] = useState<string>(defaultKey);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(defaultDir);
+
+  const sorted = useMemo(() => {
+    return [...data].sort((a, b) => {
+      const aVal = a[sortKey as keyof T];
+      const bVal = b[sortKey as keyof T];
+      // Nulls always last regardless of direction
+      if (aVal === null || aVal === undefined) return 1;
+      if (bVal === null || bVal === undefined) return -1;
+      if (aVal === bVal) return 0;
+      const cmp = aVal > bVal ? 1 : -1;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [data, sortKey, sortDir]);
+
+  const toggle = useCallback(
+    (key: string) => {
+      if (key === sortKey) {
+        setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      } else {
+        setSortKey(key);
+        setSortDir("desc");
+      }
+    },
+    [sortKey],
+  );
+
+  return { sorted, sortKey, sortDir, toggle };
+}
+
+function SortHeader({
+  label,
+  col,
+  sortKey,
+  sortDir,
+  toggle,
+  className,
+}: {
+  label: string;
+  col: string;
+  sortKey: string;
+  sortDir: "asc" | "desc";
+  toggle: (key: string) => void;
+  className?: string;
+}) {
+  const active = col === sortKey;
+  return (
+    <th
+      onClick={() => toggle(col)}
+      className={`cursor-pointer select-none ${className ?? ""}`}
+    >
+      <span className="inline-flex items-center gap-1.5 rounded px-1 -mx-1 py-0.5 hover:bg-muted/40 transition-colors">
+        {label}
+        {active ? (
+          sortDir === "asc" ? (
+            <ArrowUp className="h-3.5 w-3.5 text-foreground/80 shrink-0" />
+          ) : (
+            <ArrowDown className="h-3.5 w-3.5 text-foreground/80 shrink-0" />
+          )
+        ) : (
+          <ArrowUpDown className="h-3 w-3 text-muted-foreground/40 shrink-0" />
+        )}
+      </span>
+    </th>
+  );
+}
+
+
 
 function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
   const { t } = useI18n();
@@ -133,9 +223,9 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
 
 function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
   const { t } = useI18n();
-  if (daily.length === 0) return null;
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(daily, "day", "desc");
 
-  const sorted = [...daily].reverse();
+  if (daily.length === 0) return null;
 
   return (
     <Card>
@@ -152,46 +242,36 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left py-2 pr-4 font-medium">
-                  {t.analytics.date}
-                </th>
-                <th className="text-right py-2 px-4 font-medium">
-                  {t.sessions.title}
-                </th>
-                <th className="text-right py-2 px-4 font-medium">
-                  {t.analytics.input}
-                </th>
-                <th className="text-right py-2 pl-4 font-medium">
-                  {t.analytics.output}
-                </th>
+                <SortHeader label={t.analytics.date} col="day" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.input} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.output} col="output_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
               </tr>
             </thead>
             <tbody>
-              {sorted.map((d) => {
-                return (
-                  <tr
+              {sorted.map((d) => (
+                <tr
                     key={d.day}
                     className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
                   >
-                    <td className="py-2 pr-4 font-medium">
+                  <td className="py-2 pr-4 font-medium">
                       {formatDate(d.day)}
                     </td>
-                    <td className="text-right py-2 px-4 text-muted-foreground">
+                  <td className="text-right py-2 px-4 text-muted-foreground">
                       {d.sessions}
                     </td>
-                    <td className="text-right py-2 px-4">
-                      <span className="text-[#ffe6cb]">
+                  <td className="text-right py-2 px-4">
+                    <span className="text-[#ffe6cb]">
                         {formatTokens(d.input_tokens)}
                       </span>
-                    </td>
-                    <td className="text-right py-2 pl-4">
-                      <span className="text-emerald-400">
+                  </td>
+                  <td className="text-right py-2 pl-4">
+                    <span className="text-emerald-400">
                         {formatTokens(d.output_tokens)}
                       </span>
-                    </td>
-                  </tr>
-                );
-              })}
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
@@ -202,12 +282,9 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
 
 function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
   const { t } = useI18n();
-  if (models.length === 0) return null;
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "input_tokens", "desc");
 
-  const sorted = [...models].sort(
-    (a, b) =>
-      b.input_tokens + b.output_tokens - (a.input_tokens + a.output_tokens),
-  );
+  if (models.length === 0) return null;
 
   return (
     <Card>
@@ -224,15 +301,9 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left py-2 pr-4 font-medium">
-                  {t.analytics.model}
-                </th>
-                <th className="text-right py-2 px-4 font-medium">
-                  {t.sessions.title}
-                </th>
-                <th className="text-right py-2 pl-4 font-medium">
-                  {t.analytics.tokens}
-                </th>
+                <SortHeader label={t.analytics.model} col="model" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.tokens} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
               </tr>
             </thead>
             <tbody>
@@ -268,6 +339,8 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
 
 function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
   const { t } = useI18n();
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(skills, "total_count", "desc");
+
   if (skills.length === 0) return null;
 
   return (
@@ -283,25 +356,15 @@ function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left py-2 pr-4 font-medium">
-                  {t.analytics.skill}
-                </th>
-                <th className="text-right py-2 px-4 font-medium">
-                  {t.analytics.loads}
-                </th>
-                <th className="text-right py-2 px-4 font-medium">
-                  {t.analytics.edits}
-                </th>
-                <th className="text-right py-2 px-4 font-medium">
-                  {t.analytics.total}
-                </th>
-                <th className="text-right py-2 pl-4 font-medium">
-                  {t.analytics.lastUsed}
-                </th>
+                <SortHeader label={t.analytics.skill} col="skill" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.analytics.loads} col="view_count" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.edits} col="manage_count" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.total} col="total_count" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label={t.analytics.lastUsed} col="last_used_at" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
               </tr>
             </thead>
             <tbody>
-              {skills.map((skill) => (
+              {sorted.map((skill) => (
                 <tr
                   key={skill.skill}
                   className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
@@ -334,10 +397,26 @@ export default function AnalyticsPage() {
   const [data, setData] = useState<AnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Gated on `dashboard.show_token_analytics` (default off).  When off the
+  // page renders an explanation card instead of fetching analytics — the
+  // local token counts exclude auxiliary calls and provider retries, so
+  // they diverge from provider billing in ways that mislead users.
+  const [showTokens, setShowTokens] = useState<boolean | null>(null);
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
 
+  useEffect(() => {
+    api
+      .getConfig()
+      .then((cfg) => {
+        const dash = (cfg?.dashboard ?? {}) as { show_token_analytics?: unknown };
+        setShowTokens(dash.show_token_analytics === true);
+      })
+      .catch(() => setShowTokens(false));
+  }, []);
+
   const load = useCallback(() => {
+    if (!showTokens) return;
     setLoading(true);
     setError(null);
     api
@@ -345,7 +424,7 @@ export default function AnalyticsPage() {
       .then(setData)
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
-  }, [days]);
+  }, [days, showTokens]);
 
   useLayoutEffect(() => {
     const periodLabel =
@@ -359,37 +438,39 @@ export default function AnalyticsPage() {
       </span>,
     );
     setEnd(
-      <div className="flex w-full min-w-0 flex-wrap items-center justify-end gap-2 sm:gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {PERIODS.map((p) => (
-            <Button
-              key={p.label}
-              type="button"
-              size="sm"
-              outlined={days !== p.days}
-              onClick={() => setDays(p.days)}
-            >
-              {p.label}
-            </Button>
-          ))}
+      showTokens === false ? null : (
+        <div className="flex w-full min-w-0 flex-wrap items-center justify-end gap-2 sm:gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {PERIODS.map((p) => (
+              <Button
+                key={p.label}
+                type="button"
+                size="sm"
+                outlined={days !== p.days}
+                onClick={() => setDays(p.days)}
+              >
+                {p.label}
+              </Button>
+            ))}
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            outlined
+            onClick={load}
+            disabled={loading}
+            prefix={loading ? <Spinner /> : <RefreshCw />}
+          >
+            {t.common.refresh}
+          </Button>
         </div>
-        <Button
-          type="button"
-          size="sm"
-          outlined
-          onClick={load}
-          disabled={loading}
-          prefix={loading ? <Spinner /> : <RefreshCw />}
-        >
-          {t.common.refresh}
-        </Button>
-      </div>,
+      ),
     );
     return () => {
       setAfterTitle(null);
       setEnd(null);
     };
-  }, [days, loading, load, setAfterTitle, setEnd, t.common.refresh]);
+  }, [days, loading, load, setAfterTitle, setEnd, t.common.refresh, showTokens]);
 
   useEffect(() => {
     load();
@@ -398,13 +479,51 @@ export default function AnalyticsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PluginSlot name="analytics:top" />
-      {loading && !data && (
+
+      {showTokens === false && (
+        <Card>
+          <CardContent className="py-12">
+            <div className="mx-auto flex max-w-2xl flex-col gap-3 text-sm text-muted-foreground">
+              <h2 className="font-display text-base tracking-wider uppercase text-foreground">
+                Token analytics hidden
+              </h2>
+              <p>
+                The token, cost, and per-day analytics on this page are a
+                local debug estimate. They only count successful main-agent
+                responses with a usable <span className="font-mono">usage</span>{" "}
+                block, and silently exclude auxiliary calls (context
+                compression, title generation, vision, session search, web
+                extract, smart approvals, MCP routing, plugin LLM access)
+                plus provider-side retries and fallback attempts. Cache
+                writes are missing entirely.
+              </p>
+              <p>
+                On models with heavy auxiliary traffic (Kimi K2.6, MiniMax
+                M2.7) the local total can be 10x–100x lower than what your
+                provider bills. Hiding these numbers is safer than letting
+                them look authoritative.
+              </p>
+              <p>
+                Check your provider dashboard (OpenRouter, Anthropic, etc.)
+                for actual usage and billing. To re-enable the local debug
+                estimate anyway, set{" "}
+                <span className="font-mono">
+                  dashboard.show_token_analytics: true
+                </span>{" "}
+                in <a href="/config" className="underline">Config</a>.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {showTokens && loading && !data && (
         <div className="flex items-center justify-center py-24">
           <Spinner className="text-2xl text-primary" />
         </div>
       )}
 
-      {error && (
+      {showTokens && error && (
         <Card>
           <CardContent className="py-6">
             <p className="text-sm text-destructive text-center">{error}</p>
@@ -412,7 +531,7 @@ export default function AnalyticsPage() {
         </Card>
       )}
 
-      {data && (
+      {showTokens && data && (
         <>
           <div className="grid gap-6 lg:grid-cols-2">
             <Card>
