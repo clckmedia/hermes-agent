@@ -1220,6 +1220,11 @@ class WebhookAdapter(BasePlatformAdapter):
             reasoning = payload.get("reasoning")
         reasoning = reasoning or {}
         read_only_findings = _compact_findings(reasoning.get("read_only_findings") or reasoning.get("findings"))
+        work_mode = _text(reasoning.get("work_mode"), "") if reasoning else ""
+        explicit_client_reply_required = reasoning.get("client_reply_required") if reasoning else None
+        client_reply_required = _truthy(explicit_client_reply_required) if explicit_client_reply_required is not None else None
+        internal_plan = _compact_findings(reasoning.get("internal_plan")) if reasoning else ""
+        approval_needed = _text(reasoning.get("approval_needed"), "") if reasoning else ""
         clarification_question = _text(
             reasoning.get("clarification_question") or reasoning.get("question_for_client"), ""
         )
@@ -1430,6 +1435,12 @@ class WebhookAdapter(BasePlatformAdapter):
             reasoning_risk = _text(reasoning.get("risk_action_level") or reasoning.get("risk_level"), "")
             if reasoning_risk:
                 risk_level = reasoning_risk
+            if work_mode == "internal_action_plan":
+                risk_level = reasoning_risk or "internal action plan; approval required before writes/sends"
+            elif work_mode == "client_answer_draft":
+                risk_level = reasoning_risk or "client answer draft; approval required before send"
+            elif work_mode == "needs_specific_info":
+                risk_level = reasoning_risk or "specific missing information/access needed"
             if evidence_supported and read_only_findings:
                 if hubspot_change and reasoning_status == "scoped":
                     hubspot_status = "portal/token found; support scope check completed; no writes in MVP."
@@ -1440,7 +1451,9 @@ class WebhookAdapter(BasePlatformAdapter):
             reasoning_draft = _text(
                 reasoning.get("draft_client_reply") or reasoning.get("draft_reply"), ""
             )
-            if evidence_supported and reasoning_draft:
+            if client_reply_required is False or work_mode == "internal_action_plan":
+                draft_reply = ""
+            elif evidence_supported and reasoning_draft and (client_reply_required is not False):
                 draft_reply = reasoning_draft
             elif clarification_question and not (support_intake and not matched and _is_client_route_stall(clarification_question)):
                 draft_reply = f"Draft intentionally withheld: {clarification_question}"
@@ -1463,6 +1476,11 @@ class WebhookAdapter(BasePlatformAdapter):
                     "Forwarded support@ item looks like an instruction to investigate and fix; "
                     f"likely first system to inspect: {inferred_system_area}."
                 )
+
+        if not work_mode and (hubspot_change or automation_alert or support_action_request):
+            work_mode = "internal_action_plan"
+            client_reply_required = False
+            draft_reply = ""
 
         lines = [
             "**CLCK HubSpot support triage**",
@@ -1502,9 +1520,15 @@ class WebhookAdapter(BasePlatformAdapter):
             "",
             f"**{section_number}) Recommended action**",
             f"- Recommended internal next action: {_clip(next_action, 620)}",
-            f"- Draft client reply: {_clip(draft_reply, 500)}",
-            "- Safety: no email sent; no HubSpot write; no client Slack post.",
         ])
+        if internal_plan:
+            lines.append(f"- Internal plan: {_clip(internal_plan, 760)}")
+        if approval_needed:
+            lines.append(f"- Approval needed: {_clip(approval_needed, 420)}")
+        show_draft_reply = bool(draft_reply) and (client_reply_required is not False) and work_mode != "internal_action_plan"
+        if show_draft_reply:
+            lines.append(f"- Draft client reply: {_clip(draft_reply, 500)}")
+        lines.append("- Safety: no email sent; no HubSpot write; no client Slack post.")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------

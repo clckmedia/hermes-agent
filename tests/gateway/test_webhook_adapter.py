@@ -752,7 +752,7 @@ class TestHubSpotSupportTriage:
         assert "Issue type: inferred internal support task" in card
         assert "Likely system area: HubSpot" in card
         assert "Recommended internal next action: Inspect the likely source system" in card
-        assert "first inspect and report the concrete finding/action" in card
+        assert "Draft client reply:" not in card
         assert "Manually confirm the client/route" not in card
         assert "Which support-active client" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
@@ -822,7 +822,7 @@ class TestHubSpotSupportTriage:
         assert "HubSpot status: not applicable for ActivePieces automation repair; no HubSpot write in MVP." in card
         assert "Risk/action level: internal automation failure; repair task required" in card
         assert "Recommended internal next action: Inspect the latest ActivePieces run(s) for Reporting" in card
-        assert "Draft client reply: No client reply needed; internal automation repair task." in card
+        assert "Draft client reply:" not in card
         assert "Which support-active client" not in card
         assert "Inspect HubSpot read-only" not in card
         assert "HubSpot portal read-only inspection" not in card
@@ -901,7 +901,7 @@ class TestHubSpotSupportTriage:
         assert "Draft intentionally withheld" not in card
         assert "Recommended internal next action: Scope this as a support@ work request in the fallback channel." in card
         assert "internal_review to action the in-scope HubSpot support tasks" not in card
-        assert "Draft client reply: Thanks for sending this through. We’ll take a look at the HubSpot setup path" in card
+        assert "Draft client reply:" not in card
 
     def test_explicit_client_hint_line_renders_and_directive_is_not_summary(self):
         adapter = _make_adapter()
@@ -1013,6 +1013,106 @@ class TestHubSpotSupportTriage:
         assert "Draft client reply: Draft intentionally withheld:" in card
         assert "I’ll take a look and come back with the next step shortly" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+
+    def test_off_track_weekly_warranty_report_renders_internal_plan_without_draft(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Justin Borg <justin@offtrackrv.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Weekly warranty report",
+                    "snippet": "Can you please build a weekly warranty report from HubSpot Warranty Pipeline activity?",
+                },
+                "support": {
+                    "summary": "Please build a weekly warranty report from the Warranty Pipeline.",
+                    "requested_action": "hubspot_change",
+                    "requires_hubspot_access": True,
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Off Track RV",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "441989220",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "status": "scoped",
+                    "evidence_supported": True,
+                    "issue_type": "HubSpot change request",
+                    "work_mode": "internal_action_plan",
+                    "client_reply_required": False,
+                    "client_ask": "Build a weekly warranty report from Off Track RV HubSpot Warranty Pipeline tickets.",
+                    "likely_system_area": "HubSpot Warranty Pipeline reporting",
+                    "read_only_findings": [
+                        "Matched client: Off Track RV.",
+                        "No HubSpot writes have been made by the triage layer.",
+                    ],
+                    "internal_plan": [
+                        "Inspect Warranty Pipeline tickets read-only for stages, owners, close dates and warranty-status fields.",
+                        "Design weekly report metrics: new/open/closed warranty tickets, ageing, owners and exceptions.",
+                        "Confirm report recipients and schedule with Damien before any HubSpot build/subscription.",
+                    ],
+                    "approval_needed": "Damien approval is required before any HubSpot report/dashboard build, schedule, subscription, or client-facing send.",
+                    "recommended_internal_action": "Review the weekly warranty report plan internally and ask Damien to approve before any HubSpot build or schedule.",
+                    "draft_client_reply": "",
+                },
+            }
+        )
+
+        assert "Client match: matched client: Off Track RV (safe_match)" in card
+        assert "Issue type: HubSpot change request" in card
+        assert "Likely system area: HubSpot Warranty Pipeline reporting" in card
+        assert "Internal plan: Inspect Warranty Pipeline tickets read-only" in card
+        assert "weekly report metrics" in card
+        assert "Approval needed: Damien approval is required before any HubSpot report/dashboard build" in card
+        assert "Draft client reply:" not in card
+        assert "Break the explicit HubSpot change/review request into support tasks" not in card
+        assert "Create/assign the in-scope HubSpot support tasks now" not in card
+        assert "notification or handoff owners" not in card
+
+    def test_simple_question_reasoning_still_renders_draft_client_reply(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Jane <jane@example.com>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Where do I find the HubSpot import view?",
+                },
+                "support": {"summary": "Client asks where to find the HubSpot import view."},
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "Example Client",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "status": "supported",
+                    "evidence_supported": True,
+                    "issue_type": "simple client question",
+                    "work_mode": "client_answer_draft",
+                    "client_reply_required": True,
+                    "client_ask": "Client asks where to find the HubSpot import view.",
+                    "likely_system_area": "HubSpot navigation / known help answer",
+                    "recommended_internal_action": "Review the draft answer and approve/send if it fits the thread.",
+                    "draft_client_reply": "You can find HubSpot imports under Data Management > Data Integration, then use Import data.",
+                    "approval_needed": "Approval is required before sending the client reply.",
+                },
+            }
+        )
+
+        assert "Risk/action level: client answer draft; approval required before send" in card
+        assert "Draft client reply: You can find HubSpot imports under Data Management > Data Integration" in card
+        assert "Approval needed: Approval is required before sending the client reply." in card
 
     def test_off_track_enriched_reasoning_renders_evidence_backed_answer(self):
         adapter = _make_adapter()
@@ -1145,7 +1245,7 @@ class TestHubSpotSupportTriage:
         assert "Recommended internal next action: Damien to action the in-scope HubSpot support tasks" in card
         assert "approval before write" not in card.lower()
         assert "Thanks Lynne" not in card
-        assert "Draft client reply: Thanks for sending this through." in card
+        assert "Draft client reply:" not in card
         assert "Damien approves before any HubSpot write" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
 
@@ -1408,7 +1508,7 @@ class TestHubSpotSupportTriage:
         )
 
         assert "Clarification question: What exact HubSpot change is being requested?" in card
-        assert "Draft intentionally withheld: What exact HubSpot change is being requested?" in card
+        assert "Draft client reply:" not in card
 
     @pytest.mark.asyncio
     async def test_existing_support_reasoning_is_not_enriched_again(self):
