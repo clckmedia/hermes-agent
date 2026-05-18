@@ -381,6 +381,37 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 # Output redirects that overwrite files (> but not >>)
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
+# Artefact claim/evidence heuristics used after provider fallback.  The goal is
+# not to prove that every artefact is correct; it is to catch the dangerous
+# failure mode where a fallback model fabricates file paths, Drive links, or row
+# counts after a long tool-heavy run without any same-turn tool evidence.
+_ARTIFACT_EXTENSIONS_RE = r"(?:csv|tsv|xlsx?|md|txt|jsonl?|pdf|docx?|pptx?|zip|html?|png|jpe?g|webp)"
+_DRIVE_URL_RE = re.compile(r"https?://drive\.google\.com/[^\s)>\]\"']+", re.IGNORECASE)
+_DRIVE_ID_FROM_URL_RE = re.compile(r"/(?:file/d|folders)/([A-Za-z0-9_-]{10,})")
+_DRIVE_ID_FIELD_RE = re.compile(
+    r"(?i)\b(?:drive[_ -]?)?(?:file[_ -]?)?id[\"'\s:=]+([A-Za-z0-9_-]{20,})"
+)
+_ARTIFACT_PATH_RE = re.compile(
+    rf"(?<![\w:])(?:~|/)[^\s`\"'<>|]*?\.{_ARTIFACT_EXTENSIONS_RE}(?:[^\s`\"'<>|]*)?",
+    re.IGNORECASE,
+)
+_ARTIFACT_FILENAME_RE = re.compile(
+    rf"\b[A-Za-z0-9][A-Za-z0-9_.-]{{1,180}}\.{_ARTIFACT_EXTENSIONS_RE}\b",
+    re.IGNORECASE,
+)
+_POST_FALLBACK_ARTIFACT_SUCCESS_TERMS = (
+    "artefact", "artifact", "created", "generated", "saved", "wrote",
+    "written", "uploaded", "verified", "exists", "resolves", "row count",
+    "rows", "workbook", "report", "drive link", "file link", "local file",
+    "local folder",
+)
+_POST_FALLBACK_ARTIFACT_DISCLAIMERS = (
+    "unverified", "not verified", "could not verify", "couldn't verify",
+    "cannot verify", "can't verify", "unable to verify", "did not verify",
+    "not created", "did not create", "does not exist", "do not trust",
+    "treat as invalid", "fabricated", "unsupported claim",
+)
+
 
 def _is_destructive_command(cmd: str) -> bool:
     """Heuristic: does this terminal command look like it modifies/deletes files?"""
@@ -592,6 +623,152 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     if len(text) > max_len:
         text = text[: max_len - 1] + "…"
     return text
+
+
+def _clean_artifact_token(value: str) -> str:
+    """Trim common markdown/list punctuation from an artefact token."""
+    return (value or "").strip().strip(".,;:)]}'\"`")
+
+
+def _extract_post_fallback_artifact_claims(text: str) -> List[Dict[str, Any]]:
+    """Extract file/Drive artefact mentions from assistant-facing text.
+
+    Returns dicts with ``display`` (for the footer) and ``tokens`` (strings that
+    count as evidence).  Kept deliberately heuristic: false negatives are safer
+    than flooding normal answers, but exact file paths and Drive IDs are caught.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+
+    claims: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(display: str, tokens: List[str]) -> None:
+        display = _clean_artifact_token(display)
+        if not display:
+            return
+        key = display.lower()
+        if key in seen:
+            return
+        clean_tokens = []
+        for token in tokens:
+            token = _clean_artifact_token(str(token))
+            if token and token not in clean_tokens:
+                clean_tokens.append(token)
+        if not clean_tokens:
+            clean_tokens = [display]
+        claims.append({"display": display, "tokens": clean_tokens})
+        seen.add(key)
+
+    for match in _DRIVE_URL_RE.finditer(text):
+        url = _clean_artifact_token(match.group(0))
+        tokens = [url]
+        id_match = _DRIVE_ID_FROM_URL_RE.search(url)
+        if id_match:
+            tokens.append(id_match.group(1))
+        _add(url, tokens)
+
+    for match in _DRIVE_ID_FIELD_RE.finditer(text):
+        drive_id = _clean_artifact_token(match.group(1))
+        _add(f"Drive ID {drive_id}", [drive_id])
+
+    for match in _ARTIFACT_PATH_RE.finditer(text):
+        path = _clean_artifact_token(match.group(0))
+        tokens = [path]
+        try:
+            base = os.path.basename(path.rstrip("/"))
+            if base:
+                tokens.append(base)
+        except Exception:
+            pass
+        _add(path, tokens)
+
+    # Capture bare filenames after paths so a full path does not duplicate its
+    # basename in the footer.
+    path_basenames = {
+        os.path.basename(c["tokens"][0].rstrip("/"))
+        for c in claims
+        if c.get("tokens") and (c["tokens"][0].startswith("/") or c["tokens"][0].startswith("~"))
+    }
+    for match in _ARTIFACT_FILENAME_RE.finditer(text):
+        filename = _clean_artifact_token(match.group(0))
+        if filename in path_basenames:
+            continue
+        _add(filename, [filename])
+
+    return claims
+
+
+def _artifact_evidence_tokens_from_text(text: str) -> set[str]:
+    """Return lower-cased artefact evidence tokens from tool args/results."""
+    tokens: set[str] = set()
+    for claim in _extract_post_fallback_artifact_claims(text):
+        for token in claim.get("tokens") or []:
+            token = _clean_artifact_token(str(token)).lower()
+            if token:
+                tokens.add(token)
+    return tokens
+
+
+def _post_fallback_response_needs_artifact_guard(text: str, claims: List[Dict[str, Any]]) -> bool:
+    """True when a post-fallback response appears to positively claim artefacts."""
+    if not claims or not isinstance(text, str):
+        return False
+    lower = text.lower()
+    if any(term in lower for term in _POST_FALLBACK_ARTIFACT_DISCLAIMERS):
+        return False
+    return any(term in lower for term in _POST_FALLBACK_ARTIFACT_SUCCESS_TERMS)
+
+
+_ACTIVE_TOOL_EVIDENCE_ROLES = {"assistant", "tool"}
+
+
+def _tool_call_evidence_text(tool_call: Any) -> str:
+    """Extract tool name + arguments from persisted or live tool-call objects."""
+    try:
+        if isinstance(tool_call, dict):
+            fn = tool_call.get("function") or {}
+            name = fn.get("name") or tool_call.get("name") or ""
+            args = fn.get("arguments") or tool_call.get("arguments") or ""
+        else:
+            fn = getattr(tool_call, "function", None)
+            name = getattr(fn, "name", "") if fn is not None else getattr(tool_call, "name", "")
+            args = getattr(fn, "arguments", "") if fn is not None else getattr(tool_call, "arguments", "")
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False, default=str)
+        return f"{name}\n{args}"
+    except Exception:
+        return ""
+
+
+def _collect_artifact_evidence_tokens_from_messages(
+    messages: List[Dict[str, Any]],
+    current_turn_user_idx: int | None = None,
+) -> set[str]:
+    """Extract artefact tokens from same-turn tool calls/results only.
+
+    User and ordinary assistant text are intentionally ignored so a user's
+    requested path or the model's final claim cannot count as verification.
+    """
+    tokens: set[str] = set()
+    if not isinstance(messages, list):
+        return tokens
+    start = 0
+    if isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages):
+        start = current_turn_user_idx + 1
+    for msg in messages[start:]:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in _ACTIVE_TOOL_EVIDENCE_ROLES:
+            continue
+        if role == "assistant":
+            for tool_call in msg.get("tool_calls") or []:
+                tokens.update(_artifact_evidence_tokens_from_text(_tool_call_evidence_text(tool_call)))
+        elif role == "tool":
+            content = _multimodal_text_summary(msg.get("content"))
+            tokens.update(_artifact_evidence_tokens_from_text(content))
+    return tokens
 
 
 def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -5488,6 +5665,89 @@ class AIAgent:
             pass
         return True  # safe default: verifier on
 
+    def _record_artifact_evidence(self, tool_name: str, args: Dict[str, Any], result: Any) -> None:
+        """Remember artefact tokens seen in tool calls/results for this turn.
+
+        This small ledger survives mid-turn context compression, so a final
+        response after provider fallback can be checked against actual tool
+        evidence rather than against the model's own summary text.
+        """
+        state = getattr(self, "_turn_artifact_evidence_tokens", None)
+        if state is None:
+            return
+        try:
+            if not isinstance(args, str):
+                args_text = json.dumps(args or {}, ensure_ascii=False, default=str)
+            else:
+                args_text = args
+            result_text = _multimodal_text_summary(result)
+            evidence_text = f"{tool_name}\n{args_text}\n{result_text}"
+            state.update(_artifact_evidence_tokens_from_text(evidence_text))
+        except Exception:
+            logger.debug("post-fallback artefact evidence record failed", exc_info=True)
+
+    def _post_fallback_artifact_guard_enabled(self) -> bool:
+        """Return whether the post-fallback artefact-claim footer is enabled."""
+        try:
+            import os as _os
+            env = _os.environ.get("HERMES_POST_FALLBACK_ARTIFACT_GUARD")
+            if env is not None:
+                return env.strip().lower() not in ("0", "false", "no", "off")
+            try:
+                from hermes_cli.config import load_config as _load_config
+                _cfg = _load_config() or {}
+            except Exception:
+                _cfg = {}
+            _display = _cfg.get("display") if isinstance(_cfg, dict) else None
+            if isinstance(_display, dict) and "post_fallback_artifact_guard" in _display:
+                return bool(_display.get("post_fallback_artifact_guard"))
+        except Exception:
+            pass
+        return True
+
+    def _format_post_fallback_artifact_guard_footer(
+        self,
+        final_response: str,
+        messages: List[Dict[str, Any]],
+        current_turn_user_idx: int | None = None,
+    ) -> str:
+        """Render a warning when a post-fallback final claims unproven artefacts."""
+        if not getattr(self, "_turn_fallback_activated", False):
+            return ""
+        if not self._post_fallback_artifact_guard_enabled():
+            return ""
+        claims = _extract_post_fallback_artifact_claims(final_response or "")
+        if not _post_fallback_response_needs_artifact_guard(final_response or "", claims):
+            return ""
+
+        evidence = set(getattr(self, "_turn_artifact_evidence_tokens", set()) or set())
+        evidence.update(_collect_artifact_evidence_tokens_from_messages(messages, current_turn_user_idx))
+        missing: List[str] = []
+        for claim in claims:
+            tokens = {
+                _clean_artifact_token(str(token)).lower()
+                for token in (claim.get("tokens") or [])
+                if _clean_artifact_token(str(token))
+            }
+            if not tokens:
+                continue
+            if not any(token in evidence for token in tokens):
+                missing.append(claim.get("display") or sorted(tokens)[0])
+
+        if not missing:
+            return ""
+
+        lines = [
+            "⚠️ Post-fallback artefact verifier: this turn switched to a fallback model, "
+            "and the final answer mentions artefact(s) that were not found in same-turn "
+            "tool evidence. Treat these claims as unverified until checked."
+        ]
+        for display in missing[:8]:
+            lines.append(f"  • {display}")
+        if len(missing) > 8:
+            lines.append(f"  • … and {len(missing) - 8} more")
+        return "\n".join(lines)
+
     @staticmethod
     def _format_file_mutation_failure_footer(failed: Dict[str, Dict[str, Any]]) -> str:
         """Render the per-turn failed-mutation dict as a user-facing footer.
@@ -8849,6 +9109,7 @@ class AIAgent:
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self._fallback_activated = True
+            self._turn_fallback_activated = True
 
             # Honor per-provider / per-model request_timeout_seconds for the
             # fallback target (same knob the primary client uses).  None = use
@@ -11091,16 +11352,17 @@ class AIAgent:
                     result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
-                # Track file-mutation outcome for the turn-end verifier.
-                # `blocked` calls never actually ran — don't let a guardrail
-                # block count as either a failure or a success.
+                # Track artefact evidence and file-mutation outcome for the
+                # turn-end verifiers. `blocked` calls never actually ran — don't
+                # let a guardrail block count as either a failure or a success.
                 if not blocked:
                     try:
+                        self._record_artifact_evidence(function_name, function_args, function_result)
                         self._record_file_mutation_result(
                             function_name, function_args, function_result, is_error,
                         )
                     except Exception as _ver_err:
-                        logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                        logging.debug("turn verifier record failed: %s", _ver_err)
 
                 if not blocked and self.tool_progress_callback:
                     try:
@@ -11524,17 +11786,18 @@ class AIAgent:
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 
-            # Track file-mutation outcome for the turn-end verifier.  See
-            # the concurrent path for the rationale; both paths must feed
-            # the same state so the footer reflects every tool call in the
-            # turn, not just the parallel ones.
+            # Track artefact evidence and file-mutation outcome for the
+            # turn-end verifiers.  See the concurrent path for the rationale;
+            # both paths must feed the same state so the footers reflect every
+            # tool call in the turn, not just the parallel ones.
             if not _execution_blocked:
                 try:
+                    self._record_artifact_evidence(function_name, function_args, function_result)
                     self._record_file_mutation_result(
                         function_name, function_args, function_result, _is_error_result,
                     )
                 except Exception as _ver_err:
-                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                    logging.debug("turn verifier record failed: %s", _ver_err)
 
             if not _execution_blocked and self.tool_progress_callback:
                 try:
@@ -12238,6 +12501,8 @@ class AIAgent:
         # present are surfaced in an advisory footer so the model cannot
         # over-claim success while the file is actually unchanged on disk.
         self._turn_failed_file_mutations: Dict[str, Dict[str, Any]] = {}
+        self._turn_artifact_evidence_tokens: set[str] = set()
+        self._turn_fallback_activated = False
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -15566,6 +15831,20 @@ class AIAgent:
                         final_response = final_response.rstrip() + "\n\n" + footer
             except Exception as _ver_err:
                 logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+
+            try:
+                footer = self._format_post_fallback_artifact_guard_footer(
+                    final_response,
+                    messages,
+                    current_turn_user_idx=current_turn_user_idx,
+                )
+                if footer:
+                    final_response = final_response.rstrip() + "\n\n" + footer
+            except Exception as _artifact_ver_err:
+                logger.debug(
+                    "post-fallback artefact verifier footer failed: %s",
+                    _artifact_ver_err,
+                )
 
         # Plugin hook: transform_llm_output
         # Fired once per turn after the tool-calling loop completes.
