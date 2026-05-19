@@ -58,6 +58,25 @@ _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
 
+# Codex Responses streams are more timeout-sensitive than normal chat
+# completions.  The live regression that motivated this cap had a 134K-char
+# noisy summary input (mostly tool JSON/logs) and requested ~15.6K output
+# tokens; the same auth/path passed with a ~55K-char synthetic payload.  Keep
+# Codex compression near that proven scale while leaving non-Codex providers on
+# the existing richer prompt path.
+_CODEX_SUMMARY_INPUT_CHAR_BUDGET = 32_000
+_CODEX_SUMMARY_TOKENS_CEILING = 3_000
+_CODEX_CONTENT_MAX = 1_800
+_CODEX_CONTENT_HEAD = 1_100
+_CODEX_CONTENT_TAIL = 450
+_CODEX_TOOL_RESULT_MAX = 850
+_CODEX_TOOL_RESULT_HEAD = 500
+_CODEX_TOOL_RESULT_TAIL = 220
+_CODEX_TOOL_ARGS_MAX = 520
+_CODEX_TOOL_ARGS_HEAD = 360
+_CODEX_SERIALIZED_HEAD_TURNS = 6
+_CODEX_SERIALIZED_TAIL_TURNS = 10
+
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -222,6 +241,90 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     return json.dumps(shrunken, ensure_ascii=False)
 
 
+def _truncate_middle_text(
+    text: str,
+    max_chars: int,
+    *,
+    head_chars: int | None = None,
+    tail_chars: int | None = None,
+) -> str:
+    """Keep the start and end of a long string with a clear omission marker."""
+    text = "" if text is None else str(text)
+    if len(text) <= max_chars:
+        return text
+    if head_chars is None:
+        head_chars = max(0, int(max_chars * 0.65))
+    if tail_chars is None:
+        tail_chars = max(0, max_chars - head_chars - 40)
+    head_chars = max(0, min(head_chars, max_chars))
+    tail_chars = max(0, min(tail_chars, max(0, max_chars - head_chars - 40)))
+    omitted = max(0, len(text) - head_chars - tail_chars)
+    marker = f"\n...[truncated {omitted:,} chars]...\n"
+    tail = text[-tail_chars:].lstrip() if tail_chars else ""
+    return text[:head_chars].rstrip() + marker + tail
+
+
+def _compact_tool_args_for_summary(args: str) -> str:
+    """Shrink tool-call args for Codex compression without corrupting JSON."""
+    if not args:
+        return ""
+    redacted = redact_sensitive_text(args)
+    if len(redacted) <= _CODEX_TOOL_ARGS_MAX:
+        return redacted
+    shrunk = _truncate_tool_call_args_json(redacted, head_chars=220)
+    if len(shrunk) <= _CODEX_TOOL_ARGS_MAX:
+        return shrunk
+    return _truncate_middle_text(
+        shrunk,
+        _CODEX_TOOL_ARGS_MAX,
+        head_chars=_CODEX_TOOL_ARGS_HEAD,
+        tail_chars=120,
+    )
+
+
+_TOOL_SNIPPET_MARKERS = (
+    "traceback", "exception", "error", "failed", "failure", "timeout",
+    "warning", "exit_code", "exit code", "status", "stderr", "stdout",
+    "pytest", "passed", "skipped", "changed", "modified", "diff",
+    "path", "file", "line", "matches", "total_count", "summary",
+)
+
+
+def _salient_tool_output_snippet(text: str, max_chars: int) -> str:
+    """Extract high-signal lines from noisy tool output for Codex summaries."""
+    if not text:
+        return ""
+    text = redact_sensitive_text(text)
+    if len(text) <= max_chars:
+        return text
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    salient: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        lower = line.lower()
+        if any(marker in lower for marker in _TOOL_SNIPPET_MARKERS):
+            clipped = _truncate_middle_text(line, 360, head_chars=250, tail_chars=80)
+            if clipped not in seen:
+                salient.append(clipped)
+                seen.add(clipped)
+        if len("\n".join(salient)) >= max_chars:
+            break
+
+    if not salient:
+        head = lines[:4]
+        tail = lines[-3:] if len(lines) > 4 else []
+        salient = [*head, *tail]
+
+    snippet = "\n".join(salient)
+    return _truncate_middle_text(
+        snippet,
+        max_chars,
+        head_chars=int(max_chars * 0.7),
+        tail_chars=int(max_chars * 0.2),
+    )
+
+
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Create an informative 1-line summary of a tool call + result.
 
@@ -370,6 +473,10 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._last_summary_input_chars = 0
+        self._last_summary_input_chars_original = 0
+        self._last_summary_payload_reduced = False
+        self._last_summary_budget_tokens = 0
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
@@ -485,6 +592,10 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        self._last_summary_input_chars: int = 0
+        self._last_summary_input_chars_original: int = 0
+        self._last_summary_payload_reduced: bool = False
+        self._last_summary_budget_tokens: int = 0
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -772,16 +883,24 @@ class ContextCompressor(ContextEngine):
                 if delay > 0:
                     time.sleep(delay)
 
-    def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
+    def _compute_summary_budget(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        codex_responses: bool = False,
+    ) -> int:
         """Scale summary token budget with the amount of content being compressed.
 
         The maximum scales with the model's context window (5% of context,
         capped at ``_SUMMARY_TOKENS_CEILING``) so large-context models get
-        richer summaries instead of being hard-capped at 8K tokens.
+        richer summaries instead of being hard-capped at 8K tokens.  Codex
+        Responses gets a smaller ceiling because long output budgets materially
+        increase stream duration and caused real compression timeouts.
         """
         content_tokens = estimate_messages_tokens_rough(turns_to_summarize)
         budget = int(content_tokens * _SUMMARY_RATIO)
-        return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
+        ceiling = min(self.max_summary_tokens, _CODEX_SUMMARY_TOKENS_CEILING) if codex_responses else self.max_summary_tokens
+        return max(_MIN_SUMMARY_TOKENS, min(budget, ceiling))
 
     # Truncation limits for the summarizer input.  These bound how much of
     # each message the summary model sees — the budget is the *summary*
@@ -792,7 +911,61 @@ class ContextCompressor(ContextEngine):
     _TOOL_ARGS_MAX = 1500     # tool call argument chars
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
 
-    def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
+    def _summary_uses_codex_responses(self) -> bool:
+        """Best-effort detection for the Codex Responses compression path."""
+        provider = (self.provider or "").strip().lower()
+        api_mode = (self.api_mode or "").strip().lower()
+        base_url = (self.base_url or "").strip().lower()
+        if provider == "openai-codex" or api_mode == "codex_responses" or "backend-api/codex" in base_url:
+            return True
+        # If this compressor was constructed without explicit runtime details,
+        # fall back to the configured auxiliary.compression provider.  This
+        # keeps the cap active when compression is explicitly routed to Codex
+        # even if the main model is not Codex.  Unit tests that need non-Codex
+        # behaviour pass a concrete non-Codex provider.
+        if provider or api_mode or base_url:
+            return False
+        try:
+            from agent.auxiliary_client import _resolve_task_provider_model
+            cfg_provider, _, cfg_base_url, _, cfg_api_mode = _resolve_task_provider_model("compression")
+        except Exception:
+            return False
+        cfg_provider = (cfg_provider or "").strip().lower()
+        cfg_api_mode = (cfg_api_mode or "").strip().lower()
+        cfg_base_url = (cfg_base_url or "").strip().lower()
+        return (
+            cfg_provider == "openai-codex"
+            or cfg_api_mode == "codex_responses"
+            or "backend-api/codex" in cfg_base_url
+        )
+
+    def _tool_call_lookup(self, turns: List[Dict[str, Any]]) -> Dict[str, tuple[str, str]]:
+        """Map tool_call_id -> (tool_name, arguments_json) for serializer hints."""
+        lookup: Dict[str, tuple[str, str]] = {}
+        for msg in turns:
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    cid = tc.get("id", "") or tc.get("call_id", "")
+                    fn = tc.get("function", {}) or {}
+                    lookup[cid] = (fn.get("name", "unknown"), fn.get("arguments", ""))
+                else:
+                    cid = getattr(tc, "id", "") or getattr(tc, "call_id", "") or ""
+                    fn = getattr(tc, "function", None)
+                    lookup[cid] = (
+                        getattr(fn, "name", "unknown") if fn else "unknown",
+                        getattr(fn, "arguments", "") if fn else "",
+                    )
+        return lookup
+
+    def _serialize_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        compact_for_codex: bool = False,
+        budget_chars: int | None = None,
+    ) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
         Includes tool call arguments and result content (up to
@@ -803,14 +976,33 @@ class ContextCompressor(ContextEngine):
         (API keys, tokens, passwords) from leaking into the summary that
         gets sent to the auxiliary model and persisted across compactions.
         """
+        tool_lookup = self._tool_call_lookup(turns) if compact_for_codex else {}
         parts = []
-        for msg in turns:
+        for idx, msg in enumerate(turns):
             role = msg.get("role", "unknown")
             content = redact_sensitive_text(msg.get("content") or "")
 
-            # Tool results: keep enough content for the summarizer
+            # Tool results: keep enough content for the summarizer.  In Codex
+            # mode, replace raw JSON/log/skill-doc blobs with a local concise
+            # description plus high-signal snippets before the LLM call.
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
+                if compact_for_codex:
+                    tool_name, tool_args = tool_lookup.get(tool_id, ("unknown", ""))
+                    summary = _summarize_tool_result(tool_name, tool_args, content)
+                    snippet = _salient_tool_output_snippet(content, _CODEX_TOOL_RESULT_MAX)
+                    if snippet and snippet != content:
+                        content = f"{summary}\nSalient output:\n{snippet}"
+                    else:
+                        content = f"{summary}\n{snippet}" if snippet else summary
+                    content = _truncate_middle_text(
+                        content,
+                        _CODEX_TOOL_RESULT_MAX,
+                        head_chars=_CODEX_TOOL_RESULT_HEAD,
+                        tail_chars=_CODEX_TOOL_RESULT_TAIL,
+                    )
+                    parts.append(f"[TOOL RESULT {tool_id}]: {content}")
+                    continue
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
@@ -818,7 +1010,14 @@ class ContextCompressor(ContextEngine):
 
             # Assistant messages: include tool call names AND arguments
             if role == "assistant":
-                if len(content) > self._CONTENT_MAX:
+                if compact_for_codex:
+                    content = _truncate_middle_text(
+                        content,
+                        _CODEX_CONTENT_MAX,
+                        head_chars=_CODEX_CONTENT_HEAD,
+                        tail_chars=_CODEX_CONTENT_TAIL,
+                    )
+                elif len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
@@ -827,25 +1026,108 @@ class ContextCompressor(ContextEngine):
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
-                            args = redact_sensitive_text(fn.get("arguments", ""))
+                            args = fn.get("arguments", "")
                             # Truncate long arguments but keep enough for context
-                            if len(args) > self._TOOL_ARGS_MAX:
-                                args = args[:self._TOOL_ARGS_HEAD] + "..."
+                            if compact_for_codex:
+                                args = _compact_tool_args_for_summary(args)
+                            else:
+                                args = redact_sensitive_text(args)
+                                if len(args) > self._TOOL_ARGS_MAX:
+                                    args = args[:self._TOOL_ARGS_HEAD] + "..."
                             tc_parts.append(f"  {name}({args})")
                         else:
                             fn = getattr(tc, "function", None)
                             name = getattr(fn, "name", "?") if fn else "?"
                             tc_parts.append(f"  {name}(...)")
                     content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
+                parts.append(f"[ASSISTANT #{idx + 1}]: {content}" if compact_for_codex else f"[ASSISTANT]: {content}")
                 continue
 
             # User and other roles
+            if compact_for_codex:
+                content = _truncate_middle_text(
+                    content,
+                    _CODEX_CONTENT_MAX,
+                    head_chars=_CODEX_CONTENT_HEAD,
+                    tail_chars=_CODEX_CONTENT_TAIL,
+                )
+                parts.append(f"[{role.upper()} #{idx + 1}]: {content}")
+                continue
             if len(content) > self._CONTENT_MAX:
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
+        if compact_for_codex and budget_chars and len("\n\n".join(parts)) > budget_chars:
+            parts = self._fit_serialized_summary_parts(parts, budget_chars)
+
         return "\n\n".join(parts)
+
+    def _fit_serialized_summary_parts(self, parts: List[str], budget_chars: int) -> List[str]:
+        """Fit serialized Codex summary parts inside a total character budget."""
+        if len("\n\n".join(parts)) <= budget_chars:
+            return parts
+        n = len(parts)
+        head_n = min(_CODEX_SERIALIZED_HEAD_TURNS, n)
+        tail_n = min(_CODEX_SERIALIZED_TAIL_TURNS, max(0, n - head_n))
+        head = list(parts[:head_n])
+        tail = list(parts[n - tail_n:]) if tail_n else []
+        middle = parts[head_n:n - tail_n] if tail_n else parts[head_n:]
+
+        def joined_len(items: List[str]) -> int:
+            return len("\n\n".join(items))
+
+        def digest_part(part: str) -> str:
+            lines = [line.strip() for line in part.splitlines() if line.strip()]
+            if not lines:
+                return "- [empty turn]"
+            kept: list[str] = [lines[0]]
+            for line in lines[1:]:
+                lower = line.lower()
+                if line.startswith("  ") or any(marker in lower for marker in _TOOL_SNIPPET_MARKERS):
+                    kept.append(line)
+                if len(kept) >= 4:
+                    break
+            return "- " + _truncate_middle_text(" | ".join(kept), 320, head_chars=230, tail_chars=60)
+
+        digest_lines = [digest_part(part) for part in middle]
+        digest = (
+            f"[... {len(middle)} middle turn(s) locally compressed to fit Codex compression budget ...]\n"
+            + "\n".join(digest_lines)
+        ) if middle else ""
+        selected = [*head, digest, *tail] if digest else [*head, *tail]
+
+        if joined_len(selected) <= budget_chars:
+            return selected
+
+        fixed_len = joined_len([*head, *tail])
+        digest_budget = max(1_200, budget_chars - fixed_len - 500)
+        if digest:
+            digest = _truncate_middle_text(
+                digest,
+                digest_budget,
+                head_chars=int(digest_budget * 0.72),
+                tail_chars=int(digest_budget * 0.18),
+            )
+            selected = [*head, digest, *tail]
+        if joined_len(selected) <= budget_chars:
+            return selected
+
+        # If the preserved head/tail alone still exceed the budget, shrink the
+        # largest preserved entries one by one, keeping role/tool labels and
+        # first/last snippets rather than dropping active context wholesale.
+        shrunk = list(selected)
+        while joined_len(shrunk) > budget_chars and shrunk:
+            largest_idx = max(range(len(shrunk)), key=lambda i: len(shrunk[i]))
+            current = shrunk[largest_idx]
+            target = max(600, int(len(current) * 0.65))
+            if len(current) <= target + 20:
+                target = max(300, len(current) - 300)
+            shrunk[largest_idx] = _truncate_middle_text(current, target)
+            if target <= 300:
+                break
+        if joined_len(shrunk) > budget_chars:
+            return [_truncate_middle_text("\n\n".join(shrunk), budget_chars)]
+        return shrunk
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -900,8 +1182,30 @@ class ContextCompressor(ContextEngine):
             )
             return None
 
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        codex_responses = self._summary_uses_codex_responses()
+        summary_budget = self._compute_summary_budget(
+            turns_to_summarize,
+            codex_responses=codex_responses,
+        )
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        original_summary_chars = len(content_to_summarize)
+        if codex_responses and original_summary_chars > _CODEX_SUMMARY_INPUT_CHAR_BUDGET:
+            content_to_summarize = self._serialize_for_summary(
+                turns_to_summarize,
+                compact_for_codex=True,
+                budget_chars=_CODEX_SUMMARY_INPUT_CHAR_BUDGET,
+            )
+            if not self.quiet_mode:
+                logger.info(
+                    "Codex compression payload reduced: %d -> %d chars; summary_budget=%d tokens",
+                    original_summary_chars,
+                    len(content_to_summarize),
+                    summary_budget,
+                )
+        self._last_summary_input_chars_original = original_summary_chars
+        self._last_summary_input_chars = len(content_to_summarize)
+        self._last_summary_payload_reduced = len(content_to_summarize) < original_summary_chars
+        self._last_summary_budget_tokens = summary_budget
 
         # Preamble shared by both first-compaction and iterative-update prompts.
         # Keep the wording deliberately plain: Azure/OpenAI-compatible content

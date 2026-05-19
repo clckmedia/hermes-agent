@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
 from agent.context_compressor import (
     ContextCompressor,
     SUMMARY_PREFIX,
+    _CODEX_SUMMARY_INPUT_CHAR_BUDGET,
     _SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS,
 )
 
@@ -261,6 +262,92 @@ class TestNonStringContent:
             "api_key": "codex-token",
             "api_mode": "codex_responses",
         }
+
+
+class TestCodexSummaryPayloadBudget:
+    def _mock_response(self, content="## Active Task\nUser asked to continue.\n\n## Goal\nKeep context."):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = content
+        return mock_response
+
+    def _tool_heavy_turns(self, count=34):
+        turns = [{"role": "user", "content": "Diagnose Hermes compression timeout regression."}]
+        for i in range(count):
+            args = (
+                '{"command": "python scripts/check_payload.py --session session_20260518_132107_0355ba", '
+                '"workdir": "/home/dmelsing/.hermes/hermes-agent", '
+                f'"path": "/tmp/payload-{i}.json", "content": "' + ("x" * 5000) + '"}'
+            )
+            turns.append({
+                "role": "assistant",
+                "content": f"Running diagnostic step {i}",
+                "tool_calls": [{
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": args},
+                }],
+            })
+            turns.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": (
+                    '{"exit_code": 0, "status": "success", "output": "'
+                    + f"checked /home/dmelsing/.hermes/sessions/session_{i}.json\\n"
+                    + "ERROR marker preserved for diagnosis\\n"
+                    + ("large-json-log-line " * 900)
+                    + '"}'
+                ),
+            })
+        turns.append({"role": "user", "content": "Latest request: implement the smallest safe fix."})
+        return turns
+
+    def test_codex_summary_prompt_is_locally_budgeted_before_llm_call(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                provider="openai-codex",
+                api_mode="codex_responses",
+                quiet_mode=True,
+            )
+
+        turns = self._tool_heavy_turns()
+        unbounded = c._serialize_for_summary(turns)
+        assert len(unbounded) > _CODEX_SUMMARY_INPUT_CHAR_BUDGET
+
+        with patch("agent.context_compressor.call_llm", return_value=self._mock_response()) as mock_call:
+            summary = c._generate_summary(turns)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert summary.startswith(SUMMARY_PREFIX)
+        assert c._last_summary_payload_reduced is True
+        assert c._last_summary_input_chars <= _CODEX_SUMMARY_INPUT_CHAR_BUDGET
+        assert c._last_summary_input_chars < len(unbounded)
+        assert mock_call.call_args.kwargs["max_tokens"] <= int(3_000 * 1.3)
+        assert len(prompt) < 50_000
+        assert "terminal" in prompt
+        assert "python scripts/check_payload.py" in prompt
+        assert "/home/dmelsing/.hermes/hermes-agent" in prompt
+        assert "ERROR marker preserved for diagnosis" in prompt
+        assert "large-json-log-line " * 200 not in prompt
+
+    def test_non_codex_summary_path_keeps_existing_rich_serialization(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
+            c = ContextCompressor(
+                model="anthropic/claude-sonnet-4",
+                provider="openrouter",
+                quiet_mode=True,
+            )
+
+        turns = self._tool_heavy_turns()
+        unbounded = c._serialize_for_summary(turns)
+        with patch("agent.context_compressor.call_llm", return_value=self._mock_response()) as mock_call:
+            c._generate_summary(turns)
+
+        assert c._last_summary_payload_reduced is False
+        assert c._last_summary_input_chars == len(unbounded)
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "large-json-log-line" in prompt
 
 
 class TestSummaryFailureCooldown:
