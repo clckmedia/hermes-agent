@@ -1256,6 +1256,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 hubspot_change = False
                 scope_decision = False
                 hubspot_status = "not applicable for ActivePieces automation repair; no HubSpot write in MVP."
+            if "lead-gen/outbound" in reasoning_issue_type or "campaign messaging" in reasoning_issue_type:
+                hubspot_change = False
+                scope_decision = False
+                support_action_request = False
+                hubspot_status = "not applicable for lead-gen/outbound strategy work; no HubSpot write in MVP."
             if "inferred internal support task" in reasoning_issue_type:
                 support_action_request = True
                 hubspot_change = False
@@ -1442,7 +1447,9 @@ class WebhookAdapter(BasePlatformAdapter):
             elif work_mode == "needs_specific_info":
                 risk_level = reasoning_risk or "specific missing information/access needed"
             if evidence_supported and read_only_findings:
-                if hubspot_change and reasoning_status == "scoped":
+                if hubspot_status.lower().startswith("not applicable"):
+                    pass
+                elif hubspot_change and reasoning_status == "scoped":
                     hubspot_status = "portal/token found; support scope check completed; no writes in MVP."
                 else:
                     hubspot_status = "portal/token found; read-only inspection completed; no writes in MVP."
@@ -1482,8 +1489,9 @@ class WebhookAdapter(BasePlatformAdapter):
             client_reply_required = False
             draft_reply = ""
 
+        triage_title = "**CLCK support triage**" if "hubspot" not in issue_type.lower() and not requires_hubspot else "**CLCK HubSpot support triage**"
         lines = [
-            "**CLCK HubSpot support triage**",
+            triage_title,
             f"`{triage_id}` · Reply in this thread with `@Arlo` plus new facts/approval; this thread becomes the working session for this card.",
             "",
             "**1) Request**",

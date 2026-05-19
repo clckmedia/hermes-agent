@@ -1075,6 +1075,128 @@ class TestHubSpotSupportTriage:
         assert "Create/assign the in-scope HubSpot support tasks now" not in card
         assert "notification or handoff owners" not in card
 
+    def test_qibn_kb_migration_reasoning_renders_internal_plan_without_draft(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "damien@clck.com.au",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: QIBN Portal Resources",
+                    "snippet": "Bryanna asks to create another Heading below Business Stages and migrate SharePoint Learning Resources into the HubSpot KB.",
+                },
+                "support": {"summary": "QIBN Portal Resources KB migration request.", "requires_hubspot_access": True},
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_name": "QIBN",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "portal_id": "441710257",
+                    "hubspot_access_status": "connected",
+                    "hubspot_token_reference_present": True,
+                },
+                "support_reasoning": {
+                    "status": "support_action_required",
+                    "evidence_status": "action_requested",
+                    "evidence_supported": False,
+                    "issue_type": "HubSpot Knowledge Base / content migration",
+                    "work_mode": "internal_action_plan",
+                    "client_reply_required": False,
+                    "client_ask": "Create another KB heading/category below Business Stages and migrate SharePoint Learning Resources into the HubSpot Knowledge Base.",
+                    "likely_system_area": "HubSpot Knowledge Base / content migration",
+                    "read_only_findings": ["Forwarded request evidence names QIBN Portal Resources, Business Stages, SharePoint Learning Resources, and HubSpot KB/content migration work."],
+                    "internal_plan": [
+                        "Inspect the QIBN HubSpot portal and Knowledge Base structure read-only.",
+                        "Locate the existing Business Stages KB heading/category.",
+                        "Inspect/source the SharePoint Learning Resources section if accessible; otherwise identify the exact missing access or source link needed.",
+                        "Map the Learning Resources items into a new KB heading/category below Business Stages.",
+                        "Prepare a migration checklist/import/edit plan for the KB content and source files.",
+                        "Ask Damien approval before any HubSpot KB creation/edit/publish or client-facing send.",
+                    ],
+                    "approval_needed": "Damien approval is required before any HubSpot KB creation, edit, import, publish, File Manager upload, redirect/archive action, external send, or client-facing Slack/email reply.",
+                    "recommended_internal_action": "Prepare a read-only QIBN Knowledge Base migration plan and ask approval before any KB creation/edit/publish or client-facing send.",
+                    "draft_client_reply": "",
+                },
+            }
+        )
+
+        assert "Client match: matched client: QIBN (safe_match)" in card
+        assert "Issue type: HubSpot Knowledge Base / content migration" in card
+        assert "Likely system area: HubSpot Knowledge Base / content migration" in card
+        assert "Internal plan: Inspect the QIBN HubSpot portal and Knowledge Base structure read-only" in card
+        assert "Business Stages KB heading/category" in card
+        assert "SharePoint Learning Resources section" in card
+        assert "KB creation/edit/publish" in card
+        assert "Draft client reply:" not in card
+        assert "HubSpot CRM/configuration change path" not in card
+        assert "Triage and scope the support request" not in card
+
+    def test_a_frame_beyond_outbound_reasoning_renders_non_hubspot_internal_plan_without_reply(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Giles Anderton <giles@aframebeyond.co>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Fwd: adjustments",
+                },
+                "support": {
+                    "summary": "A Frame Beyond repositioned; lead magnets; outreach industrial machinery mismatch.",
+                },
+                "matcher": {
+                    "decision": "route_client",
+                    "reason": "safe_match",
+                    "client_key": "a_frame_beyond",
+                    "client_name": "A Frame Beyond",
+                    "owner_primary": "Damien",
+                    "assignee_hint": "Damien",
+                    "hubspot_access_status": "not_applicable",
+                    "hubspot_access_needed": False,
+                },
+                "support_reasoning": {
+                    "status": "support_action_required",
+                    "issue_type": "lead-gen/outbound strategy/campaign messaging",
+                    "work_mode": "internal_action_plan",
+                    "client_reply_required": False,
+                    "client_ask": "Review A Frame Beyond outreach direction after repositioning and reported mismatch from the ‘industrial machinery’ opener.",
+                    "likely_system_area": "lead-gen/outbound strategy/campaign messaging",
+                    "read_only_findings": [
+                        "Matched client: A Frame Beyond.",
+                        "Forwarded request evidence mentions repositioning, lead magnets, outreach, and the industrial machinery mismatch.",
+                    ],
+                    "internal_plan": [
+                        "Review the current campaign/outreach messaging and ICP assumptions.",
+                        "Remove or revise the ‘industrial machinery’ opener because the client reports mismatch.",
+                        "Inspect the repositioned A Frame Beyond site and lead-magnet/workshop offer direction.",
+                        "Draft revised positioning angles for execs/directors.",
+                        "Propose the next outbound test structure: audience segments, message variants, CTA/lead magnet path, and success checks.",
+                        "Ask for approval before campaign copy changes, launching outreach, sending external messages, or changing live automation/campaigns.",
+                    ],
+                    "recommended_internal_action": "Prepare an internal outbound adjustment plan before any campaign changes.",
+                    "approval_needed": "Approval is required before campaign copy changes, launching outreach, sending external messages, or changing live automation/campaigns.",
+                    "draft_client_reply": "",
+                },
+            }
+        )
+
+        assert card.startswith("**CLCK support triage**")
+        assert "Client match: matched client: A Frame Beyond (safe_match)" in card
+        assert "HubSpot status: not applicable for lead-gen/outbound strategy work" in card
+        assert "Issue type: lead-gen/outbound strategy/campaign messaging" in card
+        assert "Likely system area: lead-gen/outbound strategy/campaign messaging" in card
+        assert "current campaign/outreach messaging and ICP assumptions" in card
+        assert "Remove or revise the ‘industrial machinery’ opener" in card
+        assert "positioning angles for execs/directors" in card
+        assert "audience segments, message variants, CTA/lead magnet path, and success checks" in card
+        assert "Approval needed: Approval is required before campaign copy changes" in card
+        assert "Draft client reply:" not in card
+        assert "Issue type: HubSpot change request" not in card
+        assert "HubSpot CRM/configuration" not in card
+        assert "Triage and scope the support request" not in card
+
     def test_simple_question_reasoning_still_renders_draft_client_reply(self):
         adapter = _make_adapter()
         card = adapter._format_hubspot_support_triage_card(
