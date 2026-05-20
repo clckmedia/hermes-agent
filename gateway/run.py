@@ -6975,7 +6975,7 @@ class GatewayRunner:
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if _is_shared_multi_user and source.user_name and not getattr(event, "internal", False):
             message_text = f"[{source.user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
@@ -7972,6 +7972,11 @@ class GatewayRunner:
                         _watch_events.append(evt)
                     # else: completion events are handled by the watcher task
                 for evt in _watch_events:
+                    # These events are drained only after the agent has already
+                    # produced its final result (and, for streaming replies,
+                    # potentially after the user-visible final message was sent).
+                    # Treat them as lifecycle telemetry, not as a fresh user turn.
+                    evt["_origin_turn_finalized"] = True
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
                         try:
@@ -13649,6 +13654,29 @@ class GatewayRunner:
             )
             return
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        session_key = str(evt.get("session_key") or "").strip()
+        running_agent = self._running_agents.get(session_key) if session_key else None
+        suppression_reason = None
+        if evt.get("_origin_turn_finalized"):
+            suppression_reason = "originating session/turn final response already produced"
+        elif not session_key:
+            suppression_reason = "missing session_key"
+        elif running_agent is None:
+            suppression_reason = "originating session/turn is no longer active"
+        elif running_agent is _AGENT_PENDING_SENTINEL:
+            suppression_reason = "originating session/turn is still starting"
+        if suppression_reason:
+            process_id = str(evt.get("session_id") or "unknown")
+            command_preview = _gateway_log_preview(evt.get("command", ""), limit=200)
+            pattern = evt.get("pattern") or evt.get("type") or ""
+            logger.info(
+                f"Suppressing watch pattern notification for process {process_id} "
+                f"command={command_preview!r} pattern={pattern!r} "
+                f"target={platform_name} chat={source.chat_id} thread={source.thread_id} "
+                f"session=*** reason={suppression_reason}"
+            )
+            return
+
         adapter = None
         for p, a in self.adapters.items():
             if p.value == platform_name:

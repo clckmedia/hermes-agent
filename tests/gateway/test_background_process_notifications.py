@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner, _parse_session_key
 
 
@@ -246,12 +247,13 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
+async def test_inject_watch_notification_routes_from_session_store_origin_when_active(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
-    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+    session_key = "agent:main:telegram:group:-100:42"
+    runner.session_store._entries[session_key] = SimpleNamespace(
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="-100",
@@ -261,10 +263,11 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
             user_name="Emiliyan",
         )
     )
+    runner._running_agents[session_key] = object()
 
     evt = {
         "session_id": "proc_watch",
-        "session_key": "agent:main:telegram:group:-100:42",
+        "session_key": session_key,
     }
 
     await runner._inject_watch_notification("[SYSTEM: Background process matched]", evt)
@@ -278,6 +281,131 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "123"
     assert synth_event.source.user_name == "Emiliyan"
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_suppresses_after_origin_turn_finalised(
+    monkeypatch, tmp_path, caplog
+):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:group:-100:42"
+    runner.session_store._entries[session_key] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            thread_id="42",
+            user_id="123",
+            user_name="Damien",
+        )
+    )
+
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_late_preview",
+        "session_key": session_key,
+        "command": "npm run dev -- --host 127.0.0.1",
+        "pattern": "Local",
+    }
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._inject_watch_notification(
+            "[IMPORTANT: Background process proc_late_preview matched watch pattern \"Local\"]",
+            evt,
+        )
+
+    adapter.handle_message.assert_not_awaited()
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Suppressing watch pattern notification" in log_text
+    assert "proc_late_preview" in log_text
+    assert "npm run dev -- --host 127.0.0.1" in log_text
+    assert "pattern='Local'" in log_text
+    assert "target=telegram chat=-100 thread=42" in log_text
+    assert "originating session/turn is no longer active" in log_text
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_suppresses_post_final_drain_even_while_runner_active(
+    monkeypatch, tmp_path, caplog
+):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:group:-100:42"
+    runner.session_store._entries[session_key] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            thread_id="42",
+            user_id="123",
+            user_name="Damien",
+        )
+    )
+    runner._running_agents[session_key] = object()
+
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_streaming_preview",
+        "session_key": session_key,
+        "command": "npm run dev -- --host 127.0.0.1",
+        "pattern": "Local",
+        "_origin_turn_finalized": True,
+    }
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._inject_watch_notification(
+            "[IMPORTANT: Background process proc_streaming_preview matched watch pattern \"Local\"]",
+            evt,
+        )
+
+    adapter.handle_message.assert_not_awaited()
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Suppressing watch pattern notification" in log_text
+    assert "proc_streaming_preview" in log_text
+    assert "target=telegram chat=-100 thread=42" in log_text
+    assert "originating session/turn final response already produced" in log_text
+
+
+@pytest.mark.asyncio
+async def test_internal_watch_notification_not_prefixed_as_shared_user_message(monkeypatch, tmp_path):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="group",
+        thread_id="42",
+        user_id="123",
+        user_name="Damien",
+    )
+
+    internal_event = MessageEvent(
+        text='[IMPORTANT: Background process proc_123 matched watch pattern "Local"]',
+        source=source,
+        internal=True,
+    )
+    internal_text = await runner._prepare_inbound_message_text(
+        event=internal_event,
+        source=source,
+        history=[],
+    )
+
+    normal_event = MessageEvent(text="please check this", source=source)
+    normal_text = await runner._prepare_inbound_message_text(
+        event=normal_event,
+        source=source,
+        history=[],
+    )
+
+    assert internal_text == internal_event.text
+    assert not internal_text.startswith("[Damien]")
+    assert normal_text == "[Damien] please check this"
 
 
 def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypatch, tmp_path):
@@ -347,7 +475,8 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
     adapter = runner.adapters[Platform.TELEGRAM]
 
     # Session store has the process's original thread (thread 42)
-    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+    session_key = "agent:main:telegram:group:-100:42"
+    runner.session_store._entries[session_key] = SimpleNamespace(
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="-100",
@@ -357,11 +486,12 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
             user_name="alice",
         )
     )
+    runner._running_agents[session_key] = object()
 
     # The evt dict carries the correct session_key — NOT a foreground event
     evt = {
         "session_id": "proc_cross_thread",
-        "session_key": "agent:main:telegram:group:-100:42",
+        "session_key": session_key,
     }
 
     await runner._inject_watch_notification("[SYSTEM: watch match]", evt)
