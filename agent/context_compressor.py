@@ -62,10 +62,16 @@ _SUMMARY_TOKENS_CEILING = 12_000
 # completions.  The live regression that motivated this cap had a 134K-char
 # noisy summary input (mostly tool JSON/logs) and requested ~15.6K output
 # tokens; the same auth/path passed with a ~55K-char synthetic payload.  Keep
-# Codex compression near that proven scale while leaving non-Codex providers on
-# the existing richer prompt path.
-_CODEX_SUMMARY_INPUT_CHAR_BUDGET = 32_000
+# Codex compression near that proven scale and keep one smaller emergency
+# payload available for genuine transient stream/network failures.  If Codex
+# still hits the adapter's total stream timeout after local budgeting, use a
+# local extractive digest rather than another 120s retry followed by an
+# unsummarised context-loss marker.  Non-Codex providers stay on the existing
+# richer prompt path.
+_CODEX_SUMMARY_INPUT_CHAR_BUDGET = 20_000
+_CODEX_EMERGENCY_SUMMARY_INPUT_CHAR_BUDGET = 12_000
 _CODEX_SUMMARY_TOKENS_CEILING = 3_000
+_CODEX_EMERGENCY_SUMMARY_TOKENS_CEILING = 2_000
 _CODEX_CONTENT_MAX = 1_800
 _CODEX_CONTENT_HEAD = 1_100
 _CODEX_CONTENT_TAIL = 450
@@ -811,13 +817,19 @@ class ContextCompressor(ContextEngine):
         fallback marker.  Configuration/validation failures should not be
         retried because the same request will fail again and delay the turn.
         """
+        err_text = str(exc).lower()
+        if "codex auxiliary responses stream exceeded" in err_text:
+            # This is the adapter's enforced total wall-clock timeout, not a
+            # quick network blip. Retrying another full stream has repeatedly
+            # produced a second 120s stall followed by an unsummarised fallback;
+            # let the Codex-specific fallback path build a local digest instead.
+            return False
+
         status = getattr(exc, "status_code", None) or getattr(
             getattr(exc, "response", None), "status_code", None
         )
         if status in {408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524}:
             return True
-
-        err_text = str(exc).lower()
         transient_markers = (
             "peer closed connection",
             "incomplete chunked read",
@@ -838,12 +850,22 @@ class ContextCompressor(ContextEngine):
         )
         return any(marker in err_text for marker in transient_markers)
 
-    def _call_summary_llm_with_retries(self, call_kwargs: Dict[str, Any]):
+    def _call_summary_llm_with_retries(
+        self,
+        call_kwargs: Dict[str, Any],
+        *,
+        retry_call_kwargs: Dict[str, Any] | None = None,
+        retry_description: str = "same payload",
+    ):
         """Call the summary LLM, retrying transient streaming/network errors.
 
         Raises the final exception to the existing fallback/cooldown logic if
         every attempt fails.  RuntimeError keeps the old behaviour because this
         path historically means no auxiliary provider is configured.
+
+        ``retry_call_kwargs`` lets timeout-sensitive routes retry with a smaller
+        locally-generated payload instead of spending the retry budget on the
+        same request shape that already exceeded the stream timeout.
         """
         max_attempts = 1 + len(_SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS)
         explicit_model = call_kwargs.get("model")
@@ -872,16 +894,24 @@ class ContextCompressor(ContextEngine):
                 err_text = str(exc).strip() or exc.__class__.__name__
                 if len(err_text) > 220:
                     err_text = err_text[:217].rstrip() + "..."
+                if retry_call_kwargs is not None and attempt == 1:
+                    next_kwargs = retry_call_kwargs
+                    retry_note = retry_description
+                else:
+                    next_kwargs = call_kwargs
+                    retry_note = "same payload"
                 logger.info(
                     "Context summary attempt %d/%d failed with transient error; "
-                    "retrying in %.1fs: %s",
+                    "retrying in %.1fs with %s: %s",
                     attempt,
                     max_attempts,
                     delay,
+                    retry_note,
                     err_text,
                 )
                 if delay > 0:
                     time.sleep(delay)
+                call_kwargs = next_kwargs
 
     def _compute_summary_budget(
         self,
@@ -1156,6 +1186,91 @@ class ContextCompressor(ContextEngine):
         self.summary_model = ""  # empty = use main model
         self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
 
+    def _generate_local_timeout_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        reason: str,
+        focus_topic: Optional[str] = None,
+    ) -> str:
+        """Build an extractive continuity summary when Codex summary times out.
+
+        This is deliberately not a generic fallback for all providers.  It is a
+        last-resort Codex timeout path that preserves a compact, redacted digest
+        of the removed turns instead of inserting the unhelpful
+        "Summary generation was unavailable" marker.
+        """
+        digest = self._serialize_for_summary(
+            turns_to_summarize,
+            compact_for_codex=True,
+            budget_chars=_CODEX_EMERGENCY_SUMMARY_INPUT_CHAR_BUDGET,
+        )
+        latest_compacted_user = "None found in the compacted region."
+        for msg in reversed(turns_to_summarize):
+            if msg.get("role") == "user":
+                latest_compacted_user = _truncate_middle_text(
+                    redact_sensitive_text(_content_text_for_contains(msg.get("content"))),
+                    1_200,
+                    head_chars=800,
+                    tail_chars=280,
+                ) or latest_compacted_user
+                break
+
+        role_counts: Dict[str, int] = {}
+        for msg in turns_to_summarize:
+            role = msg.get("role", "unknown")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        role_summary = ", ".join(f"{role}={count}" for role, count in sorted(role_counts.items())) or "none"
+        reason_text = _truncate_middle_text(str(reason or "Codex auxiliary summary timed out"), 240)
+        focus_line = f"\n- Requested compression focus: {focus_topic}" if focus_topic else ""
+
+        body = f"""## Active Task
+The current active task should be taken from the preserved messages after this summary. Most recent compacted user turn: {latest_compacted_user}
+
+## Goal
+Preserve continuity after the Codex auxiliary compression summary timed out.
+
+## Constraints & Preferences
+- This is a local extractive digest generated by Hermes because the auxiliary Codex summarizer exceeded its stream timeout.
+- It is source material only; the preserved messages after this summary remain authoritative for the live next action.{focus_line}
+
+## Completed Actions
+Local digest of compacted turns follows under Critical Context. It keeps role labels, tool names, commands/paths/status/error snippets, and first/last high-signal excerpts where available.
+
+## Active State
+- Compacted turns preserved in digest: {len(turns_to_summarize)} ({role_summary}).
+- Auxiliary summary failure: {reason_text}.
+
+## In Progress
+Unknown from local digest alone; inspect the preserved tail messages after this summary for current in-progress work.
+
+## Blocked
+- Auxiliary Codex summary timed out before producing a model-written summary.
+
+## Key Decisions
+- Hermes used a local extractive digest instead of dropping the compacted turns or inserting an unsummarised fallback marker.
+
+## Resolved Questions
+See Critical Context digest.
+
+## Pending User Asks
+See the preserved messages after this summary for the active ask; compacted asks are quoted in Critical Context when present.
+
+## Relevant Files
+See file paths and tool-output snippets in Critical Context.
+
+## Remaining Work
+Continue from the preserved tail messages and use the digest below only for prior context.
+
+## Critical Context
+{digest}"""
+        summary = redact_sensitive_text(body.strip())
+        self._previous_summary = summary
+        self._summary_failure_cooldown_until = 0.0
+        self._summary_model_fallen_back = False
+        self._last_summary_error = None
+        return self._with_summary_prefix(summary)
+
     def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1224,8 +1339,11 @@ class ContextCompressor(ContextEngine):
             "do not preserve their values."
         )
 
-        # Shared structured template (used by both paths).
-        _template_sections = f"""## Active Task
+        # Shared structured template (used by both paths).  Build it lazily so
+        # timeout-prone Codex retries can ask for a smaller emergency summary
+        # without duplicating the whole prompt body.
+        def _build_template_sections(target_tokens: int) -> str:
+            return f"""## Active Task
 [THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
 task assignment verbatim — the exact words they used. If multiple tasks
 were requested and only some are done, list only the ones NOT yet completed.
@@ -1286,13 +1404,15 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{target_tokens} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
 Write only the summary body. Do not include any preamble or prefix."""
 
-        if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress
-            prompt = f"""{_summarizer_preamble}
+        def _build_summary_prompt(serialized_turns: str, target_tokens: int) -> str:
+            template_sections = _build_template_sections(target_tokens)
+            if self._previous_summary:
+                # Iterative update: preserve existing info, add new progress
+                built_prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
@@ -1300,31 +1420,50 @@ PREVIOUS SUMMARY:
 {self._previous_summary}
 
 NEW TURNS TO INCORPORATE:
-{content_to_summarize}
+{serialized_turns}
 
 Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
 
-{_template_sections}"""
-        else:
-            # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
+{template_sections}"""
+            else:
+                # First compaction: summarize from scratch
+                built_prompt = f"""{_summarizer_preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
 
 TURNS TO SUMMARIZE:
-{content_to_summarize}
+{serialized_turns}
 
 Use this exact structure:
 
-{_template_sections}"""
+{template_sections}"""
 
-        # Inject focus topic guidance when the user provides one via /compress <focus>.
-        # This goes at the end of the prompt so it takes precedence.
-        if focus_topic:
-            prompt += f"""
+            # Inject focus topic guidance when the user provides one via /compress <focus>.
+            # This goes at the end of the prompt so it takes precedence.
+            if focus_topic:
+                built_prompt += f"""
 
 FOCUS TOPIC: "{focus_topic}"
 The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+            return built_prompt
+
+        prompt = _build_summary_prompt(content_to_summarize, summary_budget)
+        emergency_prompt = None
+        emergency_summary_budget = max(
+            _MIN_SUMMARY_TOKENS,
+            min(summary_budget, _CODEX_EMERGENCY_SUMMARY_TOKENS_CEILING),
+        )
+        if codex_responses:
+            emergency_content = self._serialize_for_summary(
+                turns_to_summarize,
+                compact_for_codex=True,
+                budget_chars=_CODEX_EMERGENCY_SUMMARY_INPUT_CHAR_BUDGET,
+            )
+            if len(emergency_content) < len(content_to_summarize):
+                emergency_prompt = _build_summary_prompt(
+                    emergency_content,
+                    emergency_summary_budget,
+                )
 
         try:
             call_kwargs = {
@@ -1342,7 +1481,18 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
-            response = self._call_summary_llm_with_retries(call_kwargs)
+            retry_call_kwargs = None
+            if emergency_prompt:
+                retry_call_kwargs = {
+                    **call_kwargs,
+                    "messages": [{"role": "user", "content": emergency_prompt}],
+                    "max_tokens": int(emergency_summary_budget * 1.3),
+                }
+            response = self._call_summary_llm_with_retries(
+                call_kwargs,
+                retry_call_kwargs=retry_call_kwargs,
+                retry_description="emergency Codex summary payload",
+            )
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
@@ -1402,6 +1552,23 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # back to the main model instead of entering a 60-second cooldown.
             # See issue #18458.
             _is_streaming_closed = _is_connection_error(e)
+            _is_codex_total_timeout = "codex auxiliary responses stream exceeded" in _err_str
+            if codex_responses and _is_codex_total_timeout:
+                err_text = str(e).strip() or e.__class__.__name__
+                if len(err_text) > 220:
+                    err_text = err_text[:217].rstrip() + "..."
+                self._last_aux_model_failure_error = err_text
+                self._last_aux_model_failure_model = self.summary_model or self.model
+                logging.warning(
+                    "Codex compression summary timed out after local payload budgeting; "
+                    "using local extractive continuity digest instead of an unsummarised fallback marker: %s",
+                    err_text,
+                )
+                return self._generate_local_timeout_summary(
+                    turns_to_summarize,
+                    reason=err_text,
+                    focus_topic=focus_topic,
+                )
             if _is_json_decode and not _is_model_not_found and not _is_timeout:
                 logger.error(
                     "Context compression failed: auxiliary LLM returned a "

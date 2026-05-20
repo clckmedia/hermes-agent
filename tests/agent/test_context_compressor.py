@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
 from agent.context_compressor import (
     ContextCompressor,
     SUMMARY_PREFIX,
+    _CODEX_EMERGENCY_SUMMARY_INPUT_CHAR_BUDGET,
     _CODEX_SUMMARY_INPUT_CHAR_BUDGET,
     _SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS,
 )
@@ -330,6 +331,80 @@ class TestCodexSummaryPayloadBudget:
         assert "/home/dmelsing/.hermes/hermes-agent" in prompt
         assert "ERROR marker preserved for diagnosis" in prompt
         assert "large-json-log-line " * 200 not in prompt
+
+    def test_codex_transient_error_retries_with_emergency_payload_before_fallback(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                provider="openai-codex",
+                api_mode="codex_responses",
+                quiet_mode=True,
+            )
+
+        turns = self._tool_heavy_turns()
+        transient = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+        with (
+            patch(
+                "agent.context_compressor.call_llm",
+                side_effect=[transient, self._mock_response("## Active Task\nRecovered after emergency retry.")],
+            ) as mock_call,
+            patch("agent.context_compressor.time.sleep") as mock_sleep,
+        ):
+            summary = c._generate_summary(turns)
+
+        assert mock_call.call_count == 2
+        mock_sleep.assert_called_once_with(_SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS[0])
+        first_prompt = mock_call.call_args_list[0].kwargs["messages"][0]["content"]
+        second_prompt = mock_call.call_args_list[1].kwargs["messages"][0]["content"]
+        assert len(second_prompt) < len(first_prompt)
+        assert mock_call.call_args_list[1].kwargs["max_tokens"] <= int(2_000 * 1.3)
+        assert len(second_prompt) < _CODEX_EMERGENCY_SUMMARY_INPUT_CHAR_BUDGET + 10_000
+        assert "python scripts/check_payload.py" in second_prompt
+        assert "ERROR marker preserved for diagnosis" in second_prompt
+        assert "large-json-log-line " * 200 not in second_prompt
+        assert summary is not None
+        assert summary.startswith(SUMMARY_PREFIX)
+        assert "Recovered after emergency retry" in summary
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_error is None
+
+    def test_codex_total_timeout_uses_local_digest_without_second_llm_call(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                provider="openai-codex",
+                api_mode="codex_responses",
+                quiet_mode=True,
+            )
+
+        turns = self._tool_heavy_turns()
+        timeout = TimeoutError("Codex auxiliary Responses stream exceeded 120.0s total timeout")
+
+        with (
+            patch("agent.context_compressor.call_llm", side_effect=timeout) as mock_call,
+            patch("agent.context_compressor.time.sleep") as mock_sleep,
+        ):
+            summary = c._generate_summary(turns, focus_topic="compression reliability")
+
+        assert mock_call.call_count == 1
+        mock_sleep.assert_not_called()
+        assert summary is not None
+        assert summary.startswith(SUMMARY_PREFIX)
+        assert "Summary generation was unavailable" not in summary
+        assert "## Active Task" in summary
+        assert "Latest request: implement the smallest safe fix." in summary
+        assert "local extractive digest" in summary
+        assert "Codex auxiliary Responses stream exceeded 120.0s total timeout" in summary
+        assert "compression reliability" in summary
+        assert "python scripts/check_payload.py" in summary
+        assert "ERROR marker preserved for diagnosis" in summary
+        assert "large-json-log-line " * 200 not in summary
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_error is None
 
     def test_non_codex_summary_path_keeps_existing_rich_serialization(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
