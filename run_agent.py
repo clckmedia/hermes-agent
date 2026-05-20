@@ -2639,11 +2639,13 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
-        # Check immediately so CLI users see the warning at startup.
-        # Gateway status_callback is not yet wired, so any warning is stored
-        # in _compression_warning and replayed in the first run_conversation().
+        # Lazy feasibility check: deferred to the first turn that approaches the
+        # compression threshold. Running it eagerly here costs cold-start time
+        # (network probe of the auxiliary provider chain + /models lookup) on
+        # every agent init, including short runs that never reach the threshold.
+        # _compress_context() runs it at most once per agent.
         self._compression_warning = None
-        self._check_compression_model_feasibility()
+        self._compression_feasibility_checked = False
 
         # Snapshot primary runtime for per-turn restoration.  When fallback
         # activates during a turn, the next turn restores these values so the
@@ -10691,6 +10693,12 @@ class AIAgent:
         Returns:
             (compressed_messages, new_system_prompt) tuple
         """
+        if not getattr(self, "_compression_feasibility_checked", True):
+            try:
+                self._check_compression_model_feasibility()
+            finally:
+                self._compression_feasibility_checked = True
+
         _pre_msg_count = len(messages)
         logger.info(
             "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
