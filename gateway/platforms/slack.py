@@ -2486,6 +2486,8 @@ class SlackAdapter(BasePlatformAdapter):
         _auto_skill = resolve_channel_skills(
             self.config.extra, channel_id, None,
         )
+        if _auto_skill is None and _clck_context is not None:
+            _auto_skill = ["clck-client-operations"]
 
         # Extract reply context if this message is a thread reply.
         # Mirrors the Telegram/Discord implementations so that gateway.run

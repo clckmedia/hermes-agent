@@ -61,6 +61,43 @@ def _resolve(adapter, channel_id, parent_id=None):
     return resolve_channel_skills(adapter.config.extra, channel_id, parent_id)
 
 
+async def _capture_slack_message_event(slack_module, config_extra=None, channel_id="C0A9GQUHKNK"):
+    from gateway.config import Platform
+
+    adapter = object.__new__(slack_module.SlackAdapter)
+    adapter.platform = Platform.SLACK
+    adapter.config = MagicMock()
+    adapter.config.extra = config_extra or {}
+    adapter._dedup = MagicMock()
+    adapter._dedup.is_duplicate.return_value = False
+    adapter._lookup_assistant_thread_metadata = MagicMock(return_value={})
+    adapter._team_bot_user_ids = {}
+    adapter._bot_user_id = None
+    adapter._channel_team = {}
+    adapter._slack_free_response_channels = MagicMock(return_value=set())
+    adapter._resolve_user_name = AsyncMock(return_value="Damien")
+    adapter._reactions_enabled = MagicMock(return_value=False)
+    adapter._reacting_message_ids = set()
+
+    captured = {}
+
+    async def capture_message(message_event):
+        captured["event"] = message_event
+
+    adapter.handle_message = capture_message
+
+    await adapter._handle_slack_message({
+        "channel": channel_id,
+        "channel_type": "channel",
+        "team": "T0CLCK",
+        "ts": "123.456",
+        "user": "U0DAMIEN",
+        "text": "What is the portal?",
+    })
+
+    return captured["event"]
+
+
 class TestSlackResolveChannelSkills:
     def test_no_bindings_returns_none(self):
         adapter = _make_adapter()
@@ -249,47 +286,16 @@ class TestSlackCLCKClientRegistryContext:
         assert "not_in_channel" in combined
 
     @pytest.mark.asyncio
-    async def test_slack_inbound_event_carries_registry_context_and_channel_name(self, monkeypatch, tmp_path):
+    async def test_slack_inbound_event_carries_registry_context_channel_name_and_fallback_skill(self, monkeypatch, tmp_path):
         slack_module, _routes_path, _portal_path = _install_clck_registry_fixture(monkeypatch, tmp_path)
-        from gateway.config import Platform
 
-        adapter = object.__new__(slack_module.SlackAdapter)
-        adapter.platform = Platform.SLACK
-        adapter.config = MagicMock()
-        adapter.config.extra = {
-            "channel_prompts": {"C0A9GQUHKNK": "Configured FHS prompt"},
-            "channel_skill_bindings": [
-                {"id": "C0A9GQUHKNK", "skills": ["clck-client-operations"]},
-            ],
-        }
-        adapter._dedup = MagicMock()
-        adapter._dedup.is_duplicate.return_value = False
-        adapter._lookup_assistant_thread_metadata = MagicMock(return_value={})
-        adapter._team_bot_user_ids = {}
-        adapter._bot_user_id = None
-        adapter._channel_team = {}
-        adapter._slack_free_response_channels = MagicMock(return_value=set())
-        adapter._resolve_user_name = AsyncMock(return_value="Damien")
-        adapter._reactions_enabled = MagicMock(return_value=False)
-        adapter._reacting_message_ids = set()
+        event = await _capture_slack_message_event(
+            slack_module,
+            {
+                "channel_prompts": {"C0A9GQUHKNK": "Configured FHS prompt"},
+            },
+        )
 
-        captured = {}
-
-        async def capture_message(message_event):
-            captured["event"] = message_event
-
-        adapter.handle_message = capture_message
-
-        await adapter._handle_slack_message({
-            "channel": "C0A9GQUHKNK",
-            "channel_type": "channel",
-            "team": "T0CLCK",
-            "ts": "123.456",
-            "user": "U0DAMIEN",
-            "text": "What is the portal?",
-        })
-
-        event = captured["event"]
         assert event.source.chat_name == "fhs-poly"
         assert event.channel_prompt.startswith("[Slack workspace access context]")
         assert "[CLCK client registry context" in event.channel_prompt
@@ -297,3 +303,28 @@ class TestSlackCLCKClientRegistryContext:
         assert "portal ID 23619105" in event.channel_prompt
         assert "Configured FHS prompt" in event.channel_prompt
         assert event.auto_skill == ["clck-client-operations"]
+
+    @pytest.mark.asyncio
+    async def test_slack_inbound_event_preserves_explicit_registry_channel_skill(self, monkeypatch, tmp_path):
+        slack_module, _routes_path, _portal_path = _install_clck_registry_fixture(monkeypatch, tmp_path)
+
+        event = await _capture_slack_message_event(
+            slack_module,
+            {
+                "channel_skill_bindings": [
+                    {"id": "C0A9GQUHKNK", "skills": ["custom-client-skill", "second-skill"]},
+                ],
+            },
+        )
+
+        assert "[CLCK client registry context" in event.channel_prompt
+        assert event.auto_skill == ["custom-client-skill", "second-skill"]
+
+    @pytest.mark.asyncio
+    async def test_slack_inbound_event_without_registry_context_has_no_fallback_skill(self, monkeypatch, tmp_path):
+        slack_module, _routes_path, _portal_path = _install_clck_registry_fixture(monkeypatch, tmp_path)
+
+        event = await _capture_slack_message_event(slack_module, channel_id="C0UNKNOWN")
+
+        assert "[CLCK client registry context" not in event.channel_prompt
+        assert event.auto_skill is None
