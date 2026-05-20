@@ -210,7 +210,8 @@ class TestSlackCLCKClientRegistryContext:
         assert str(routes_path) in ctx.prompt
         assert str(portal_path) in ctx.prompt
         assert "channel/client registry context beats recent/session guesses" in ctx.prompt
-        assert "invoice/accounting defaults to Xero" in ctx.prompt
+        assert "do not treat ordinary client-channel work as invoice/accounting work" in ctx.prompt
+        assert "invoice/accounting defaults to Xero" not in ctx.prompt
         assert "client-system writes without approval" in ctx.prompt
         assert "SERVICE_KEY" not in ctx.prompt
         assert "ACCESS_TOKEN" not in ctx.prompt
@@ -231,9 +232,21 @@ class TestSlackCLCKClientRegistryContext:
 
         combined = slack_module._combine_slack_channel_prompts(registry_prompt, "Configured channel prompt")
 
-        assert combined.startswith("[CLCK client registry context")
+        assert combined.startswith("[Slack workspace access context]")
+        assert "uploaded files, and canvases" in combined
+        assert "[CLCK client registry context" in combined
         assert "Configured channel prompt" in combined
+        assert combined.index("[Slack workspace access context]") < combined.index("[CLCK client registry context")
         assert combined.index("[CLCK client registry context") < combined.index("Configured channel prompt")
+
+    def test_slack_access_prompt_present_without_channel_or_registry_prompt(self, monkeypatch, tmp_path):
+        slack_module, _routes_path, _portal_path = _install_clck_registry_fixture(monkeypatch, tmp_path)
+
+        combined = slack_module._combine_slack_channel_prompts(None, None)
+
+        assert combined.startswith("[Slack workspace access context]")
+        assert "try the appropriate Slack API/tool path first" in combined
+        assert "not_in_channel" in combined
 
     @pytest.mark.asyncio
     async def test_slack_inbound_event_carries_registry_context_and_channel_name(self, monkeypatch, tmp_path):
@@ -278,7 +291,8 @@ class TestSlackCLCKClientRegistryContext:
 
         event = captured["event"]
         assert event.source.chat_name == "fhs-poly"
-        assert event.channel_prompt.startswith("[CLCK client registry context")
+        assert event.channel_prompt.startswith("[Slack workspace access context]")
+        assert "[CLCK client registry context" in event.channel_prompt
         assert "FHS Poly (key: fhs_poly)" in event.channel_prompt
         assert "portal ID 23619105" in event.channel_prompt
         assert "Configured FHS prompt" in event.channel_prompt

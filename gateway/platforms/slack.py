@@ -97,6 +97,12 @@ class _CLCKSlackClientContext:
     channel_name: Optional[str] = None
 
 
+_SLACK_WORKSPACE_ACCESS_CONTEXT = """[Slack workspace access context]
+- CLCK Slack API access is available for visible workspace channels, threads, uploaded files, and canvases via the configured Slack token; do not assume Slack content is inaccessible just because it is not already in the session.
+- When a user references a Slack file, canvas, channel, or earlier thread item, try the appropriate Slack API/tool path first using the source channel/thread context and exact reference. Only report access failure after a real Slack API blocker such as not_in_channel, missing_scope, not_visible, or file_not_found.
+- Do not send Slack messages, reactions, edits, joins, invites, admin changes, or external/client-facing updates unless explicitly approved."""
+
+
 def _clck_registry_paths() -> Tuple[_Path, _Path]:
     """Return the local CLCK client route + HubSpot registry paths."""
     try:
@@ -249,9 +255,9 @@ def _build_clck_slack_client_context(channel_id: str) -> Optional[_CLCKSlackClie
     lines.append("- Source registries: " + "; ".join(sources))
     lines.append(
         "- Guardrails: channel/client registry context beats recent/session guesses; "
-        "verify the HubSpot portal before any portal action; invoice/accounting defaults "
-        "to Xero unless explicitly asked otherwise; no external/client sends or "
-        "client-system writes without approval."
+        "verify the HubSpot portal before any portal action; do not treat ordinary "
+        "client-channel work as invoice/accounting work; no external/client sends "
+        "or client-system writes without approval."
     )
     return _CLCKSlackClientContext(prompt="\n".join(lines), channel_name=channel_name or None)
 
@@ -260,9 +266,9 @@ def _combine_slack_channel_prompts(
     registry_prompt: Optional[str],
     configured_prompt: Optional[str],
 ) -> Optional[str]:
-    """Prepend local registry context while preserving config channel prompts."""
+    """Prepend Slack access + local registry context while preserving config prompts."""
     parts = []
-    for prompt in (registry_prompt, configured_prompt):
+    for prompt in (_SLACK_WORKSPACE_ACCESS_CONTEXT, registry_prompt, configured_prompt):
         text = str(prompt or "").strip()
         if text:
             parts.append(text)
