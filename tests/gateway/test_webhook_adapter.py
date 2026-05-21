@@ -757,6 +757,95 @@ class TestHubSpotSupportTriage:
         assert "Which support-active client" not in card
         assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
 
+    @pytest.mark.asyncio
+    async def test_stale_fallback_matcher_is_revalidated_before_render_and_delivery(self):
+        adapter = _make_adapter()
+        payload = {
+            "event_type": "hubspot_support_triage",
+            "gmail": {
+                "from": "Damien <damien@clck.com.au>",
+                "source_mailbox": "support@clck.com.au",
+                "subject": "Fwd: FW: Would you still like to hear from us?",
+            },
+            "sender_email": "Alana Rochford <alana@anchorhomes.com.au>",
+            "source_mailbox": "support@clck.com.au",
+            "subject": "Fwd: FW: Would you still like to hear from us?",
+            "support": {"summary": "Anchor Homes enquiry link needs fixing."},
+            "matcher": {
+                "decision": "fallback",
+                "reason": "no_safe_match",
+                "assignee_hint": "internal_review",
+            },
+            "match": {
+                "decision": "fallback",
+                "reason": "no_safe_match",
+                "assignee_hint": "internal_review",
+            },
+            "slack": {"channel_id": "C0B3PQE0CHG", "thread_ts": "", "routing_source": "internal_fallback"},
+            "support_reasoning": {},
+        }
+        fresh_match = {
+            "decision": "route_client",
+            "reason": "safe_match",
+            "matched_by": "unique_domain",
+            "client_key": "anchor_homes",
+            "client_name": "Anchor Homes",
+            "slack_channel_id": "C09AF2XJVN3",
+            "owner_primary": "Damien",
+            "assignee_hint": "Damien",
+            "portal_id": "507045",
+            "hubspot_access_status": "connected",
+            "hubspot_access_needed": False,
+            "hubspot_token_reference_present": True,
+            "hubspot_inspection_allowed": False,
+        }
+
+        with patch.object(adapter, "_run_support_matcher_worker", new=AsyncMock(return_value=fresh_match)):
+            enriched = await adapter._enrich_hubspot_support_triage_payload(payload)
+
+        assert enriched["matcher"]["decision"] == "route_client"
+        assert enriched["matcher"]["matcher_revalidation"] == "hermes_local_route_override"
+        assert enriched["match"]["client_key"] == "anchor_homes"
+        assert enriched["slack"]["channel_id"] == "C09AF2XJVN3"
+        assert enriched["slack"]["routing_source"] == "hermes_local_matcher_revalidation"
+        delivery_extra = adapter._render_delivery_extra(
+            {"chat_id": "{slack.channel_id}", "thread_id": "{slack.thread_ts}"},
+            enriched,
+        )
+        assert delivery_extra["chat_id"] == "C09AF2XJVN3"
+
+        card = adapter._format_hubspot_support_triage_card(enriched)
+        assert "Client match: matched client: Anchor Homes (safe_match)" in card
+        assert "fallback/no_safe_match" not in card
+        assert "HubSpot status: portal/token found" in card
+
+    @pytest.mark.asyncio
+    async def test_unknown_sender_stays_fallback_after_local_revalidation(self):
+        adapter = _make_adapter()
+        payload = {
+            "event_type": "hubspot_support_triage",
+            "gmail": {
+                "from": "Unknown Person <unknown@example.invalid>",
+                "source_mailbox": "support@clck.com.au",
+                "subject": "Can you help?",
+            },
+            "support": {"summary": "Unknown sender needs HubSpot help."},
+            "matcher": {"decision": "fallback", "reason": "no_safe_match", "assignee_hint": "internal_review"},
+            "slack": {"channel_id": "C0B3PQE0CHG", "thread_ts": ""},
+            "support_reasoning": {},
+        }
+        fresh_fallback = {"decision": "fallback", "reason": "no_safe_match"}
+
+        with patch.object(adapter, "_run_support_matcher_worker", new=AsyncMock(return_value=fresh_fallback)):
+            enriched = await adapter._enrich_hubspot_support_triage_payload(payload)
+
+        assert enriched["matcher"]["decision"] == "fallback"
+        assert enriched["matcher"]["matcher_revalidation"] == "checked_no_route"
+        assert enriched["slack"]["channel_id"] == "C0B3PQE0CHG"
+        card = adapter._format_hubspot_support_triage_card(enriched)
+        assert "Client match: fallback/no_safe_match" in card
+        assert "matched client:" not in card
+
     def test_forwarded_platform_alert_formats_inferred_working_session_card(self):
         adapter = _make_adapter()
         card = adapter._format_hubspot_support_triage_card(

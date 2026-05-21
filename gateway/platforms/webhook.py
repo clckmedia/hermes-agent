@@ -61,6 +61,8 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_SUPPORT_MATCHER_SCRIPT = Path.home() / ".hermes" / "scripts" / "clck_support_triage_matcher.py"
+_SUPPORT_MATCHER_TIMEOUT_SECONDS = 2.5
 _SUPPORT_REASONING_SCRIPT = Path.home() / ".hermes" / "scripts" / "clck_support_triage_reasoning.py"
 _SUPPORT_REASONING_TIMEOUT_SECONDS = 5.0
 
@@ -755,7 +757,7 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _enrich_hubspot_support_triage_payload(
         self, payload: dict, route_config: Optional[dict] = None
     ) -> dict:
-        """Attach local read-only support reasoning to CLCK support triage payloads.
+        """Attach local read-only matcher/reasoning enrichment to support triage payloads.
 
         This is fail-open by design: if the local worker is missing, times out,
         has no credentials, or errors, the deterministic base card still renders
@@ -764,10 +766,12 @@ class WebhookAdapter(BasePlatformAdapter):
         """
         if payload.get("event_type") != "hubspot_support_triage":
             return payload
-        if "support_reasoning" in payload:
-            return payload
 
-        enriched = dict(payload)
+        enriched = await self._maybe_revalidate_support_triage_matcher(payload, route_config)
+        if "support_reasoning" in enriched:
+            return enriched
+        enriched = dict(enriched)
+
         route_config = route_config or {}
         try:
             timeout = float(
@@ -798,6 +802,133 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             enriched["support_reasoning"] = self._support_reasoning_unavailable("error")
         return enriched
+
+    async def _maybe_revalidate_support_triage_matcher(
+        self, payload: dict, route_config: Optional[dict] = None
+    ) -> dict:
+        """Re-run the local matcher when AP/Hermes supplied a fallback object.
+
+        Production support@ has repeatedly produced cards where the current raw
+        Gmail/forwarded evidence resolves to a known exact email/domain, but the
+        incoming ``matcher``/``match`` object is stale or from an older bridge and
+        says ``fallback/no_safe_match``.  Revalidating locally before delivery
+        prevents silent generic fallback and also lets delivery_extra route to the
+        matched internal client channel when the local route is safe.
+        """
+        matcher_obj = payload.get("matcher") if isinstance(payload.get("matcher"), dict) else None
+        if matcher_obj is None and isinstance(payload.get("match"), dict):
+            matcher_obj = payload.get("match")
+        if matcher_obj is None:
+            return payload
+        decision = str(matcher_obj.get("decision") or matcher_obj.get("match_result") or "").strip().lower()
+        reason = str(matcher_obj.get("reason") or matcher_obj.get("match_reason") or "").strip().lower()
+        if decision == "route_client":
+            return payload
+        if decision and reason not in {"", "no_safe_match"}:
+            return payload
+
+        route_config = route_config or {}
+        try:
+            timeout = float(
+                route_config.get(
+                    "support_matcher_timeout_seconds",
+                    _SUPPORT_MATCHER_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            timeout = _SUPPORT_MATCHER_TIMEOUT_SECONDS
+        timeout = max(0.5, min(timeout, 5.0))
+
+        try:
+            fresh = await self._run_support_matcher_worker(payload, timeout=timeout)
+            if not isinstance(fresh, dict):
+                raise ValueError("support matcher worker returned non-object JSON")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[webhook] support-triage matcher revalidation unavailable: timeout after %.1fs",
+                timeout,
+            )
+            return payload
+        except Exception as exc:
+            logger.warning(
+                "[webhook] support-triage matcher revalidation unavailable: %s",
+                type(exc).__name__,
+            )
+            return payload
+
+        fresh_decision = str(fresh.get("decision") or fresh.get("match_result") or "").strip().lower()
+        enriched = dict(payload)
+        if fresh_decision != "route_client":
+            if matcher_obj:
+                diagnostic_matcher = dict(matcher_obj)
+                diagnostic_matcher.setdefault("matcher_revalidation", "checked_no_route")
+                diagnostic_matcher.setdefault("local_revalidation_decision", fresh.get("decision"))
+                diagnostic_matcher.setdefault("local_revalidation_reason", fresh.get("reason"))
+                enriched["matcher"] = diagnostic_matcher
+                enriched["match"] = diagnostic_matcher
+            return enriched
+
+        fresh = dict(fresh)
+        fresh["matcher_revalidation"] = "hermes_local_route_override"
+        fresh["previous_matcher_decision"] = matcher_obj.get("decision")
+        fresh["previous_matcher_reason"] = matcher_obj.get("reason")
+        enriched["matcher"] = fresh
+        enriched["match"] = fresh
+
+        slack_channel_id = fresh.get("slack_channel_id")
+        if slack_channel_id:
+            slack = dict(enriched.get("slack") or {})
+            slack["channel_id"] = slack_channel_id
+            slack["thread_ts"] = slack.get("thread_ts") or ""
+            slack["routing_source"] = "hermes_local_matcher_revalidation"
+            enriched["slack"] = slack
+
+        hubspot = dict(enriched.get("hubspot") or {})
+        hubspot.update(
+            {
+                "portal_id": fresh.get("portal_id") or fresh.get("hubspot_portal_id"),
+                "portal_key": fresh.get("hubspot_portal_key"),
+                "access_status": fresh.get("hubspot_access_status"),
+                "access_needed": fresh.get("hubspot_access_needed"),
+                "token_found": fresh.get("hubspot_token_reference_present"),
+                "inspection_allowed": fresh.get("hubspot_inspection_allowed"),
+            }
+        )
+        enriched["hubspot"] = hubspot
+        enriched["owner"] = fresh.get("owner_primary") or enriched.get("owner")
+        enriched["assignee_hints"] = [fresh.get("assignee_hint") or fresh.get("owner_primary") or "internal_review"]
+        return enriched
+
+    async def _run_support_matcher_worker(self, payload: dict, *, timeout: float) -> dict:
+        """Run the local support matcher helper and return its JSON object."""
+        if not _SUPPORT_MATCHER_SCRIPT.exists():
+            raise FileNotFoundError("support matcher worker not found")
+
+        raw_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(_SUPPORT_MATCHER_SCRIPT),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(raw_payload),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            with contextlib.suppress(Exception):
+                await process.communicate()
+            raise
+
+        if process.returncode != 0:
+            raise RuntimeError(f"support matcher worker exited {process.returncode}")
+        if stderr:
+            logger.debug("[webhook] support-triage matcher worker wrote stderr")
+        decoded = stdout.decode("utf-8").strip()
+        return json.loads(decoded)
 
     async def _run_support_reasoning_worker(self, payload: dict, *, timeout: float) -> dict:
         """Run the local support reasoning helper and return its JSON object."""
