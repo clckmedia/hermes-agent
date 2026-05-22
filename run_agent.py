@@ -3633,14 +3633,40 @@ class AIAgent:
 
         return 300.0, True
 
-    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+    @staticmethod
+    def _estimate_non_stream_payload_tokens(payload: Any) -> int:
+        """Cheap token-ish estimate for non-stream watchdog decisions/logging.
+
+        Chat Completions requests keep the conversation in ``messages``;
+        Responses API requests, including Codex, keep the converted
+        conversation in ``input``. Count either shape so large Responses
+        requests do not look like empty prompts to the stale-call detector.
+        """
+        candidates: list[Any] = []
+        if isinstance(payload, dict):
+            for key in ("messages", "input"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+                elif value is not None:
+                    candidates.append(value)
+            if not candidates:
+                candidates.append(payload)
+        elif isinstance(payload, list):
+            candidates.extend(payload)
+        elif payload is not None:
+            candidates.append(payload)
+
+        return sum(len(str(v)) for v in candidates) // 4
+
+    def _compute_non_stream_stale_timeout(self, payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
+        est_tokens = self._estimate_non_stream_payload_tokens(payload)
         if est_tokens > 100_000:
             return max(stale_base, 600.0)
         if est_tokens > 50_000:
@@ -7838,9 +7864,7 @@ class AIAgent:
         # httpx timeout (default 1800s) with zero feedback.  The stale
         # detector kills the connection early so the main retry loop can
         # apply richer recovery (credential rotation, provider fallback).
-        _stale_timeout = self._compute_non_stream_stale_timeout(
-            api_kwargs.get("messages", [])
-        )
+        _stale_timeout = self._compute_non_stream_stale_timeout(api_kwargs)
 
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
@@ -7864,7 +7888,7 @@ class AIAgent:
             # arrives within the configured timeout.
             _elapsed = time.time() - _call_start
             if _elapsed > _stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                _est_ctx = self._estimate_non_stream_payload_tokens(api_kwargs)
                 logger.warning(
                     "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                     "model=%s context=~%s tokens. Killing connection.",
@@ -8827,7 +8851,7 @@ class AIAgent:
             # when the context is large.  Without this, the stale detector kills
             # healthy connections during the model's thinking phase, producing
             # spurious RemoteProtocolError ("peer closed connection").
-            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_tokens = self._estimate_non_stream_payload_tokens(api_kwargs)
             if _est_tokens > 100_000:
                 _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
             elif _est_tokens > 50_000:
@@ -8863,7 +8887,7 @@ class AIAgent:
             # inner retry loop can start a fresh connection.
             _stale_elapsed = time.time() - last_chunk_time["t"]
             if _stale_elapsed > _stream_stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                _est_ctx = self._estimate_non_stream_payload_tokens(api_kwargs)
                 logger.warning(
                     "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                     "model=%s context=~%s tokens. Killing connection.",
