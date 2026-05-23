@@ -295,16 +295,22 @@ def sync_skills(quiet: bool = False) -> dict:
     for name in cleaned:
         del manifest[name]
 
-    # Also copy DESCRIPTION.md files for categories (if not already present)
+    # Also copy DESCRIPTION.md files for categories, but only when that
+    # destination category subtree contains an active skill. Without this guard,
+    # retired/deleted bundled categories can be rehydrated as DESCRIPTION-only
+    # stubs after the skill itself has been intentionally removed from disk.
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         rel = desc_md.relative_to(bundled_dir)
         dest_desc = SKILLS_DIR / rel
-        if not dest_desc.exists():
-            try:
-                dest_desc.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(desc_md, dest_desc)
-            except (OSError, IOError) as e:
-                logger.debug("Could not copy %s: %s", desc_md, e)
+        if dest_desc.exists():
+            continue
+        if not any(skill_md.is_file() for skill_md in dest_desc.parent.rglob("SKILL.md")):
+            continue
+        try:
+            dest_desc.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(desc_md, dest_desc)
+        except (OSError, IOError) as e:
+            logger.debug("Could not copy %s: %s", desc_md, e)
 
     _write_manifest(manifest)
 

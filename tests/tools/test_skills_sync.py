@@ -217,6 +217,60 @@ class TestSyncSkills:
         assert (skills_dir / "old-skill" / "SKILL.md").exists()
         assert (skills_dir / "category" / "DESCRIPTION.md").exists()
 
+    def test_description_copied_for_category_with_active_skill(self, tmp_path):
+        """Fresh install keeps category descriptions when a real skill exists below."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+
+        assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
+        assert (skills_dir / "category" / "DESCRIPTION.md").read_text() == "Category desc"
+
+    def test_description_only_bundled_category_not_copied(self, tmp_path):
+        """A bundled DESCRIPTION.md without any active skill must not create a stub."""
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "retired-category").mkdir(parents=True)
+        (bundled / "retired-category" / "DESCRIPTION.md").write_text("Retired desc")
+        (bundled / "active-category" / "real-skill").mkdir(parents=True)
+        (bundled / "active-category" / "real-skill" / "SKILL.md").write_text(
+            "---\nname: real-skill\n---\n# Real\n"
+        )
+        (bundled / "active-category" / "DESCRIPTION.md").write_text("Active desc")
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+
+        assert (skills_dir / "active-category" / "DESCRIPTION.md").exists()
+        assert not (skills_dir / "retired-category" / "DESCRIPTION.md").exists()
+        assert not (skills_dir / "retired-category").exists()
+
+    def test_user_deleted_bundled_skill_does_not_recreate_category_description(self, tmp_path):
+        """Manifest-tracked user-deleted skill cannot rehydrate its category stub alone."""
+        bundled = tmp_path / "bundled_skills"
+        deleted_skill = bundled / "retired-category" / "deleted-skill"
+        deleted_skill.mkdir(parents=True)
+        (deleted_skill / "SKILL.md").write_text(
+            "---\nname: deleted-skill\n---\n# Deleted upstream copy\n"
+        )
+        (bundled / "retired-category" / "DESCRIPTION.md").write_text("Retired desc")
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text(f"deleted-skill:{_dir_hash(deleted_skill)}\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert "deleted-skill" not in result["copied"]
+        assert not (skills_dir / "retired-category" / "deleted-skill").exists()
+        assert not (skills_dir / "retired-category" / "DESCRIPTION.md").exists()
+        assert not (skills_dir / "retired-category").exists()
+
     def test_fresh_install_records_origin_hashes(self, tmp_path):
         """After fresh install, manifest should have v2 format with hashes."""
         bundled = self._setup_bundled(tmp_path)
