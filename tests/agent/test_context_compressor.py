@@ -405,6 +405,10 @@ class TestCodexSummaryPayloadBudget:
         assert "large-json-log-line " * 200 not in summary
         assert c._last_summary_fallback_used is False
         assert c._last_summary_error is None
+        assert c._last_local_timeout_digest_used is True
+        assert c._last_local_timeout_digest_error == "Codex auxiliary Responses stream exceeded 120.0s total timeout"
+        assert c._last_aux_model_failure_model is None
+        assert c._last_aux_model_failure_error is None
 
     def test_non_codex_summary_path_keeps_existing_rich_serialization(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=272_000):

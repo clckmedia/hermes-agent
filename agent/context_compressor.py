@@ -102,6 +102,37 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 _SUMMARY_TRANSIENT_RETRY_DELAYS_SECONDS = (2.0,)
 
 
+def _codex_timeout_seconds_for_notice(error: Optional[str]) -> str:
+    """Return a compact timeout value for user-facing Codex digest notices."""
+    text = str(error or "")
+    match = re.search(r"exceeded\s+([0-9]+(?:\.[0-9]+)?)s\s+total timeout", text, re.IGNORECASE)
+    if not match:
+        return "the configured timeout"
+    try:
+        seconds = float(match.group(1))
+    except ValueError:
+        return f"{match.group(1)}s"
+    if seconds.is_integer():
+        return f"{int(seconds)}s"
+    return f"{seconds:g}s"
+
+
+def format_local_timeout_digest_notice(error: Optional[str]) -> str:
+    """User-facing note for Codex timeout recovery via local continuity digest.
+
+    This is deliberately distinct from the aux-model/main-model recovery
+    warning.  The local digest path does not prove a bad config and does not
+    retry on the main model, so callers must not tell users to check
+    ``auxiliary.compression.model`` for this state.
+    """
+    timeout = _codex_timeout_seconds_for_notice(error)
+    return (
+        f"ℹ️ Codex compression summariser timed out after {timeout}; "
+        "Hermes used a local continuity digest, so context is intact. "
+        "No config change needed unless this repeats."
+    )
+
+
 def _content_length_for_budget(raw_content: Any) -> int:
     """Return the effective char-length of a message's content for token budgeting.
 
@@ -479,6 +510,8 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._last_local_timeout_digest_used = False
+        self._last_local_timeout_digest_error = None
         self._last_summary_input_chars = 0
         self._last_summary_input_chars_original = 0
         self._last_summary_payload_reduced = False
@@ -598,6 +631,12 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        # When Codex hits its Responses total-timeout after local payload
+        # budgeting, Hermes uses a local continuity digest.  This is recovery
+        # without main-model fallback and without evidence of a bad config, so
+        # expose it through distinct state for user-facing notices.
+        self._last_local_timeout_digest_used: bool = False
+        self._last_local_timeout_digest_error: Optional[str] = None
         self._last_summary_input_chars: int = 0
         self._last_summary_input_chars_original: int = 0
         self._last_summary_payload_reduced: bool = False
@@ -1289,6 +1328,8 @@ Continue from the preserved tail messages and use the digest below only for prio
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        self._last_local_timeout_digest_used = False
+        self._last_local_timeout_digest_error = None
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
             logger.debug(
@@ -1557,8 +1598,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 err_text = str(e).strip() or e.__class__.__name__
                 if len(err_text) > 220:
                     err_text = err_text[:217].rstrip() + "..."
-                self._last_aux_model_failure_error = err_text
-                self._last_aux_model_failure_model = self.summary_model or self.model
+                self._last_local_timeout_digest_used = True
+                self._last_local_timeout_digest_error = err_text
+                self._last_aux_model_failure_error = None
+                self._last_aux_model_failure_model = None
                 logging.warning(
                     "Codex compression summary timed out after local payload budgeting; "
                     "using local extractive continuity digest instead of an unsummarised fallback marker: %s",
@@ -1958,6 +2001,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._last_local_timeout_digest_used = False
+        self._last_local_timeout_digest_error = None
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1

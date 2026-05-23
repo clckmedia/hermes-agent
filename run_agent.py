@@ -157,7 +157,7 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, format_local_timeout_digest_notice
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_always_include_skills_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -10749,7 +10749,7 @@ class AIAgent:
             compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
-        summary_fallback_used = bool(getattr(self.context_compressor, "_last_summary_fallback_used", False))
+        summary_fallback_used = getattr(self.context_compressor, "_last_summary_fallback_used", False) is True
         if summary_error and summary_fallback_used:
             if getattr(self, "_last_compression_summary_warning", None) != summary_error:
                 self._last_compression_summary_warning = summary_error
@@ -10759,22 +10759,33 @@ class AIAgent:
                 )
         else:
             # No final fallback marker — either summary generation succeeded,
-            # or a custom context engine recorded a non-fatal diagnostic. Did
-            # the configured aux model error out and get recovered by retrying
-            # on main? Surface that so users know their config is broken even
-            # though compression succeeded.
-            _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
-            _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
-            if _aux_fail_model:
-                # Dedup on (model, error) so we don't spam on every compaction
-                _aux_key = (_aux_fail_model, _aux_fail_err)
-                if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
-                    self._last_aux_fallback_warning_key = _aux_key
-                    self._emit_warning(
-                        f"ℹ Configured compression model '{_aux_fail_model}' failed "
-                        f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
-                        "check auxiliary.compression.model in config.yaml."
-                    )
+            # a custom context engine recorded a non-fatal diagnostic, or Codex
+            # timed out and Hermes preserved continuity with a local digest.
+            _local_digest_used = (
+                getattr(self.context_compressor, "_last_local_timeout_digest_used", False) is True
+            )
+            _local_digest_err = getattr(self.context_compressor, "_last_local_timeout_digest_error", None)
+            if _local_digest_used:
+                _local_key = _local_digest_err or "codex-local-timeout-digest"
+                if getattr(self, "_last_local_timeout_digest_warning_key", None) != _local_key:
+                    self._last_local_timeout_digest_warning_key = _local_key
+                    self._emit_warning(format_local_timeout_digest_notice(_local_digest_err))
+            else:
+                # Did the configured aux model error out and get recovered by
+                # retrying on main? Surface that so users know their config is
+                # broken even though compression succeeded.
+                _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
+                _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
+                if isinstance(_aux_fail_model, str) and _aux_fail_model:
+                    # Dedup on (model, error) so we don't spam on every compaction
+                    _aux_key = (_aux_fail_model, _aux_fail_err)
+                    if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
+                        self._last_aux_fallback_warning_key = _aux_key
+                        self._emit_warning(
+                            f"ℹ Configured compression model '{_aux_fail_model}' failed "
+                            f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
+                            "check auxiliary.compression.model in config.yaml."
+                        )
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:

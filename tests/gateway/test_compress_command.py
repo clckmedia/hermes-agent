@@ -251,3 +251,58 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered()
     assert "intact" in result
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_surfaces_codex_local_timeout_digest_without_config_warning():
+    """Codex total-timeout recovery uses a local digest, not main-model recovery."""
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "local extractive continuity digest"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_summary_fallback_used = False
+    agent_instance.context_compressor._last_summary_dropped_count = 0
+    agent_instance.context_compressor._last_summary_error = None
+    agent_instance.context_compressor._last_local_timeout_digest_used = True
+    agent_instance.context_compressor._last_local_timeout_digest_error = (
+        "Codex auxiliary Responses stream exceeded 120.0s total timeout"
+    )
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.context_compressor._last_aux_model_failure_error = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+
+    def _estimate(messages, **_kwargs):
+        if messages == history:
+            return 100
+        if messages == compressed:
+            return 60
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    assert "Codex compression summariser timed out after 120s" in result
+    assert "local continuity digest" in result
+    assert "context is intact" in result
+    assert "No config change needed" in result
+    assert "Configured compression model" not in result
+    assert "Recovered using" not in result
+    assert "auxiliary.compression.model" not in result
+    agent_instance.shutdown_memory_provider.assert_called_once()
+    agent_instance.close.assert_called_once()

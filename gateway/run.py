@@ -7697,7 +7697,7 @@ class GatewayRunner:
                                     # warning to the gateway user — agent.log
                                     # alone is invisible on TG/Discord/etc.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
-                                    if _comp is not None and getattr(_comp, "_last_summary_fallback_used", False):
+                                    if _comp is not None and getattr(_comp, "_last_summary_fallback_used", False) is True:
                                         _dropped = getattr(_comp, "_last_summary_dropped_count", 0)
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         _warn_msg = (
@@ -7717,13 +7717,35 @@ class GatewayRunner:
                                                 "Failed to deliver compression-failure warning to user: %s",
                                                 _werr,
                                             )
-                                    # Separately: if the user's CONFIGURED aux
-                                    # model failed and we recovered by falling
-                                    # back to the main model, tell them — a
-                                    # misconfigured auxiliary.compression.model
-                                    # is something only they can fix, and
-                                    # silent recovery would hide it.
-                                    elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
+                                    # Separately: if Codex timed out but Hermes
+                                    # preserved continuity with a local digest,
+                                    # tell the user without implying config/main
+                                    # model recovery.
+                                    elif _comp is not None and getattr(_comp, "_last_local_timeout_digest_used", False) is True:
+                                        from agent.context_compressor import format_local_timeout_digest_notice
+
+                                        _local_err = getattr(_comp, "_last_local_timeout_digest_error", None)
+                                        _local_msg = format_local_timeout_digest_notice(_local_err)
+                                        try:
+                                            _adapter = self.adapters.get(source.platform)
+                                            if _adapter and source.chat_id:
+                                                await _adapter.send(source.chat_id, _local_msg, metadata=_hyg_meta)
+                                        except Exception as _werr:
+                                            logger.warning(
+                                                "Failed to deliver local-timeout-digest notice to user: %s",
+                                                _werr,
+                                            )
+                                    # If the user's CONFIGURED aux model failed
+                                    # and we recovered by falling back to the
+                                    # main model, tell them — a misconfigured
+                                    # auxiliary.compression.model is something
+                                    # only they can fix, and silent recovery
+                                    # would hide it.
+                                    elif (
+                                        _comp is not None
+                                        and isinstance(getattr(_comp, "_last_aux_model_failure_model", None), str)
+                                        and getattr(_comp, "_last_aux_model_failure_model", None)
+                                    ):
                                         _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
                                         _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
                                         _aux_msg = (
@@ -11170,6 +11192,7 @@ class GatewayRunner:
             from run_agent import AIAgent
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
+            from agent.context_compressor import format_local_timeout_digest_notice
 
             session_key = self._session_key_for_source(source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -11243,9 +11266,16 @@ class GatewayRunner:
                 # Detect summary-generation failure so we can surface a
                 # visible warning to the user even on the manual /compress
                 # path (otherwise the failure is silently logged).
-                _summary_failed = bool(getattr(compressor, "_last_summary_fallback_used", False))
+                _summary_failed = getattr(compressor, "_last_summary_fallback_used", False) is True
                 _dropped_count = int(getattr(compressor, "_last_summary_dropped_count", 0) or 0)
                 _summary_err = getattr(compressor, "_last_summary_error", None)
+                # Codex total-timeout recovery used a local continuity digest:
+                # context is intact, but this is not main-model recovery and
+                # does not imply auxiliary.compression.model is wrong.
+                _local_timeout_digest_used = (
+                    getattr(compressor, "_last_local_timeout_digest_used", False) is True
+                )
+                _local_timeout_digest_err = getattr(compressor, "_last_local_timeout_digest_error", None)
                 # Separately: did the user's CONFIGURED aux model fail
                 # and we recovered via main?  Surface that as an info
                 # note so they can fix their config.
@@ -11270,7 +11300,9 @@ class GatewayRunner:
                         count=_dropped_count,
                     )
                 )
-            elif _aux_fail_model:
+            elif _local_timeout_digest_used:
+                lines.append(format_local_timeout_digest_notice(_local_timeout_digest_err))
+            elif isinstance(_aux_fail_model, str) and _aux_fail_model:
                 lines.append(
                     t(
                         "gateway.compress.aux_failed",
