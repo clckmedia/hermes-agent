@@ -261,6 +261,8 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
             return True
         elif not adapter._slack_require_mention():
             return True
+        elif adapter._slack_strict_mention() and not is_mentioned:
+            return False
         elif not is_mentioned:
             if thread_reply and active_session:
                 return True
@@ -310,6 +312,38 @@ def test_thread_reply_with_active_session_processed():
     assert _would_process(
         adapter, text="followup",
         thread_reply=True, active_session=True,
+    ) is True
+
+
+def test_strict_mention_blocks_active_session_thread_without_mention():
+    adapter = _make_adapter(require_mention=True, strict_mention=True)
+    assert _would_process(
+        adapter, text="followup",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_strict_mention_allows_mentioned_thread_reply():
+    adapter = _make_adapter(require_mention=True, strict_mention=True)
+    assert _would_process(
+        adapter,
+        text="followup",
+        mentioned=True,
+        thread_reply=True,
+        active_session=True,
+    ) is True
+
+
+def test_strict_mention_keeps_free_response_channel_open():
+    adapter = _make_adapter(
+        require_mention=True,
+        strict_mention=True,
+        free_response_channels=[CHANNEL_ID],
+    )
+    assert _would_process(
+        adapter,
+        channel_id=CHANNEL_ID,
+        text="top-level coordination",
     ) is True
 
 
