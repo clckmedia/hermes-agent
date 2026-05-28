@@ -280,6 +280,19 @@ class HermesTokenStorage:
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
         payload = tokens.model_dump(mode="json", exclude_none=True)
+        # OAuth refresh responses are allowed to omit refresh_token when the
+        # existing refresh token remains valid. The MCP SDK validates that
+        # response into a fresh OAuthToken and then calls storage.set_tokens();
+        # without preserving the old value here, a successful refresh silently
+        # downgrades durable auth into a short-lived access token and the next
+        # restart falls back to full browser OAuth.
+        if not payload.get("refresh_token"):
+            existing = _read_json(self._tokens_path()) or {}
+            existing_refresh = (
+                existing.get("refresh_token") if isinstance(existing, dict) else None
+            )
+            if existing_refresh:
+                payload["refresh_token"] = existing_refresh
         # Persist an absolute ``expires_at`` so a process restart can
         # reconstruct the correct remaining TTL. Without this the MCP SDK's
         # ``_initialize`` reloads a relative ``expires_in`` which has no
@@ -489,7 +502,16 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             "Complete the authorization in a browser first, then retry."
         )
 
-    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    stop_server = threading.Event()
+
+    def _serve_callback() -> None:
+        server.timeout = 0.5
+        while not stop_server.is_set():
+            if result["auth_code"] is not None or result["error"] is not None:
+                break
+            server.handle_request()
+
+    server_thread = threading.Thread(target=_serve_callback, daemon=True)
     server_thread.start()
 
     # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -520,7 +542,9 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
     finally:
+        stop_server.set()
         server.server_close()
+        server_thread.join(timeout=1.0)
 
     if result["error"] == _USER_SKIPPED_SENTINEL:
         raise OAuthNonInteractiveError("user_skipped")

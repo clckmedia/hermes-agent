@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 import stat
 import sys
 from io import BytesIO
@@ -475,6 +476,24 @@ class TestWaitForCallbackNoBlocking:
             with patch("builtins.input", side_effect=AssertionError("input() must not be called")):
                 with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
                     asyncio.run(_wait_for_callback())
+
+    def test_timeout_releases_callback_listener(self):
+        """A timed-out OAuth wait must not leave the callback port bound."""
+        import tools.mcp_oauth as mod
+        import asyncio
+
+        port = _find_free_port()
+        mod._oauth_port = port
+
+        async def instant_sleep(_seconds):
+            pass
+
+        with patch.object(mod.asyncio, "sleep", instant_sleep):
+            with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
+                asyncio.run(_wait_for_callback())
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
 
 
 class TestBuildOAuthAuthNonInteractive:
