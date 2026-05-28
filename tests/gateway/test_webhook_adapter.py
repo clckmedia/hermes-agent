@@ -892,6 +892,101 @@ class TestRawTemplateToken:
 
 
 # ===================================================================
+# CLCK HubSpot support triage
+# ===================================================================
+
+
+class TestHubSpotSupportTriage:
+    def _support_triage_routes(self):
+        return {
+            "hubspot-support-triage": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["hubspot_support_triage"],
+                "prompt": "generic fallback prompt should not be used",
+                "deliver": "slack",
+                "deliver_extra": {
+                    "chat_id": "{slack.channel_id}",
+                    "thread_id": "{slack.thread_ts}",
+                },
+            }
+        }
+
+    def _attach_slack_runner(self, adapter):
+        slack_adapter = AsyncMock()
+        slack_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner = MagicMock()
+        runner.adapters = {Platform.SLACK: slack_adapter}
+        runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = runner
+        return slack_adapter
+
+    def test_unknown_sender_formats_internal_working_session_card(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Unknown Person <unknown@example.invalid>",
+                    "to": "support@clck.com.au",
+                    "subject": "Can you help?",
+                },
+                "support": {"summary": "Unknown sender needs HubSpot help."},
+                "matcher": {
+                    "decision": "fallback",
+                    "reason": "no_safe_match",
+                    "assignee_hint": "internal_review",
+                },
+                "support_reasoning": {
+                    "status": "enrichment_unavailable",
+                    "evidence_supported": False,
+                },
+            }
+        )
+
+        assert "Request summary: Unknown sender needs HubSpot help." in card
+        assert "Source: support@clck.com.au intake" in card
+        assert "Safety: no email sent; no HubSpot write; no client Slack post." in card
+        assert "No client reply drafted yet" in card
+
+    @pytest.mark.asyncio
+    async def test_support_triage_event_delivers_card_to_slack_thread_without_agent(self):
+        adapter = _make_adapter(routes=self._support_triage_routes())
+        adapter.handle_message = AsyncMock()
+        adapter._run_deepseek_classifier = AsyncMock(side_effect=RuntimeError("worker disabled in test"))
+        slack_adapter = self._attach_slack_runner(adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/hubspot-support-triage",
+                json={
+                    "event_type": "hubspot_support_triage",
+                    "gmail": {
+                        "from": "Unknown <unknown@example.invalid>",
+                        "source_mailbox": "support@clck.com.au",
+                        "subject": "TEST support triage",
+                    },
+                    "support": {"summary": "Fake internal test payload."},
+                    "matcher": {"decision": "fallback", "reason": "no_safe_match"},
+                    "slack": {"channel_id": "C0ASKKH52RK", "thread_ts": "1777784852.911829"},
+                },
+                headers={"X-Request-ID": "support-triage-test-1"},
+            )
+            assert resp.status == 202
+            data = await resp.json()
+
+        assert data["status"] == "accepted"
+        adapter.handle_message.assert_not_called()
+        slack_adapter.send.assert_awaited_once()
+        chat_id, content = slack_adapter.send.await_args.args[:2]
+        assert chat_id == "C0ASKKH52RK"
+        assert "Request summary: Fake internal test payload." in content
+        assert slack_adapter.send.await_args.kwargs["metadata"] == {
+            "thread_id": "1777784852.911829"
+        }
+
+
+# ===================================================================
 # Cross-platform delivery thread_id passthrough
 # ===================================================================
 
@@ -1031,4 +1126,3 @@ class TestInsecureNoAuthSafetyRail:
             assert result is True
         finally:
             await adapter.disconnect()
-

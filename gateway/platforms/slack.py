@@ -72,6 +72,204 @@ class _ThreadContextCache:
     parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
 
 
+@dataclass(frozen=True)
+class _CLCKSlackClientContext:
+    """Compact local-registry context for a CLCK Slack client channel."""
+    prompt: str
+    channel_name: Optional[str] = None
+
+
+_SLACK_WORKSPACE_ACCESS_CONTEXT = """[Slack workspace access context]
+- CLCK Slack API access is available for visible workspace channels, threads, uploaded files, and canvases via the configured Slack token; do not assume Slack content is inaccessible just because it is not already in the session.
+- When a user references a Slack file, canvas, channel, or earlier thread item, try the appropriate Slack API/tool path first using the source channel/thread context and exact reference. Only report access failure after a real Slack API blocker such as not_in_channel, missing_scope, not_visible, or file_not_found.
+- Do not send Slack messages, reactions, edits, joins, invites, admin changes, or external/client-facing updates unless explicitly approved."""
+
+
+def _clck_registry_paths() -> Tuple[_Path, _Path]:
+    """Return the local CLCK client route + HubSpot registry paths."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    except Exception:
+        hermes_home = _Path.home() / ".hermes"
+
+    refs = hermes_home / "references"
+    return (
+        refs / "clck_support_triage_client_routes.json",
+        refs / "hubspot_portal_registry.json",
+    )
+
+
+def _read_local_json(path: _Path) -> Optional[dict]:
+    """Read a local JSON file fail-open for inbound Slack handling."""
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        logger.debug("[Slack] Failed to read local registry %s: %s", path, exc)
+        return None
+
+
+def _clean_registry_value(value: Any, *, max_chars: int = 160) -> str:
+    """Render a registry scalar safely for compact prompt injection."""
+    if value is None:
+        return ""
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "..."
+    return text
+
+
+def _find_clck_route_for_slack_channel(
+    routes_data: Optional[dict],
+    channel_id: str,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Find the CLCK client route for a Slack internal/shared channel ID."""
+    if not routes_data or not channel_id:
+        return None, None
+    routes = routes_data.get("client_routes") or []
+    if not isinstance(routes, list):
+        return None, None
+
+    channel_id = str(channel_id).strip()
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        for id_key, name_key in (
+            ("slack_channel_id", "slack_channel_name"),
+            ("shared_slack_channel_id", "shared_slack_channel_name"),
+        ):
+            if _clean_registry_value(route.get(id_key)) == channel_id:
+                return route, _clean_registry_value(route.get(name_key)) or None
+    return None, None
+
+
+def _hubspot_portal_reference(
+    portal_data: Optional[dict],
+    route: dict,
+) -> Tuple[str, str, str]:
+    """Return secret-safe HubSpot portal id/key/name reference for a route."""
+    route_portal_id = _clean_registry_value(route.get("hubspot_portal_id"))
+    route_portal_key = _clean_registry_value(route.get("hubspot_portal_key"))
+    route_portal_name = _clean_registry_value(route.get("hubspot_portal_registry_name"))
+
+    clients = portal_data.get("clients") if isinstance(portal_data, dict) else None
+    if isinstance(clients, dict):
+        entry_key = route_portal_key if route_portal_key in clients else ""
+        entry = clients.get(entry_key) if entry_key else None
+        if not entry and route_portal_id:
+            for key, candidate in clients.items():
+                if not isinstance(candidate, dict):
+                    continue
+                if _clean_registry_value(candidate.get("portal_id")) == route_portal_id:
+                    entry_key = _clean_registry_value(key)
+                    entry = candidate
+                    break
+        if isinstance(entry, dict):
+            route_portal_id = route_portal_id or _clean_registry_value(entry.get("portal_id"))
+            route_portal_key = route_portal_key or entry_key
+            route_portal_name = route_portal_name or _clean_registry_value(entry.get("client_name"))
+
+    return route_portal_id, route_portal_key, route_portal_name
+
+
+def _build_clck_slack_client_context(channel_id: str) -> Optional[_CLCKSlackClientContext]:
+    """Build deterministic, secret-safe CLCK client context for a Slack channel."""
+    channel_id = str(channel_id or "").strip()
+    if not channel_id:
+        return None
+
+    routes_path, portal_path = _clck_registry_paths()
+    routes_data = _read_local_json(routes_path)
+    route, registry_channel_name = _find_clck_route_for_slack_channel(routes_data, channel_id)
+    if not route:
+        return None
+
+    portal_data = _read_local_json(portal_path)
+    portal_id, portal_key, portal_name = _hubspot_portal_reference(portal_data, route)
+
+    client_name = _clean_registry_value(route.get("client_name"))
+    client_key = _clean_registry_value(route.get("client_key"))
+    primary_name = _clean_registry_value(route.get("contact_primary_name"))
+    primary_email = _clean_registry_value(route.get("contact_primary_email"))
+    channel_name = registry_channel_name or _clean_registry_value(route.get("slack_channel_name"))
+
+    lines = ["[CLCK client registry context - local, per-turn, secret-safe]"]
+    if channel_name:
+        lines.append(f"- Slack channel: #{channel_name} ({channel_id})")
+    else:
+        lines.append(f"- Slack channel ID: {channel_id}")
+    if client_name and client_key:
+        lines.append(f"- Client: {client_name} (key: {client_key})")
+    elif client_name:
+        lines.append(f"- Client: {client_name}")
+    elif client_key:
+        lines.append(f"- Client key: {client_key}")
+
+    portal_bits = []
+    if portal_id:
+        portal_bits.append(f"portal ID {portal_id}")
+    if portal_key:
+        portal_bits.append(f"registry key {portal_key}")
+    if portal_name:
+        portal_bits.append(f"registry name {portal_name}")
+    if portal_bits:
+        lines.append("- HubSpot: " + "; ".join(portal_bits))
+
+    if primary_name and primary_email:
+        lines.append(f"- Primary contact: {primary_name} <{primary_email}>")
+    elif primary_name:
+        lines.append(f"- Primary contact: {primary_name}")
+    elif primary_email:
+        lines.append(f"- Primary contact email: {primary_email}")
+
+    sources = [str(routes_path)]
+    if portal_data is not None:
+        sources.append(str(portal_path))
+    lines.append("- Source registries: " + "; ".join(sources))
+    lines.append(
+        "- Guardrails: channel/client registry context beats recent/session guesses; "
+        "verify the HubSpot portal before any portal action; do not treat ordinary "
+        "client-channel work as invoice/accounting work; no external/client sends "
+        "or client-system writes without approval."
+    )
+    return _CLCKSlackClientContext(prompt="\n".join(lines), channel_name=channel_name or None)
+
+
+def _combine_slack_channel_prompts(
+    registry_prompt: Optional[str],
+    configured_prompt: Optional[str],
+) -> Optional[str]:
+    """Prepend Slack access + local registry context while preserving config prompts."""
+    parts = []
+    for prompt in (_SLACK_WORKSPACE_ACCESS_CONTEXT, registry_prompt, configured_prompt):
+        text = str(prompt or "").strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts) if parts else None
+
+
+def _slack_event_channel_name(
+    event: dict,
+    channel_id: str,
+    registry_context: Optional[_CLCKSlackClientContext] = None,
+) -> str:
+    """Resolve a cheap Slack channel display name, falling back to the ID."""
+    for candidate in (
+        event.get("channel_name") if isinstance(event, dict) else None,
+        (event.get("channel", {}) or {}).get("name") if isinstance(event.get("channel"), dict) else None,
+        getattr(registry_context, "channel_name", None),
+    ):
+        name = _clean_registry_value(candidate)
+        if name and name != channel_id:
+            return name
+    return channel_id
+
+
 def check_slack_requirements() -> bool:
     """Check if Slack dependencies are available.
 
@@ -2179,24 +2377,34 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
 
-        # Build source
+        # Build source. For known CLCK client channels, use the local registry
+        # name cheaply; otherwise keep the existing safe channel-ID fallback.
+        _clck_context = _build_clck_slack_client_context(channel_id)
+        _chat_name = _slack_event_channel_name(event, channel_id, _clck_context)
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=channel_id,  # Will be resolved later if needed
+            chat_name=_chat_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
         )
 
-        # Per-channel ephemeral prompt
+        # Per-channel ephemeral prompt. Local CLCK registry context is prepended
+        # per turn, and existing config-based channel_prompts are preserved.
         from gateway.platforms.base import resolve_channel_prompt, resolve_channel_skills
-        _channel_prompt = resolve_channel_prompt(
+        _configured_channel_prompt = resolve_channel_prompt(
             self.config.extra, channel_id, None,
+        )
+        _channel_prompt = _combine_slack_channel_prompts(
+            getattr(_clck_context, "prompt", None),
+            _configured_channel_prompt,
         )
         _auto_skill = resolve_channel_skills(
             self.config.extra, channel_id, None,
         )
+        if _auto_skill is None and _clck_context is not None:
+            _auto_skill = ["clck-client-operations"]
 
         # Extract reply context if this message is a thread reply.
         # Mirrors the Telegram/Discord implementations so that gateway.run

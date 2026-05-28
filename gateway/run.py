@@ -1114,6 +1114,40 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _resolve_provider_runtime_agent_kwargs(
+    provider: str,
+    *,
+    model: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+) -> tuple[Optional[str], dict]:
+    """Resolve runtime kwargs for a configured non-global provider override."""
+    from hermes_cli.runtime_provider import (
+        resolve_runtime_provider,
+        format_runtime_provider_error,
+    )
+    from hermes_cli.auth import AuthError
+
+    try:
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            explicit_base_url=(explicit_base_url or None),
+            explicit_api_key=(explicit_api_key or None),
+            target_model=model,
+        )
+    except AuthError as auth_exc:
+        raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+    except Exception as exc:
+        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+    runtime_model = runtime.get("model")
+    kwargs = _runtime_agent_kwargs_from_resolved_provider(runtime)
+    if api_mode:
+        kwargs["api_mode"] = api_mode
+    return runtime_model, kwargs
+
+
 def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -1399,6 +1433,150 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _topic_model_as_string_set(value: Any) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value}
+    if value is not None:
+        text = str(value)
+        return {text} if text else set()
+    return set()
+
+
+def _iter_topic_model_overrides(config: dict, platform: str):
+    """Yield topic model override blocks for a platform from supported config paths."""
+    if not isinstance(config, dict):
+        return
+
+    platform_cfg = config.get(platform)
+    if isinstance(platform_cfg, dict) and "topic_model_overrides" in platform_cfg:
+        yield platform_cfg.get("topic_model_overrides")
+
+    platforms_cfg = config.get("platforms")
+    if isinstance(platforms_cfg, dict):
+        platform_block = platforms_cfg.get(platform)
+        if isinstance(platform_block, dict):
+            extra = platform_block.get("extra")
+            if isinstance(extra, dict) and "topic_model_overrides" in extra:
+                yield extra.get("topic_model_overrides")
+
+    gateway_cfg = config.get("gateway")
+    if isinstance(gateway_cfg, dict):
+        gateway_platforms = gateway_cfg.get("platforms")
+        if isinstance(gateway_platforms, dict):
+            platform_block = gateway_platforms.get(platform)
+            if isinstance(platform_block, dict):
+                extra = platform_block.get("extra")
+                if isinstance(extra, dict) and "topic_model_overrides" in extra:
+                    yield extra.get("topic_model_overrides")
+
+
+def _topic_model_entry_channel_ids(entry: dict) -> set[str]:
+    entry_ids = (
+        entry.get("ids")
+        if entry.get("ids") is not None
+        else entry.get("id")
+        or entry.get("channel_id")
+        or entry.get("chat_id")
+        or entry.get("parent_channel_id")
+        or entry.get("stream_id")
+        or entry.get("stream_ids")
+    )
+    return _topic_model_as_string_set(entry_ids)
+
+
+def _topic_model_topic_matches(entry: dict, topic_id: Optional[str]) -> bool:
+    if topic_id is None:
+        return False
+    topic = str(topic_id)
+    exact_topics = _topic_model_as_string_set(
+        entry.get("topic")
+        or entry.get("topics")
+        or entry.get("thread_id")
+        or entry.get("thread_ids")
+    )
+    if exact_topics and topic in exact_topics:
+        return True
+
+    prefixes = _topic_model_as_string_set(
+        entry.get("topic_prefix")
+        or entry.get("topic_prefixes")
+        or entry.get("thread_prefix")
+        or entry.get("thread_prefixes")
+        or entry.get("topic_startswith")
+    )
+    return any(topic.startswith(prefix) for prefix in prefixes)
+
+
+def _topic_model_source_channel_ids(source: Optional[SessionSource]) -> list[str]:
+    if source is None:
+        return []
+    raw_ids: list[str] = []
+    for value in (getattr(source, "chat_id", None), getattr(source, "parent_chat_id", None)):
+        if value is None:
+            continue
+        text = str(value)
+        if not text:
+            continue
+        raw_ids.append(text)
+        if ":" in text:
+            suffix = text.split(":", 1)[1]
+            if suffix:
+                raw_ids.append(suffix)
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(raw_ids))
+
+
+def _match_topic_model_override(
+    config: dict,
+    platform: str,
+    topic_id: Optional[str],
+    *channel_ids: Optional[str],
+) -> Optional[dict]:
+    """Return the first model/provider override matching channel + topic."""
+    if topic_id is None:
+        return None
+    wanted = {str(ch_id) for ch_id in channel_ids if ch_id is not None and str(ch_id)}
+    if not wanted:
+        return None
+
+    for overrides in _iter_topic_model_overrides(config, platform):
+        if not isinstance(overrides, list):
+            continue
+        for entry in overrides:
+            if not isinstance(entry, dict):
+                continue
+            ids = _topic_model_entry_channel_ids(entry)
+            if ids and wanted.isdisjoint(ids):
+                continue
+            if not _topic_model_topic_matches(entry, topic_id):
+                continue
+            result = {}
+            for key in ("provider", "model", "base_url", "api_key", "api_mode"):
+                if key not in entry or entry.get(key) is None:
+                    continue
+                value = str(entry.get(key) or "").strip()
+                if value:
+                    result[key] = value
+            if result.get("provider") or result.get("model"):
+                return result
+    return None
+
+
+def _resolve_topic_model_override_for_source(
+    config: dict,
+    source: Optional[SessionSource],
+) -> Optional[dict]:
+    if source is None:
+        return None
+    platform = _platform_config_key(source.platform)
+    return _match_topic_model_override(
+        config or {},
+        platform,
+        getattr(source, "thread_id", None) or getattr(source, "chat_topic", None),
+        *_topic_model_source_channel_ids(source),
+    )
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -1471,6 +1649,24 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     elif isinstance(model_cfg, dict):
         return model_cfg.get("default") or model_cfg.get("model") or ""
     return ""
+
+
+def _ensure_model_for_runtime_provider(model: str, runtime_kwargs: dict) -> str:
+    """Fill a missing model from the provider catalog when possible."""
+    if model or not runtime_kwargs.get("provider"):
+        return model
+    try:
+        from hermes_cli.models import get_default_model_for_provider
+        resolved = get_default_model_for_provider(runtime_kwargs["provider"])
+        if resolved:
+            logger.info(
+                "No model configured — defaulting to %s for provider %s",
+                resolved, runtime_kwargs["provider"],
+            )
+            return resolved
+    except Exception:
+        pass
+    return model
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -2373,8 +2569,10 @@ class GatewayRunner:
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(user_config)
-        override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        config = user_config if isinstance(user_config, dict) else _load_gateway_config()
+        model = _resolve_gateway_model(config)
+        override = self._get_session_model_override(resolved_session_key)
+        topic_override = None if override else _resolve_topic_model_override_for_source(config, source)
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -2385,23 +2583,67 @@ class GatewayRunner:
             }
             if override_runtime.get("api_key"):
                 logger.debug(
-                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
+                    "Session model override applied: session=*** config_model=%s -> override_model=%s provider=%s",
                     resolved_session_key or "", model, override_model,
                     override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
+
+            override_provider = override_runtime.get("provider")
+            if override_provider:
+                runtime_model, override_runtime = _resolve_provider_runtime_agent_kwargs(
+                    override_provider,
+                    model=override_model,
+                    explicit_base_url=override.get("base_url"),
+                    explicit_api_key=override.get("api_key"),
+                    api_mode=override.get("api_mode"),
+                )
+                if runtime_model and not override.get("model"):
+                    override_model = runtime_model
+                override_model = _ensure_model_for_runtime_provider(
+                    override_model, override_runtime
+                )
+                logger.debug(
+                    "Persisted session model override resolved: session=*** config_model=%s -> override_model=%s provider=%s",
+                    resolved_session_key or "", model, override_model,
+                    override_runtime.get("provider"),
+                )
+                return override_model, override_runtime
+
+            # Legacy/partial override with no provider: resolve the default
+            # runtime, then layer non-secret fields below.
             logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
+                "Session model override (partial): session=*** config_model=%s override_model=%s",
                 resolved_session_key or "", model, override_model,
             )
         else:
             logger.debug(
-                "No session model override: session=%s config_model=%s override_keys=%s",
+                "No session model override: session=*** config_model=%s override_keys=%s",
                 resolved_session_key or "", model,
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
+
+        if topic_override and topic_override.get("provider"):
+            topic_model = topic_override.get("model")
+            if topic_model:
+                model = topic_model
+            runtime_model, runtime_kwargs = _resolve_provider_runtime_agent_kwargs(
+                topic_override["provider"],
+                model=model,
+                explicit_base_url=topic_override.get("base_url"),
+                explicit_api_key=topic_override.get("api_key"),
+                api_mode=topic_override.get("api_mode"),
+            )
+            if runtime_model and not topic_model:
+                model = runtime_model
+            model = _ensure_model_for_runtime_provider(model, runtime_kwargs)
+            logger.info(
+                "Topic model override applied: platform=%s model=%s provider=%s",
+                getattr(getattr(source, "platform", None), "value", None),
+                model,
+                runtime_kwargs.get("provider"),
+            )
+            return model, runtime_kwargs
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
@@ -2412,26 +2654,38 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        if topic_override:
+            topic_model = topic_override.get("model")
+            if topic_model:
+                model = topic_model
+            topic_provider = topic_override.get("provider")
+            if topic_provider:
+                runtime_model, runtime_kwargs = _resolve_provider_runtime_agent_kwargs(
+                    topic_provider,
+                    model=model,
+                    explicit_base_url=topic_override.get("base_url"),
+                    explicit_api_key=topic_override.get("api_key"),
+                    api_mode=topic_override.get("api_mode"),
+                )
+                if runtime_model and not topic_model:
+                    model = runtime_model
+            else:
+                for key in ("api_key", "base_url", "api_mode"):
+                    val = topic_override.get(key)
+                    if val is not None:
+                        runtime_kwargs[key] = val
+            logger.info(
+                "Topic model override applied: platform=%s model=%s provider=%s",
+                getattr(getattr(source, "platform", None), "value", None),
+                model,
+                runtime_kwargs.get("provider"),
+            )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
 
-        # When the config has no model.default but a provider was resolved
-        # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
-        # fall back to the provider's first catalog model so the API call
-        # doesn't fail with "model must be a non-empty string".
-        if not model and runtime_kwargs.get("provider"):
-            try:
-                from hermes_cli.models import get_default_model_for_provider
-                model = get_default_model_for_provider(runtime_kwargs["provider"])
-                if model:
-                    logger.info(
-                        "No model configured — defaulting to %s for provider %s",
-                        model, runtime_kwargs["provider"],
-                    )
-            except Exception:
-                pass
+        model = _ensure_model_for_runtime_provider(model, runtime_kwargs)
 
         return model, runtime_kwargs
 
@@ -2891,6 +3145,76 @@ class GatewayRunner:
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
         return self._load_reasoning_config()
+
+    def _get_session_model_override(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Return a manual /model override, hydrating it from SessionStore if needed."""
+        if not session_key:
+            return None
+        overrides = getattr(self, "_session_model_overrides", None)
+        if overrides is None:
+            self._session_model_overrides = {}
+            overrides = self._session_model_overrides
+        override = overrides.get(session_key)
+        if override:
+            return override
+        store = getattr(self, "session_store", None)
+        getter = getattr(store, "get_model_override", None)
+        if getter is None:
+            return None
+        try:
+            persisted = getter(session_key)
+        except Exception:
+            logger.debug("Failed to load persisted session model override", exc_info=True)
+            return None
+        if persisted:
+            overrides[session_key] = dict(persisted)
+            return overrides[session_key]
+        return None
+
+    def _set_session_model_override(
+        self,
+        session_key: str,
+        override: Optional[Dict[str, Any]],
+        *,
+        persist: bool = True,
+        source: Optional[SessionSource] = None,
+    ) -> None:
+        """Set or clear a manual /model override for this session.
+
+        The in-memory copy may include resolved credentials for the current
+        process.  The SessionStore persists only non-secret routing fields so
+        the selected model/provider can be re-resolved after a gateway restart.
+        """
+        if not session_key:
+            return
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+        if override is None:
+            self._session_model_overrides.pop(session_key, None)
+        else:
+            # Strip empty-string values so the in-memory copy is consistent with
+            # the sanitized version the SessionStore persists.  Empty provider/api_key
+            # values would otherwise be treated as falsy in _resolve_session_agent_runtime
+            # but still get written into runtime_kwargs by _apply_session_model_override,
+            # clobbering valid resolved credentials with empty strings.
+            self._session_model_overrides[session_key] = {
+                k: v for k, v in override.items() if v is not None and v != ""
+            }
+        if not persist:
+            return
+        store = getattr(self, "session_store", None)
+        setter = getattr(store, "set_model_override", None)
+        if setter is None:
+            return
+        try:
+            persisted = setter(session_key, override)
+            if not persisted and source is not None:
+                creator = getattr(store, "get_or_create_session", None)
+                if creator is not None:
+                    creator(source)
+                    setter(session_key, override)
+        except Exception:
+            logger.debug("Failed to persist session model override", exc_info=True)
 
     def _set_session_reasoning_override(
         self,
@@ -6319,6 +6643,13 @@ class GatewayRunner:
                 return None
             return SlackAdapter(config)
 
+        elif platform == Platform.ZULIP:
+            from gateway.platforms.zulip import ZulipAdapter, check_zulip_requirements
+            if not check_zulip_requirements():
+                logger.warning("Zulip: aiohttp not installed or ZULIP_SITE/BOT credentials not configured")
+                return None
+            return ZulipAdapter(config)
+
         elif platform == Platform.SIGNAL:
             from gateway.platforms.signal import SignalAdapter, check_signal_requirements
             if not check_signal_requirements():
@@ -6508,6 +6839,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.ZULIP: "ZULIP_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -6534,6 +6866,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.ZULIP: "ZULIP_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -6554,9 +6887,18 @@ class GatewayRunner:
             except Exception:
                 pass
 
-        # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
+        platform_cfg_extra = {}
+        if getattr(self, "config", None) and source.platform in getattr(self.config, "platforms", {}):
+            platform_cfg_extra = getattr(self.config.platforms[source.platform], "extra", {}) or {}
+
+        # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true).
+        # Zulip may load this from ~/.hermes/secrets/zulip.env into platform
+        # config rather than exporting it as a process environment variable.
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in {"true", "1", "yes"}:
+        platform_allow_all_value = os.getenv(platform_allow_all_var, "") if platform_allow_all_var else ""
+        if not platform_allow_all_value:
+            platform_allow_all_value = str(platform_cfg_extra.get("allow_all_users", ""))
+        if platform_allow_all_value.lower().strip() in {"true", "1", "yes"}:
             return True
 
         if getattr(source, "is_bot", False):
@@ -6571,6 +6913,8 @@ class GatewayRunner:
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
+        if not platform_allowlist:
+            platform_allowlist = str(platform_cfg_extra.get("allowed_users", "")).strip()
         group_user_allowlist = ""
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
@@ -6707,6 +7051,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.ZULIP:    "ZULIP_ALLOWED_USERS",
             }
             platform_group_env_map = {
                 Platform.TELEGRAM: (
@@ -6716,6 +7061,9 @@ class GatewayRunner:
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
+                return "ignore"
+            platform_cfg = config.platforms.get(platform) if config and hasattr(config, "platforms") else None
+            if platform_cfg and str(getattr(platform_cfg, "extra", {}).get("allowed_users", "")).strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
                 if os.getenv(env_key, "").strip():
@@ -7234,6 +7582,10 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
 
+            # /state is read-only metadata and should be queryable mid-turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "state":
+                return await self._handle_state_command(event)
+
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             # /btw is an alias of /background and resolves to the same canonical
@@ -7553,6 +7905,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "state":
+            return await self._handle_state_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -10285,7 +10640,7 @@ class GatewayRunner:
         # Check for session override
         source = event.source
         session_key = self._session_key_for_source(source)
-        override = self._session_model_overrides.get(session_key, {})
+        override = self._get_session_model_override(session_key) or {}
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
@@ -10369,13 +10724,17 @@ class GatewayRunner:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
+                        _self._set_session_model_override(
+                            _session_key,
+                            {
+                                "model": result.new_model,
+                                "provider": result.target_provider,
+                                "api_key": result.api_key,
+                                "base_url": result.base_url,
+                                "api_mode": result.api_mode,
+                            },
+                            source=source,
+                        )
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -10509,13 +10868,17 @@ class GatewayRunner:
         )
 
         # Store session override so next agent creation uses the new model
-        self._session_model_overrides[session_key] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "api_key": result.api_key,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
-        }
+        self._set_session_model_override(
+            session_key,
+            {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            },
+            source=source,
+        )
 
         # Evict cached agent so the next turn creates a fresh agent from the
         # override rather than relying on cache signature mismatch detection.
@@ -13142,6 +13505,40 @@ class GatewayRunner:
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
+    async def _handle_state_command(self, event: MessageEvent) -> str:
+        """Handle /state command -- read-only session/lane state report."""
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+        if agent is _AGENT_PENDING_SENTINEL:
+            agent = None
+
+        try:
+            from gateway.state_report import build_state_report, render_state_report
+
+            session_db = getattr(self, "_session_db", None) or getattr(
+                self.session_store, "_db", None
+            )
+            report = build_state_report(
+                source,
+                self.session_store,
+                session_db,
+                live_agent=agent,
+            )
+            return render_state_report(report)
+        except Exception as exc:
+            logger.warning("State report failed: %s", exc, exc_info=True)
+            return f"State report unavailable: {exc}"
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 
@@ -15236,7 +15633,7 @@ class GatewayRunner:
         subsequent messages.  Fields with ``None`` values are skipped so
         partial overrides don't clobber valid config defaults.
         """
-        override = self._session_model_overrides.get(session_key)
+        override = self._get_session_model_override(session_key)
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
@@ -15248,7 +15645,7 @@ class GatewayRunner:
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
         """Return True if *agent_model* matches an active /model session override."""
-        override = self._session_model_overrides.get(session_key)
+        override = self._get_session_model_override(session_key)
         return override is not None and override.get("model") == agent_model
 
     def _release_running_agent_state(
