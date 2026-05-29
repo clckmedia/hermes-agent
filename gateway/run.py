@@ -1133,6 +1133,11 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
+    return _runtime_agent_kwargs_from_resolved_provider(runtime)
+
+
+def _runtime_agent_kwargs_from_resolved_provider(runtime: dict) -> dict:
+    """Return the AIAgent runtime kwargs subset from a provider resolution."""
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
