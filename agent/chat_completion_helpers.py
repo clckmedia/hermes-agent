@@ -36,7 +36,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import classify_api_error, FailoverReason
-from agent.model_metadata import is_local_endpoint
+from agent.model_metadata import estimate_request_tokens_rough, is_local_endpoint
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _sanitize_messages_surrogates,
@@ -63,6 +63,73 @@ from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_prune_summary_tool_results(agent, api_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Prune old tool outputs from the max-iterations summary request copy."""
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or not hasattr(compressor, "_prune_old_tool_results"):
+        return api_messages
+
+    try:
+        approx_request_tokens = estimate_request_tokens_rough(api_messages, tools=None)
+    except Exception:
+        approx_request_tokens = sum(len(str(msg)) for msg in api_messages) // 4
+
+    try:
+        threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    except Exception:
+        threshold_tokens = 0
+    try:
+        context_length = int(getattr(compressor, "context_length", 0) or 0)
+    except Exception:
+        context_length = 0
+
+    budget_tokens = threshold_tokens or context_length
+    if budget_tokens <= 0:
+        budget_tokens = 100_000
+    trigger_tokens = max(20_000, int(budget_tokens * 0.45))
+    if approx_request_tokens < trigger_tokens:
+        return api_messages
+
+    try:
+        protect_tail_count = int(getattr(compressor, "protect_last_n", 20) or 20)
+    except Exception:
+        protect_tail_count = 20
+    protect_tail_count = max(0, protect_tail_count)
+
+    try:
+        configured_tail_budget = int(getattr(compressor, "tail_token_budget", 0) or 0)
+    except Exception:
+        configured_tail_budget = 0
+    protect_tail_tokens = max(12_000, min(70_000, int(budget_tokens * 0.30)))
+    if configured_tail_budget > 0:
+        protect_tail_tokens = min(configured_tail_budget, protect_tail_tokens)
+
+    try:
+        pruned_messages, pruned_count = compressor._prune_old_tool_results(
+            api_messages,
+            protect_tail_count=protect_tail_count,
+            protect_tail_tokens=protect_tail_tokens,
+        )
+    except Exception as exc:
+        logger.debug("Max-iteration summary tool-result pruning failed: %s", exc, exc_info=True)
+        return api_messages
+
+    if not pruned_count:
+        return api_messages
+
+    try:
+        new_request_tokens = estimate_request_tokens_rough(pruned_messages, tools=None)
+    except Exception:
+        new_request_tokens = sum(len(str(msg)) for msg in pruned_messages) // 4
+    logger.info(
+        "Max-iteration summary pruning: pruned %d old tool result(s), tokens ~%s -> ~%s",
+        pruned_count,
+        f"{approx_request_tokens:,}",
+        f"{new_request_tokens:,}",
+    )
+    return pruned_messages
 
 
 def _ra():
@@ -1321,6 +1388,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
         # Same safety net as the main loop: drop thinking-only assistant
         # turns so Anthropic-family providers don't 400 the summary call.
+        api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+        api_messages = _maybe_prune_summary_tool_results(agent, api_messages)
+        api_messages = agent._sanitize_api_messages(api_messages)
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
         summary_extra_body = {}

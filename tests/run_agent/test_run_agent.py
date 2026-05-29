@@ -2559,6 +2559,66 @@ class TestHandleMaxIterations:
         ]
         assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
 
+    def test_summary_request_prunes_old_tool_results(self, agent):
+        """Regression: max-iteration summary must not resend a huge tool transcript."""
+        resp = _mock_response(content="Summary after tool loop.")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        huge_output = "x" * 120_000
+
+        class Compressor:
+            threshold_tokens = 40_000
+            context_length = 80_000
+            protect_last_n = 2
+            tail_token_budget = 30_000
+            seen_tail_tokens = None
+
+            def _prune_old_tool_results(
+                self,
+                api_messages,
+                protect_tail_count,
+                protect_tail_tokens=None,
+            ):
+                self.seen_tail_tokens = protect_tail_tokens
+                pruned = [msg.copy() for msg in api_messages]
+                pruned_count = 0
+                for msg in pruned:
+                    if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_old":
+                        msg["content"] = "[terminal] summarized old output"
+                        pruned_count += 1
+                return pruned, pruned_count
+
+        compressor = Compressor()
+        agent.context_compressor = compressor
+        messages = [
+            {"role": "user", "content": "run big workload"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "function": {"name": "terminal", "arguments": "{\"cmd\":\"make test\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": huge_output},
+            {"role": "user", "content": "keep going"},
+        ]
+
+        result = agent._handle_max_iterations(messages, 90)
+
+        assert result == "Summary after tool loop."
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        sent_msgs = kwargs.get("messages", [])
+        sent_tool_msgs = [
+            m for m in sent_msgs
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_old"
+        ]
+        assert sent_tool_msgs
+        assert sent_tool_msgs[0]["content"] == "[terminal] summarized old output"
+        assert messages[2]["content"] == huge_output
+        assert compressor.seen_tail_tokens is not None
+
     def test_summary_request_inserts_stub_for_missing_tool_result(self, agent):
         """If an assistant tool_call has no matching tool result in the
         summary request, a stub must be inserted to satisfy the API contract."""
