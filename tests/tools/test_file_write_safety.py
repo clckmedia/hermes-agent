@@ -24,6 +24,55 @@ class TestStaticDenyList:
     def test_etc_shadow_is_denied(self):
         assert _is_write_denied("/etc/shadow") is True
 
+    def test_active_hermes_config_yaml_is_allowed(self, tmp_path: Path, monkeypatch):
+        """The active profile's config is operator-owned config, not credentials."""
+        import agent.file_safety as fs
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = hermes_home / "config.yaml"
+        config.write_text("model: {}\n", encoding="utf-8")
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: hermes_home)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: hermes_home)
+        assert _is_write_denied(str(config)) is False
+
+    def test_profile_config_allowed_but_root_config_denied(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Profile sessions may edit their own config, not inherited root config."""
+        import agent.file_safety as fs
+
+        root = tmp_path / "hermes-root"
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        root_config = root / "config.yaml"
+        profile_config = profile / "config.yaml"
+        root_config.write_text("model: root\n", encoding="utf-8")
+        profile_config.write_text("model: profile\n", encoding="utf-8")
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: profile)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+
+        assert _is_write_denied(str(profile_config)) is False
+        assert _is_write_denied(str(root_config)) is True
+
+    def test_active_config_does_not_override_safe_root(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The config allowance must not pierce an explicit safe-root sandbox."""
+        import agent.file_safety as fs
+
+        hermes_home = tmp_path / "hermes-home"
+        safe_root = tmp_path / "workspace"
+        hermes_home.mkdir()
+        safe_root.mkdir()
+        config = hermes_home / "config.yaml"
+        config.write_text("model: {}\n", encoding="utf-8")
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: hermes_home)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: hermes_home)
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+
+        assert _is_write_denied(str(config)) is True
+
 
 class TestSafeWriteRoot:
     """HERMES_WRITE_SAFE_ROOT should sandbox writes to a specific subtree."""

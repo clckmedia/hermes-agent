@@ -426,6 +426,36 @@ def _auto_continue_freshness_window() -> float:
         return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
 
 
+def _compression_chain_depth_from_session_db(session_db: Any, session_id: str | None) -> int:
+    """Count contiguous compression ancestors for a session without reading messages."""
+    if not session_db or not session_id or not hasattr(session_db, "get_session"):
+        return 0
+
+    depth = 0
+    current = session_id
+    seen = {session_id}
+    for _ in range(32):
+        try:
+            row = session_db.get_session(current)
+        except Exception:
+            break
+        if not isinstance(row, dict):
+            break
+        parent_id = row.get("parent_session_id")
+        if not parent_id or parent_id in seen:
+            break
+        seen.add(parent_id)
+        try:
+            parent = session_db.get_session(parent_id)
+        except Exception:
+            break
+        if not isinstance(parent, dict) or parent.get("end_reason") != "compression":
+            break
+        depth += 1
+        current = parent_id
+    return depth
+
+
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
 
@@ -1442,22 +1472,22 @@ def _topic_model_as_string_set(value: Any) -> set[str]:
     return set()
 
 
-def _iter_topic_model_overrides(config: dict, platform: str):
-    """Yield topic model override blocks for a platform from supported config paths."""
+def _iter_platform_config_values(config: dict, platform: str, key: str):
+    """Yield platform config values from legacy, platforms.*, and gateway.* paths."""
     if not isinstance(config, dict):
         return
 
     platform_cfg = config.get(platform)
-    if isinstance(platform_cfg, dict) and "topic_model_overrides" in platform_cfg:
-        yield platform_cfg.get("topic_model_overrides")
+    if isinstance(platform_cfg, dict) and key in platform_cfg:
+        yield platform_cfg.get(key)
 
     platforms_cfg = config.get("platforms")
     if isinstance(platforms_cfg, dict):
         platform_block = platforms_cfg.get(platform)
         if isinstance(platform_block, dict):
             extra = platform_block.get("extra")
-            if isinstance(extra, dict) and "topic_model_overrides" in extra:
-                yield extra.get("topic_model_overrides")
+            if isinstance(extra, dict) and key in extra:
+                yield extra.get(key)
 
     gateway_cfg = config.get("gateway")
     if isinstance(gateway_cfg, dict):
@@ -1466,8 +1496,13 @@ def _iter_topic_model_overrides(config: dict, platform: str):
             platform_block = gateway_platforms.get(platform)
             if isinstance(platform_block, dict):
                 extra = platform_block.get("extra")
-                if isinstance(extra, dict) and "topic_model_overrides" in extra:
-                    yield extra.get("topic_model_overrides")
+                if isinstance(extra, dict) and key in extra:
+                    yield extra.get(key)
+
+
+def _iter_topic_model_overrides(config: dict, platform: str):
+    """Yield topic model override blocks for a platform from supported config paths."""
+    yield from _iter_platform_config_values(config, platform, "topic_model_overrides")
 
 
 def _topic_model_entry_channel_ids(entry: dict) -> set[str]:
@@ -1504,7 +1539,17 @@ def _topic_model_topic_matches(entry: dict, topic_id: Optional[str]) -> bool:
         or entry.get("thread_prefixes")
         or entry.get("topic_startswith")
     )
-    return any(topic.startswith(prefix) for prefix in prefixes)
+    if any(topic.startswith(prefix) for prefix in prefixes):
+        return True
+
+    suffixes = _topic_model_as_string_set(
+        entry.get("topic_suffix")
+        or entry.get("topic_suffixes")
+        or entry.get("thread_suffix")
+        or entry.get("thread_suffixes")
+        or entry.get("topic_endswith")
+    )
+    return any(topic.endswith(suffix) for suffix in suffixes)
 
 
 def _topic_model_source_channel_ids(source: Optional[SessionSource]) -> list[str]:
@@ -1575,6 +1620,132 @@ def _resolve_topic_model_override_for_source(
         getattr(source, "thread_id", None) or getattr(source, "chat_topic", None),
         *_topic_model_source_channel_ids(source),
     )
+
+
+def _coerce_toolset_names(value: Any) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw_values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        return None
+
+    toolsets: list[str] = []
+    for item in raw_values:
+        text = str(item).strip()
+        if text:
+            toolsets.append(text)
+    return toolsets
+
+
+def _resolve_configured_toolsets(
+    config: dict,
+    platform: str,
+    toolset_names: Optional[list[str]] = None,
+) -> list[str]:
+    from hermes_cli.tools_config import _get_platform_tools
+
+    if toolset_names is None:
+        return sorted(_get_platform_tools(config or {}, platform))
+
+    scoped_config = dict(config or {})
+    platform_toolsets = dict(scoped_config.get("platform_toolsets") or {})
+    platform_toolsets[platform] = list(toolset_names)
+    scoped_config["platform_toolsets"] = platform_toolsets
+    return sorted(_get_platform_tools(scoped_config, platform))
+
+
+def _match_topic_toolsets(
+    config: dict,
+    platform: str,
+    topic_id: Optional[str],
+    *channel_ids: Optional[str],
+) -> Optional[list[str]]:
+    if topic_id is None:
+        return None
+    wanted = {str(ch_id) for ch_id in channel_ids if ch_id is not None and str(ch_id)}
+    if not wanted:
+        return None
+
+    for rules in _iter_platform_config_values(config, platform, "topic_toolsets"):
+        if not isinstance(rules, list):
+            continue
+        for entry in rules:
+            if not isinstance(entry, dict):
+                continue
+            ids = _topic_model_entry_channel_ids(entry)
+            if ids and wanted.isdisjoint(ids):
+                continue
+            if not _topic_model_topic_matches(entry, topic_id):
+                continue
+            toolsets = _coerce_toolset_names(
+                entry.get("toolsets") if "toolsets" in entry else entry.get("tools")
+            )
+            if toolsets is not None:
+                return toolsets
+    return None
+
+
+def _match_channel_toolsets(
+    config: dict,
+    platform: str,
+    *channel_ids: Optional[str],
+) -> Optional[list[str]]:
+    wanted = [str(ch_id) for ch_id in channel_ids if ch_id is not None and str(ch_id)]
+    if not wanted:
+        return None
+    wanted_set = set(wanted)
+
+    for rules in _iter_platform_config_values(config, platform, "channel_toolsets"):
+        if isinstance(rules, dict):
+            normalized_rules = {str(key): value for key, value in rules.items()}
+            for channel_id in wanted:
+                toolsets = _coerce_toolset_names(normalized_rules.get(channel_id))
+                if toolsets is not None:
+                    return toolsets
+            continue
+
+        if not isinstance(rules, list):
+            continue
+        for entry in rules:
+            if not isinstance(entry, dict):
+                continue
+            ids = _topic_model_entry_channel_ids(entry)
+            if ids and wanted_set.isdisjoint(ids):
+                continue
+            toolsets = _coerce_toolset_names(
+                entry.get("toolsets") if "toolsets" in entry else entry.get("tools")
+            )
+            if toolsets is not None:
+                return toolsets
+    return None
+
+
+def _resolve_source_toolsets(
+    config: dict,
+    platform: str,
+    source: Optional[SessionSource],
+) -> list[str]:
+    if source is None:
+        return _resolve_configured_toolsets(config, platform)
+
+    channel_ids = _topic_model_source_channel_ids(source)
+    topic_id = getattr(source, "thread_id", None) or getattr(source, "chat_topic", None)
+
+    toolsets = _match_topic_toolsets(config or {}, platform, topic_id, *channel_ids)
+    if toolsets is None:
+        toolsets = _match_channel_toolsets(config or {}, platform, *channel_ids)
+    resolved = _resolve_configured_toolsets(config or {}, platform, toolsets)
+    logger.debug(
+        "Resolved %s toolsets for topic=%r channels=%s: %s",
+        platform,
+        topic_id,
+        channel_ids,
+        resolved,
+    )
+    return resolved
 
 
 def _teams_pipeline_plugin_enabled() -> bool:
@@ -9272,6 +9443,9 @@ class GatewayRunner:
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    compression_count=agent_result.get("compression_count"),
+                    session_compression_depth=agent_result.get("session_compression_depth"),
+                    session_was_split=bool(agent_result.get("session_was_split")),
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:
@@ -12142,8 +12316,7 @@ class GatewayRunner:
 
             platform_key = _platform_config_key(source.platform)
 
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _resolve_source_toolsets(user_config, platform_key, source)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -16341,8 +16514,7 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _resolve_source_toolsets(user_config, platform_key, source)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -17647,13 +17819,20 @@ class GatewayRunner:
             _input_toks = 0
             _output_toks = 0
             _context_length = 0
+            _compression_count = 0
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _compression_count = getattr(_agent.context_compressor, "compression_count", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _effective_session_for_lineage = getattr(_agent, "session_id", session_id) if _agent else session_id
+            _session_compression_depth = _compression_chain_depth_from_session_db(
+                self._session_db,
+                _effective_session_for_lineage,
+            )
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -17675,6 +17854,9 @@ class GatewayRunner:
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "compression_count": _compression_count,
+                    "session_compression_depth": _session_compression_depth,
+                    "session_was_split": False,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -17835,6 +18017,9 @@ class GatewayRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "compression_count": _compression_count,
+                "session_compression_depth": _session_compression_depth,
+                "session_was_split": _session_was_split,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),

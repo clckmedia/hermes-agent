@@ -260,3 +260,140 @@ def test_build_footer_no_data_returns_empty_even_when_enabled():
     # With no TERMINAL_CWD env either
     if not os.environ.get("TERMINAL_CWD"):
         assert out == ""
+
+# ---------------------------------------------------------------------------
+# context_action parent-state footer
+# ---------------------------------------------------------------------------
+
+def test_context_action_footer_renders_parent_context_decision_only():
+    rendered = format_runtime_footer(
+        model="openai/gpt-5.5",
+        context_tokens=77_923,
+        context_length=272_000,
+        fields=["context_pct", "context_action"],
+    )
+
+    assert rendered == "29% · continue"
+    assert "gpt-5.5" not in rendered
+
+
+def test_context_action_footer_uses_handover_bands():
+    assert (
+        format_runtime_footer(
+            model=None,
+            context_tokens=55_000,
+            context_length=100_000,
+            fields=["context_pct", "context_action"],
+        )
+        == "55% · keep lean"
+    )
+    assert (
+        format_runtime_footer(
+            model=None,
+            context_tokens=68_000,
+            context_length=100_000,
+            fields=["context_pct", "context_action"],
+        )
+        == "68% · prep handover"
+    )
+    assert (
+        format_runtime_footer(
+            model=None,
+            context_tokens=73_000,
+            context_length=100_000,
+            fields=["context_pct", "context_action"],
+        )
+        == "73% · handover now"
+    )
+
+
+
+
+def test_compression_status_footer_marks_compacted_context_from_lineage():
+    rendered = format_runtime_footer(
+        model="openai/gpt-5.5",
+        context_tokens=44_316,
+        context_length=272_000,
+        session_compression_depth=2,
+        fields=["context_pct", "compression_status", "context_action"],
+    )
+
+    assert rendered == "16% · compacted · continue"
+
+
+def test_compression_status_footer_omits_for_fresh_context():
+    rendered = format_runtime_footer(
+        model="openai/gpt-5.5",
+        context_tokens=44_316,
+        context_length=272_000,
+        session_compression_depth=0,
+        fields=["context_pct", "compression_status", "context_action"],
+    )
+
+    assert rendered == "16% · continue"
+
+
+def test_platform_runtime_footer_config_can_enable_compression_status():
+    cfg = {
+        "display": {
+            "runtime_footer": {"enabled": False, "fields": ["model", "context_pct"]},
+            "platforms": {
+                "zulip": {
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": [
+                            "context_pct",
+                            "compression_status",
+                            "context_action",
+                        ],
+                    }
+                }
+            },
+        }
+    }
+
+    rendered = build_footer_line(
+        user_config=cfg,
+        platform_key="zulip",
+        model="openai/gpt-5.5",
+        context_tokens=44_316,
+        context_length=272_000,
+        session_compression_depth=2,
+    )
+
+    assert rendered == "16% · compacted · continue"
+
+def test_platform_runtime_footer_config_can_enable_context_action_without_model():
+    cfg = {
+        "display": {
+            "runtime_footer": {"enabled": False, "fields": ["model", "context_pct"]},
+            "platforms": {
+                "zulip": {
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": ["context_pct", "context_action"],
+                    }
+                }
+            },
+        }
+    }
+
+    rendered = build_footer_line(
+        user_config=cfg,
+        platform_key="zulip",
+        model="openai/gpt-5.5",
+        context_tokens=77_923,
+        context_length=272_000,
+    )
+
+    assert rendered == "29% · continue"
+    assert (
+        build_footer_line(
+            user_config=cfg,
+            platform_key="slack",
+            model="openai/gpt-5.5",
+            context_tokens=77_923,
+            context_length=272_000,
+        )
+        == ""
+    )

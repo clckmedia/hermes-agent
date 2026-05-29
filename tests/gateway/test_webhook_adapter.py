@@ -985,6 +985,87 @@ class TestHubSpotSupportTriage:
             "thread_id": "1777784852.911829"
         }
 
+    def test_support_triage_continuation_card_marks_existing_ticket_update(self):
+        adapter = _make_adapter()
+        card = adapter._format_hubspot_support_triage_card(
+            {
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Client <client@example.invalid>",
+                    "to": "support@clck.com.au",
+                    "subject": "Re: Website form issue",
+                },
+                "support": {"summary": "Client supplied more detail."},
+                "support_reasoning": {
+                    "mode": "action_plan",
+                    "issue_type": "HubSpot form debugging",
+                    "assignee": "benson",
+                    "summary": "Client supplied more detail on the existing form issue.",
+                    "actions": ["Review the new details against the existing ticket."],
+                    "draft_reply": None,
+                    "internal_note": None,
+                    "ticket_url": "https://app.hubspot.com/contacts/435014/ticket/123",
+                    "slack_thread_ts": "1777784852.911829",
+                    "existing_ticket_update": True,
+                },
+            }
+        )
+
+        assert "CLCK support ticket update" in card
+        assert "Continuation: existing HubSpot ticket update; not a new support request." in card
+        assert "posted into the existing Slack working thread" in card
+        assert "Review the new details against the existing ticket." in card
+
+    def test_support_subject_normalisation_strips_reply_forward_prefixes(self):
+        adapter = _make_adapter()
+        assert adapter._normalise_support_subject("Re: Fwd: [External] Website form issue") == "website form issue"
+
+    @pytest.mark.asyncio
+    async def test_continuation_support_triage_does_not_overwrite_parent_slack_ts(self):
+        adapter = _make_adapter(routes=self._support_triage_routes())
+        adapter.handle_message = AsyncMock()
+        parent_ts = "1777784852.911829"
+        adapter._enrich_hubspot_support_triage_payload = AsyncMock(
+            return_value={
+                "event_type": "hubspot_support_triage",
+                "gmail": {
+                    "from": "Client <client@example.invalid>",
+                    "source_mailbox": "support@clck.com.au",
+                    "subject": "Re: Website form issue",
+                },
+                "support": {"summary": "More details from the client."},
+                "slack": {"channel_id": "C0B3PQE0CHG", "thread_ts": parent_ts},
+                "support_reasoning": {
+                    "mode": "action_plan",
+                    "issue_type": "HubSpot form debugging",
+                    "assignee": "benson",
+                    "summary": "More details on the existing issue.",
+                    "actions": ["Review the new client details."],
+                    "ticket_id": "123",
+                    "ticket_url": "https://app.hubspot.com/contacts/435014/ticket/123",
+                    "slack_thread_ts": parent_ts,
+                    "existing_ticket_update": True,
+                },
+            }
+        )
+        adapter._store_slack_thread_ts = AsyncMock()
+        slack_adapter = self._attach_slack_runner(adapter)
+        slack_adapter.send.return_value = SendResult(success=True, message_id="1777784999.000001")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/hubspot-support-triage",
+                json={"event_type": "hubspot_support_triage"},
+                headers={"X-Request-ID": "support-continuation-test-1"},
+            )
+            assert resp.status == 202
+
+        slack_adapter.send.assert_awaited_once()
+        assert slack_adapter.send.await_args.args[0] == "C0B3PQE0CHG"
+        assert slack_adapter.send.await_args.kwargs["metadata"] == {"thread_id": parent_ts}
+        adapter._store_slack_thread_ts.assert_not_awaited()
+
 
 # ===================================================================
 # Cross-platform delivery thread_id passthrough

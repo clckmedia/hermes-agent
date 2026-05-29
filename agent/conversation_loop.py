@@ -117,6 +117,86 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     )
 
 
+def _api_request_size_estimates(
+    api_messages: List[Dict[str, Any]],
+    tools: Any = None,
+) -> tuple[int, int, int]:
+    total_chars = sum(len(str(msg)) for msg in api_messages)
+    approx_tokens = estimate_messages_tokens_rough(api_messages)
+    approx_request_tokens = estimate_request_tokens_rough(
+        api_messages, tools=tools or None
+    )
+    return total_chars, approx_tokens, approx_request_tokens
+
+
+def _maybe_prune_api_tool_results(
+    agent: Any,
+    api_messages: List[Dict[str, Any]],
+    approx_request_tokens: int,
+) -> tuple[List[Dict[str, Any]], int, int]:
+    """Prune old tool output in the API request copy before full compression.
+
+    Session history remains untouched; this only shrinks the payload sent on
+    this model call. It is intentionally below the full-compression threshold
+    so heavy tool loops do not have to wait for compaction to get relief.
+    """
+    if not getattr(agent, "compression_enabled", False):
+        return api_messages, 0, approx_request_tokens
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or not hasattr(compressor, "_prune_old_tool_results"):
+        return api_messages, 0, approx_request_tokens
+
+    try:
+        threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    except Exception:
+        threshold_tokens = 0
+    if threshold_tokens <= 0:
+        return api_messages, 0, approx_request_tokens
+
+    trigger_tokens = max(20_000, int(threshold_tokens * 0.45))
+    if approx_request_tokens < trigger_tokens:
+        return api_messages, 0, approx_request_tokens
+
+    try:
+        protect_tail_count = int(getattr(compressor, "protect_last_n", 20) or 20)
+    except Exception:
+        protect_tail_count = 20
+    protect_tail_count = max(0, protect_tail_count)
+
+    try:
+        configured_tail_budget = int(getattr(compressor, "tail_token_budget", 0) or 0)
+    except Exception:
+        configured_tail_budget = 0
+    protect_tail_tokens = max(12_000, min(70_000, int(threshold_tokens * 0.30)))
+    if configured_tail_budget > 0:
+        protect_tail_tokens = min(configured_tail_budget, protect_tail_tokens)
+
+    try:
+        pruned_messages, pruned_count = compressor._prune_old_tool_results(
+            api_messages,
+            protect_tail_count=protect_tail_count,
+            protect_tail_tokens=protect_tail_tokens,
+        )
+    except Exception as exc:
+        logger.debug("API request tool-result pruning failed: %s", exc, exc_info=True)
+        return api_messages, 0, approx_request_tokens
+
+    if not pruned_count:
+        return api_messages, 0, approx_request_tokens
+
+    new_request_tokens = estimate_request_tokens_rough(
+        pruned_messages, tools=getattr(agent, "tools", None) or None
+    )
+    logger.info(
+        "API request tool pruning: pruned %d old tool result(s), tokens ~%s -> ~%s",
+        pruned_count,
+        f"{approx_request_tokens:,}",
+        f"{new_request_tokens:,}",
+    )
+    return pruned_messages, pruned_count, new_request_tokens
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -1056,12 +1136,18 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
-        # Calculate approximate request size for logging
-        total_chars = sum(len(str(msg)) for msg in api_messages)
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
-        approx_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+        # Calculate approximate request size for logging. Before the call, make
+        # a cheap API-copy-only pruning pass for large tool-heavy histories.
+        total_chars, approx_tokens, approx_request_tokens = _api_request_size_estimates(
+            api_messages, agent.tools or None
         )
+        api_messages, _api_tool_pruned, approx_request_tokens = _maybe_prune_api_tool_results(
+            agent, api_messages, approx_request_tokens
+        )
+        if _api_tool_pruned:
+            total_chars, approx_tokens, approx_request_tokens = _api_request_size_estimates(
+                api_messages, agent.tools or None
+            )
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens

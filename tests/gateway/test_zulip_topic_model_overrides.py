@@ -303,3 +303,109 @@ def test_model_command_persists_session_override(monkeypatch, tmp_path) -> None:
             },
         )
     ]
+
+
+def _toolset_config() -> dict:
+    return {
+        "platform_toolsets": {
+            "zulip": ["file", "web", "no_mcp"],
+        },
+        "mcp_servers": {
+            "activepieces": {"url": "https://cloud.activepieces.com/mcp"},
+        },
+        "zulip": {
+            "topic_toolsets": [
+                {
+                    "ids": ["595301"],
+                    "topic_prefix": "- ",
+                    "toolsets": [
+                        "terminal",
+                        "file",
+                        "code_execution",
+                        "skills",
+                        "web",
+                        "no_mcp",
+                    ],
+                },
+                {
+                    "ids": ["595301"],
+                    "topic_suffix": "PARENT",
+                    "toolsets": ["file", "skills", "session_search", "web", "no_mcp"],
+                },
+            ],
+            "channel_toolsets": {
+                "595301": ["file", "web", "no_mcp"],
+            },
+        },
+    }
+
+
+def test_dash_prefixed_zulip_topic_uses_child_toolsets_without_mcp() -> None:
+    from gateway.run import _resolve_source_toolsets
+
+    enabled = _resolve_source_toolsets(
+        _toolset_config(),
+        "zulip",
+        _zulip_source("- child-demo"),
+    )
+
+    assert "terminal" in enabled
+    assert "code_execution" in enabled
+    assert "file" in enabled
+    assert "activepieces" not in enabled
+    assert "no_mcp" not in enabled
+
+
+def test_zulip_parent_topic_uses_lean_suffix_toolsets() -> None:
+    from gateway.run import _resolve_source_toolsets
+
+    enabled = _resolve_source_toolsets(
+        _toolset_config(),
+        "zulip",
+        _zulip_source("roadmap PARENT"),
+    )
+
+    assert "session_search" in enabled
+    assert "skills" in enabled
+    assert "terminal" not in enabled
+    assert "code_execution" not in enabled
+    assert "activepieces" not in enabled
+
+
+def test_normal_zulip_topic_uses_channel_toolsets_without_mcp() -> None:
+    from gateway.run import _resolve_source_toolsets
+
+    enabled = _resolve_source_toolsets(
+        _toolset_config(),
+        "zulip",
+        _zulip_source("regular-topic"),
+    )
+
+    assert "file" in enabled
+    assert "web" in enabled
+    assert "terminal" not in enabled
+    assert "activepieces" not in enabled
+
+
+def test_zulip_topic_model_override_supports_suffix() -> None:
+    from gateway.run import _resolve_topic_model_override_for_source
+
+    config = {
+        "zulip": {
+            "topic_model_overrides": [
+                {
+                    "ids": ["595301"],
+                    "topic_suffix": "PARENT",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                }
+            ]
+        }
+    }
+
+    override = _resolve_topic_model_override_for_source(
+        config,
+        _zulip_source("implementation PARENT"),
+    )
+
+    assert override == {"provider": "openai-codex", "model": "gpt-5.5"}

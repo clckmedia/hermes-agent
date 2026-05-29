@@ -104,30 +104,44 @@ def is_write_denied(path: str) -> bool:
         if resolved.startswith(prefix):
             return True
 
-    # Hermes control-plane files: block both the ACTIVE profile's view
-    # (hermes_home) AND the global root view. Without the root pass, a
-    # profile-mode session leaves <root>/auth.json + <root>/config.yaml
-    # writable — letting a prompt-injected write_file overwrite the global
-    # files that every profile inherits from (same shape as #15981).
-    control_file_names = ("auth.json", "config.yaml", "webhook_subscriptions.json")
+    # Hermes control-plane files: block credential/secret-bearing files in
+    # both the ACTIVE profile's view (hermes_home) AND the global root view.
+    # ``config.yaml`` is intentionally handled separately below: it is an
+    # operator-owned configuration file, not a credential store, and the active
+    # profile's config must remain editable by the agent.
+    credential_control_file_names = ("auth.json", "webhook_subscriptions.json")
     mcp_tokens_dir_name = "mcp-tokens"
 
+    hermes_home_real = None
     hermes_dirs = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
+    for idx, base in enumerate((_hermes_home_path(), _hermes_root_path())):
         try:
             real = os.path.realpath(base)
+            if idx == 0:
+                hermes_home_real = real
             if real not in hermes_dirs:
                 hermes_dirs.append(real)
         except Exception:
             continue
 
     for base_real in hermes_dirs:
-        for name in control_file_names:
+        for name in credential_control_file_names:
             try:
                 if resolved == os.path.realpath(os.path.join(base_real, name)):
                     return True
             except Exception:
                 continue
+        try:
+            config_real = os.path.realpath(os.path.join(base_real, "config.yaml"))
+            active_config_real = (
+                os.path.realpath(os.path.join(hermes_home_real, "config.yaml"))
+                if hermes_home_real
+                else None
+            )
+            if resolved == config_real and resolved != active_config_real:
+                return True
+        except Exception:
+            continue
         try:
             mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
             if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):

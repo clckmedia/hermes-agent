@@ -564,10 +564,15 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
             if result.success:
-                # Store Slack thread_ts → HubSpot ticket mapping for reply tracking
+                # Store Slack top-level ts → HubSpot ticket mapping for reply tracking.
+                # If this intake was routed into an existing Slack thread, keep the
+                # original parent ts and do not overwrite it with the threaded reply ts.
                 slack_ts = getattr(result, "message_id", None) or ""
-                ticket_id = payload.get("support_reasoning", {}).get("ticket_id", "")
-                if slack_ts and ticket_id:
+                reasoning = payload.get("support_reasoning", {}) if isinstance(payload.get("support_reasoning"), dict) else {}
+                ticket_id = reasoning.get("ticket_id", "")
+                slack_payload = payload.get("slack") if isinstance(payload.get("slack"), dict) else {}
+                existing_thread_ts = reasoning.get("slack_thread_ts") or slack_payload.get("thread_ts") or ""
+                if slack_ts and ticket_id and not existing_thread_ts:
                     try:
                         await self._store_slack_thread_ts(ticket_id, slack_ts)
                     except Exception:
@@ -634,8 +639,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
             # Build and post threaded reply card to the original Slack thread
             reply_card = (
-                f"📬 *Client reply from {reply_sender}*\n"
-                f"> {reply_body[:500]}\n\n"
+                f"📬 *Client reply on existing support ticket*\n"
+                f"- From: {reply_sender}\n"
+                f"- Update: {reply_body[:500]}\n"
+                f"- Next: review this update in the existing working thread and reply with `@Arlo` plus the next bounded action/approval.\n\n"
                 f"_<{ticket_url}|View ticket in HubSpot>_"
             )
 
@@ -963,6 +970,41 @@ class WebhookAdapter(BasePlatformAdapter):
                 rendered[key] = value
         return rendered
 
+    def _get_env_or_dotenv(self, name: str) -> str:
+        """Read a secret from process env, falling back to ~/.hermes/.env without logging it."""
+        import os
+
+        value = os.environ.get(name, "")
+        if value:
+            return value
+        env_path = os.path.expanduser("~/.hermes/.env")
+        if not os.path.exists(env_path):
+            return ""
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, raw_value = line.split("=", 1)
+                    if key.strip() == name:
+                        return raw_value.strip().strip('"').strip("'")
+        except Exception:
+            return ""
+        return ""
+
+    def _normalise_support_subject(self, subject: str) -> str:
+        """Normalise email reply/forward subjects for ticket continuation matching."""
+        text = str(subject or "").strip().lower()
+        # Gmail/Outlook can stack prefixes: Re: Fwd: RE: Original subject
+        previous = None
+        while text and text != previous:
+            previous = text
+            text = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", text, flags=re.I)
+            text = re.sub(r"^\s*\[[^\]]*(?:external|secure|bulk)[^\]]*\]\s*", "", text, flags=re.I)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:160]
+
     async def _enrich_hubspot_support_triage_payload(
         self, payload: dict, route_config: Optional[dict] = None
     ) -> dict:
@@ -998,6 +1040,12 @@ class WebhookAdapter(BasePlatformAdapter):
             try:
                 hubspot_enrichment = await self._enrich_hubspot_ticket(payload, reasoning, timeout=timeout)
                 enriched["support_reasoning"].update(hubspot_enrichment)
+                if hubspot_enrichment.get("slack_thread_ts"):
+                    slack_payload = enriched.get("slack") if isinstance(enriched.get("slack"), dict) else {}
+                    slack_payload = dict(slack_payload)
+                    slack_payload.setdefault("channel_id", "C0B3PQE0CHG")
+                    slack_payload["thread_ts"] = hubspot_enrichment["slack_thread_ts"]
+                    enriched["slack"] = slack_payload
             except Exception:
                 logger.warning("[webhook] HubSpot ticket enrichment failed (non-fatal)")
         except asyncio.TimeoutError:
@@ -1030,8 +1078,7 @@ class WebhookAdapter(BasePlatformAdapter):
         Returns a dict with: mode, issue_type, assignee, summary, actions (list),
         draft_reply (str|null), internal_note (str|null).
         """
-        import os
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        api_key = self._get_env_or_dotenv("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY not set")
 
@@ -1122,57 +1169,48 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _enrich_hubspot_ticket(
         self, payload: dict, reasoning: dict, *, timeout: float
     ) -> dict:
-        """Look up the HubSpot ticket (auto-created by Help Desk) and assign owner.
+        """Look up the HubSpot ticket and mark existing Slack-thread continuations.
 
-        Returns a dict with 'ticket_url', 'ticket_id' to merge into support_reasoning.
-        Fail-open: if HubSpot is unavailable, returns empty dict.
+        Returns ticket_url/ticket_id plus slack_thread_ts/existing_ticket_update when
+        the ticket already has a Slack parent thread stored. Fail-open on API issues.
         """
-        import os
-        token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
+        token = self._get_env_or_dotenv("HUBSPOT_ACCESS_TOKEN")
         if not token:
             return {}
 
         gmail = payload.get("gmail") if isinstance(payload.get("gmail"), dict) else {}
         subject = gmail.get("subject") or payload.get("subject") or ""
-        thread_id = gmail.get("thread_id") or payload.get("thread_id") or ""
+        if not subject:
+            return {}
 
-        result = {}
-        timeout_sec = max(1.0, min(timeout * 0.5, 4.0))
+        result: Dict[str, Any] = {}
+        ticket = await self._find_ticket_by_subject(subject)
+        if not ticket:
+            return result
 
+        ticket_id = ticket["id"]
+        props = ticket.get("properties", {})
+        result["ticket_id"] = ticket_id
+        result["ticket_url"] = f"https://app.hubspot.com/contacts/435014/ticket/{ticket_id}"
+
+        slack_thread_ts = props.get("slack_thread_ts") or ""
+        if slack_thread_ts:
+            result["slack_thread_ts"] = slack_thread_ts
+            result["existing_ticket_update"] = True
+
+        # Assign owner based on DeepSeek classification. Non-fatal and preserves
+        # the existing behaviour for new and continuing tickets.
         try:
             import aiohttp
+
+            timeout_sec = max(1.0, min(timeout * 0.5, 4.0))
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
                 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-                # Search for ticket by subject (last 24h, limit 3)
-                async with session.post(
-                    "https://api.hubapi.com/crm/v3/objects/tickets/search",
-                    headers=headers,
-                    json={
-                        "filterGroups": [{"filters": [
-                            {"propertyName": "subject", "operator": "CONTAINS_TOKEN", "value": subject[:80]}
-                        ]}],
-                        "sorts": [{"propertyName": "createdate", "direction": "DESCENDING"}],
-                        "limit": 3,
-                        "properties": ["subject", "hs_pipeline_stage", "hubspot_owner_id"],
-                    },
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        tickets = data.get("results", [])
-                        if tickets:
-                            ticket = tickets[0]
-                            ticket_id = ticket["id"]
-                            result["ticket_id"] = ticket_id
-                            result["ticket_url"] = f"https://app.hubspot.com/contacts/435014/ticket/{ticket_id}"
-
-                            # Assign owner based on DeepSeek classification
-                            assignee = reasoning.get("assignee", "")
-                            if assignee == "benson":
-                                # Benson uses team@clck.com.au in HubSpot
-                                await self._assign_hubspot_owner(session, ticket_id, "team@clck.com.au", headers)
-                            elif assignee == "marinda":
-                                await self._assign_hubspot_owner(session, ticket_id, "marinda@clck.com.au", headers)
+                assignee = reasoning.get("assignee", "")
+                if assignee == "benson":
+                    await self._assign_hubspot_owner(session, ticket_id, "team@clck.com.au", headers)
+                elif assignee == "marinda":
+                    await self._assign_hubspot_owner(session, ticket_id, "marinda@clck.com.au", headers)
         except Exception:
             pass
 
@@ -1204,21 +1242,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _store_slack_thread_ts(self, ticket_id: str, slack_ts: str) -> None:
         """Store the Slack message timestamp on the HubSpot ticket. Non-fatal."""
-        import os
-        token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
-        # Fallback: read from .env if not in process environment
-        if not token:
-            env_path = os.path.expanduser("~/.hermes/.env")
-            if os.path.exists(env_path):
-                try:
-                    with open(env_path) as f:
-                        for line in f:
-                            line = line.strip()
-                            if line.startswith("HUBSPOT_ACCESS_TOKEN="):
-                                token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                                break
-                except Exception:
-                    pass
+        token = self._get_env_or_dotenv("HUBSPOT_ACCESS_TOKEN")
         if not token:
             return
         try:
@@ -1239,21 +1263,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _find_ticket_by_subject(self, subject: str) -> Optional[dict]:
         """Find a HubSpot ticket by subject. Uses GET list endpoint (search has scope issues)."""
-        import os
-        token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
-        # Fallback: read from .env if not in process environment
-        if not token:
-            env_path = os.path.expanduser("~/.hermes/.env")
-            if os.path.exists(env_path):
-                try:
-                    with open(env_path) as f:
-                        for line in f:
-                            line = line.strip()
-                            if line.startswith("HUBSPOT_ACCESS_TOKEN="):
-                                token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                                break
-                except Exception:
-                    pass
+        token = self._get_env_or_dotenv("HUBSPOT_ACCESS_TOKEN")
         if not token or not subject:
             return None
         try:
@@ -1262,7 +1272,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 headers = {"Authorization": f"Bearer {token}"}
                 url = (
                     "https://api.hubapi.com/crm/v3/objects/tickets"
-                    "?limit=50&properties=subject,slack_thread_ts"
+                    "?limit=50&properties=subject,slack_thread_ts,hs_pipeline_stage,hubspot_owner_id"
                     "&archived=false"
                 )
                 async with session.get(url, headers=headers) as resp:
@@ -1270,12 +1280,16 @@ class WebhookAdapter(BasePlatformAdapter):
                         return None
                     data = await resp.json()
                     results = data.get("results", [])
-                    subject_lower = subject.lower()[:80]
+                    subject_key = self._normalise_support_subject(subject)
                     for ticket in results:
-                        ticket_subject = (
-                            ticket.get("properties", {}).get("subject", "").lower()
+                        ticket_subject = self._normalise_support_subject(
+                            ticket.get("properties", {}).get("subject", "")
                         )
-                        if subject_lower in ticket_subject or ticket_subject in subject_lower:
+                        if subject_key and ticket_subject and (
+                            subject_key == ticket_subject
+                            or subject_key in ticket_subject
+                            or ticket_subject in subject_key
+                        ):
                             return ticket
 
                 after = data.get("paging", {}).get("next", {}).get("after")
@@ -1285,10 +1299,14 @@ class WebhookAdapter(BasePlatformAdapter):
                             break
                         data = await resp.json()
                         for ticket in data.get("results", []):
-                            ticket_subject = (
-                                ticket.get("properties", {}).get("subject", "").lower()
+                            ticket_subject = self._normalise_support_subject(
+                                ticket.get("properties", {}).get("subject", "")
                             )
-                            if subject_lower in ticket_subject or ticket_subject in subject_lower:
+                            if subject_key and ticket_subject and (
+                                subject_key == ticket_subject
+                                or subject_key in ticket_subject
+                                or ticket_subject in subject_key
+                            ):
                                 return ticket
                         after = data.get("paging", {}).get("next", {}).get("after")
         except Exception:
@@ -1312,8 +1330,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _update_ticket_stage(self, ticket_id: str, stage_id: str) -> None:
         """Move a HubSpot ticket to a new pipeline stage. Non-fatal."""
-        import os
-        token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
+        token = self._get_env_or_dotenv("HUBSPOT_ACCESS_TOKEN")
         if not token:
             return
         try:
@@ -1851,6 +1868,20 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deepseek_summary:
             summary = deepseek_summary
+
+        existing_ticket_update = False
+        if reasoning:
+            existing_ticket_update = _truthy(reasoning.get("existing_ticket_update")) or bool(
+                _text(reasoning.get("slack_thread_ts"), "")
+            )
+        card_title = "**CLCK support ticket update**" if existing_ticket_update else "**CLCK support triage**"
+        working_session_line = (
+            f"`{triage_id}` · Update on an existing HubSpot ticket; posted into the existing Slack working thread. Reply with `@Arlo` plus the next bounded action/approval."
+            if existing_ticket_update
+            else f"`{triage_id}` · Reply in this thread with `@Arlo` plus new facts/approval; this thread becomes the working session for this card."
+        )
+        continuation_line = "- Continuation: existing HubSpot ticket update; not a new support request." if existing_ticket_update else ""
+
         if reasoning:
             issue_type = _text(reasoning.get("issue_type"), issue_type)
             reasoning_client_ask = _text(reasoning.get("client_ask"), "")
@@ -1877,10 +1908,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if has_legacy_fields:
             # Legacy card rendering — preserve old format for backward compat
-            triage_title = "**CLCK HubSpot support triage**" if "hubspot" in issue_type.lower() else "**CLCK support triage**"
+            triage_title = "**CLCK HubSpot support ticket update**" if existing_ticket_update and "hubspot" in issue_type.lower() else card_title
             lines = [
                 triage_title,
-                f"`{triage_id}` · Reply in this thread with `@Arlo` plus new facts/approval; this thread becomes the working session for this card.",
+                working_session_line,
                 "",
                 "**1) Request**",
                 f"- Request summary: {_clip(summary, 700)}",
@@ -1891,10 +1922,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 "**2) Routing / context**",
                 f"- Source: support@clck.com.au intake",
                 f"- HubSpot status: {_clip(hubspot_status, 260)}",
+            ]
+            if continuation_line:
+                lines.append(continuation_line)
+            lines.extend([
                 f"- Owner/assignee hint: {_clip(owner_hint, 120)}",
                 f"- Risk/action level: {_clip(risk_level, 260)}",
                 f"- Sender/source/subject: {_clip(sender + original_sender_line, 200)} / {_clip(source_mailbox, 120)} / {_clip(subject, 180)}",
-            ]
+            ])
             section_number = 3
             if read_only_findings:
                 lines.extend([
@@ -1929,8 +1964,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if deepseek_mode:
             # Mode-aware card (DeepSeek classified)
             lines = [
-                "**CLCK support triage**",
-                f"`{triage_id}` · Reply in this thread with `@Arlo` plus new facts/approval; this thread becomes the working session for this card.",
+                card_title,
+                working_session_line,
                 "",
                 "**Request**",
                 f"- Summary: {_clip(summary, 700)}",
@@ -1940,9 +1975,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 f"- Source: support@clck.com.au intake",
                 f"- Client: {_clip(original_sender or sender, 160)}",
                 f"- HubSpot ticket: {_clip(reasoning.get('ticket_url', 'auto-created by Help Desk'), 120)}",
+            ]
+            if continuation_line:
+                lines.append(continuation_line)
+            lines.extend([
                 f"- Suggested assignee: {_clip(owner_hint, 120)}",
                 f"- Sender/subject: {_clip(sender + original_sender_line, 200)} / {_clip(subject, 180)}",
-            ]
+            ])
 
             if deepseek_mode == "action_plan" and deepseek_actions:
                 lines.append("")
@@ -1970,8 +2009,8 @@ class WebhookAdapter(BasePlatformAdapter):
         else:
             # Deterministic fallback (no DeepSeek reasoning or legacy mode)
             lines = [
-                "**CLCK support triage**",
-                f"`{triage_id}` · Reply in this thread with `@Arlo` plus new facts/approval; this thread becomes the working session for this card.",
+                card_title,
+                working_session_line,
                 "",
                 "**1) Request**",
                 f"- Request summary: {_clip(summary, 700)}",
@@ -1982,13 +2021,17 @@ class WebhookAdapter(BasePlatformAdapter):
                 "**2) Routing / context**",
                 f"- Source: support@clck.com.au intake",
                 f"- HubSpot status: {_clip(hubspot_status, 260)}",
+            ]
+            if continuation_line:
+                lines.append(continuation_line)
+            lines.extend([
                 f"- Owner/assignee hint: {_clip(owner_hint, 120)}",
                 f"- Risk/action level: {_clip(risk_level, 260)}",
                 f"- Sender/source/subject: {_clip(sender + original_sender_line, 200)} / {_clip(source_mailbox, 120)} / {_clip(subject, 180)}",
                 "",
                 "**3) Recommended action**",
                 f"- Recommended internal next action: {_clip(next_action, 620)}",
-            ]
+            ])
             if draft_reply:
                 lines.append(f"- Draft client reply: {_clip(draft_reply, 500)}")
 
