@@ -1,3 +1,11 @@
+# Upstream contribution fork and historical experiments
+
+**This fork is not a production deployment source or an operational issue queue.** It remains public to support existing upstream contributions. Historical branches and experiments are retained as evidence, not current release instructions. For the maintained Hermes project and its documentation, use [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
+
+---
+
+## Historical upstream README
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
